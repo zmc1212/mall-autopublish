@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# Build/Dist
+build/
+dist/
+*.egg-info/
+
+# Playwright & Browser
+.playwright/
+.playwright-cli/
+%SystemDrive%/
+
+# Project specific caches and outputs
+.work/
+output/
+outputs/
+testdata/
+
+# OS generated files
+.DS_Store
+Thumbs.db

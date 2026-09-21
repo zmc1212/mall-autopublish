@@ -1,0 +1,8 @@
+{
+  "name": "48小时",
+  "ship_time": "48小时内发货",
+  "ship_from": "大陆及港澳台",
+  "use_logistics": true,
+  "freight": "文具用品 包邮",
+  "region_limit": false
+}

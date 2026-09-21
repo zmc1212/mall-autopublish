@@ -1,0 +1,5 @@
+desktop/ui/node_modules/
+desktop/ui/dist/
+desktop/runtime/
+build/
+dist/

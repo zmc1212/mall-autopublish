@@ -1,0 +1,11 @@
+{
+  "name": "仓库多规格",
+  "spec_mode": "单层展示",
+  "spec_name": "商品规格",
+  "sku_category": "单品",
+  "thickness": "0.05mm",
+  "stock_deduction": "拍下减库存",
+  "listing_time": "放入仓库",
+  "multi_discount": false,
+  "precheck": false
+}

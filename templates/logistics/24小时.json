@@ -1,0 +1,8 @@
+{
+  "name": "24小时",
+  "ship_time": "24小时内发货提升转化",
+  "ship_from": "大陆及港澳台",
+  "use_logistics": true,
+  "freight": "文具用品 包邮",
+  "region_limit": false
+}

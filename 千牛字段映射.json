@@ -1,0 +1,59 @@
+{
+  "page": "https://item.upload.taobao.com/sell/v2/publish.htm",
+  "new_item_entry": "https://item.upload.taobao.com/sell/ai/category.htm",
+  "verified_at": "2026-09-19",
+  "verified_category": "文具用品/文化用品/商务用品>>日常学习用品>>修正带",
+  "category_id": "121466019",
+  "category_profiles": {
+    "中性笔": {
+      "path": "文具用品/文化用品/商务用品>>笔类/书写工具>>中性笔",
+      "category_id": "50012720",
+      "required_attributes": ["笔头类型", "笔芯颜色", "闭合方式", "风格", "功能", "品牌", "型号", "适用场景", "适用人群", "包装方式", "采购地"],
+      "optional_attributes": ["上市时间", "生产企业", "书写长度", "是否定制"],
+      "sku_columns": ["书写粗细", "支数", "颜色分类"],
+      "preflight": ["标题品牌必须与品牌属性一致", "型号为文本属性", "采购地默认为中国内地（大陆）"],
+      "observed_existing_item": {"item_id": "1074400219062", "price_examples": ["115.00", "150.00", "23.00"], "stock_examples": [552, 555, 541, 546, 554]}
+    },
+    "修正带": {
+      "path": "文具用品/文化用品/商务用品>>日常学习用品>>修正带",
+      "category_id": "121466019",
+      "required_attributes": ["附加功能", "风格", "可换芯设计", "适用场景"],
+      "optional_attributes": ["环保认证", "适用人群", "IP联名", "修正效果", "品牌", "生产企业", "总长度", "重量", "上市时间"]
+    }
+  },
+  "mode": "warehouse_only",
+  "selectors": {
+    "category_search": "getByRole('textbox', {name:'可输入产品名称、类目关键词、条码信息'})",
+    "category_next": "getByRole('button', {name:'确认，下一步'})",
+    "title": "getByRole('textbox', {name:'最多允许输入30个汉字（60字符）'})",
+    "guide_title": "getByRole('textbox', {name:'最多输入30字符（15个汉字）'})",
+    "category_switch": "getByRole('button', {name:'切换类目'})",
+    "brand": "商品属性中的品牌，或类目页 combobox 请输入",
+    "outer_id": "商家编码 textbox",
+    "main_image": "label 1:1主图 input[type=file]，最多5张，正方形，推荐1440x1440+",
+    "portrait_image": "label 3:4主图 input[type=file]，最多5张，推荐1440x1920+",
+    "detail_images": "宝贝详情 上传，高/宽≤2，建议宽度≥1440",
+    "description": "宝贝详情 editor",
+    "price": "一口价旁未命名 textbox",
+    "stock": "总库存旁未命名 textbox",
+    "create_sku": "getByRole('button', {name:'+ 创建规格'})",
+    "stock_deduction": ["拍下减库存", "付款减库存"],
+    "warehouse_button": "getByRole('radio', {name:'放入仓库'})",
+    "instant_button": "getByRole('radio', {name:'立刻上架'})",
+    "timed_button": "getByRole('radio', {name:'定时上架'})",
+    "submit_button": "getByRole('button', {name:'提交宝贝信息'})",
+    "save_draft": "getByRole('button', {name:'保存草稿'})",
+    "success_notice": "提交后读取页面成功/失败文案，并以仓库查询为准",
+    "shipping_time": ["24小时内发货提升转化", "48小时内发货", "大于48小时发货"],
+    "shipping_origin": ["大陆及港澳台", "其他国家或地区"],
+    "shipping_method": "getByRole('checkbox', {name:'使用物流配送'})",
+    "service": "七天退货为该类目强制勾选服务承诺"
+  },
+  "status": "页面字段已核验；网页执行器走 Playwright CLI / CDP，默认填写后不点击提交",
+  "notes": [
+    "选择放入仓库，不执行立即上架",
+    "新建入口必须是 category.htm，禁止带 itemId 的编辑页",
+    "所有选择器必须基于可见页面元素确认",
+    "示例数据禁止提交真实店铺"
+  ]
+}
