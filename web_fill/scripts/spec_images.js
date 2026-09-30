@@ -5,10 +5,24 @@ async page => {
 
   const phase = PAYLOAD.phase || "upload";
   const specs = PAYLOAD.skus || [];
-  const files = (PAYLOAD.files && PAYLOAD.files.length)
+  const bindStart = Math.max(0, Number(PAYLOAD.bindStart) || 0);
+  const bindEnd = Math.min(specs.length, PAYLOAD.bindEnd == null
+    ? specs.length : Math.max(bindStart, Number(PAYLOAD.bindEnd) || 0));
+  // 分批补图：onlyRows 为 0 基行号，绑定与保存校验只针对这些行；
+  // 其余行属于后续批次，不参与本次确认。
+  const onlyRows = Array.isArray(PAYLOAD.onlyRows)
+    ? [...new Set(PAYLOAD.onlyRows.map((value) => Number(value)))]
+        .filter((value) => Number.isInteger(value) && value >= 0 && value < specs.length)
+        .sort((a, b) => a - b)
+    : null;
+  // 抽屉里会显示之前批次已绑定的行，稳定性判断用“本批结束时应至少已填多少行”。
+  const minFilled = Number(PAYLOAD.minFilledCount) > 0 ? Number(PAYLOAD.minFilledCount) : specs.length;
+  // Several SKU rows can use the same image. Upload each file once, then bind it to every row.
+  const files = [...new Set(((PAYLOAD.files && PAYLOAD.files.length)
     ? PAYLOAD.files
-    : specs.map((item) => item.image).filter(Boolean);
-  const names = specs.map((item) => item.file || (item.image && String(item.image).split(/[\\/]/).pop())).filter(Boolean);
+    : specs.map((item) => item.image)).filter(Boolean))];
+  const names = [...new Set(files.map(fileBase))];
+  const uploadNames = [...new Set(PAYLOAD.uploadNames && PAYLOAD.uploadNames.length ? PAYLOAD.uploadNames : names)];
   const targetColumn = "商品规格";
 
   await dismissKnow({ escape: false });
@@ -90,8 +104,12 @@ async page => {
   async function openSpecImagePicker() {
     await ensureSpecDrawer();
     const current = await drawerImageState();
-    if (current.open && specs.length && current.filled >= specs.length) {
+    if (current.open && specs.length && current.filled >= minFilled) {
       return { clicked: "ALREADY_FILLED", frame: null, prefilled: true, current };
+    }
+    if (await pickerOpen()) {
+      const frame = sucaiFrame() || await waitFrame(sucaiFrame, 18);
+      if (frame) return { clicked: "REUSE_PICKER", frame };
     }
     const clicked = await page.evaluate(() => {
       const drawer = document.querySelector(".sku-decouple-drawer");
@@ -125,6 +143,43 @@ async page => {
       }));
   }
 
+  async function waitSpecUploadOverlay(frame) {
+    if (!frame) return "NO_FRAME";
+    for (let i = 0; i < 90; i++) {
+      const uploading = await frame.evaluate(() => /\d+\s*个文件\s*上传中|文件上传中\.\.\./.test(
+        (document.body && document.body.innerText) || ""
+      )).catch(() => false);
+      if (!uploading) {
+        if (await hasUploadResult() && (await waitUploadResultClosed(20)) !== "CLOSED") {
+          throw new Error("图片上传结果弹窗未关闭");
+        }
+        return "READY";
+      }
+      await sleep(1000);
+    }
+    throw new Error("图片空间仍在上传，已暂停规格绑定");
+  }
+
+  async function specRowImageState(index) {
+    return page.evaluate((i) => {
+      const dialog = document.querySelector(".batch-fill-sku-image-dialog");
+      const items = dialog ? [...dialog.querySelectorAll("li.sku-item")] : [];
+      const item = items[i];
+      if (!item) return { found: false, count: items.length, hasImage: false };
+      const images = [...item.querySelectorAll("img")].filter((img) =>
+        (img.width || img.naturalWidth || 0) > 12 && (img.height || img.naturalHeight || 0) > 12);
+      const backgrounds = [...item.querySelectorAll("*")].filter((el) =>
+        /url\(/i.test(getComputedStyle(el).backgroundImage || ""));
+      return {
+        found: true,
+        hasImage: images.length + backgrounds.length > 0,
+        imageCount: images.length + backgrounds.length,
+        name: (item.innerText || "").replace(/\s+/g, " ").trim().slice(0, 70),
+        html: String(item.outerHTML || "").replace(/\s+/g, " ").slice(0, 600),
+      };
+    }, index);
+  }
+
   async function drawerImageState() {
     return page.evaluate(() => {
       const drawer = document.querySelector(".sku-decouple-drawer");
@@ -147,7 +202,7 @@ async page => {
     for (let i = 0; i < 24; i++) {
       const dialog = await pickerOpen();
       state = await drawerImageState();
-      if (!dialog && state.open && state.filled >= specs.length) {
+      if (!dialog && state.open && state.filled >= minFilled) {
         stable += 1;
         if (stable >= 3) return state;
       } else {
@@ -190,8 +245,7 @@ async page => {
       };
     });
     if (meta.disabled) return { result: "DISABLED", count, meta };
-    await button.scrollIntoViewIfNeeded();
-    await button.click({ timeout: 8000 });
+    await button.evaluate((el) => { el.scrollIntoView({ block: "center" }); el.click(); });
     return { result: "CLICKED_VISIBLE", count, meta };
   }
 
@@ -202,10 +256,11 @@ async page => {
         return text.includes("元") && text.includes("件") && !text.includes("SKU分类");
       });
       const details = rows.map((tr, index) => {
-        const images = [...tr.querySelectorAll("img")].filter((img) =>
+        const cell = tr.querySelector('td[id$="-custom_-1"]');
+        const images = [...(cell ? cell.querySelectorAll("img.image-item") : [])].filter((img) =>
           (img.width || img.naturalWidth || 0) > 16 && (img.height || img.naturalHeight || 0) > 16
         );
-        const backgrounds = [...tr.querySelectorAll("*")].filter((el) => {
+        const backgrounds = [...(cell ? cell.querySelectorAll(".image-item") : [])].filter((el) => {
           const value = getComputedStyle(el).backgroundImage || "";
           return value !== "none" && /url\(/i.test(value);
         });
@@ -229,34 +284,69 @@ async page => {
   }
 
   async function selectSpec(spec, frame) {
+    await assertNoSecurityChallenge();
+    const index = specs.indexOf(spec);
     const skuClick = await page.evaluate((want) => {
       const dialog = document.querySelector(".batch-fill-sku-image-dialog");
       if (!dialog) return "NO_DIALOG";
-      const items = [...dialog.querySelectorAll("li.sku-item, li, [class*='sku-item']")];
-      const item = items.find((el) => {
-        const text = ((el.querySelector(".sku-text") && el.querySelector(".sku-text").innerText) || el.innerText || "")
-          .replace(/\s+/g, " ").trim();
+      const specific = [...dialog.querySelectorAll("li.sku-item")];
+      const items = specific.length ? specific : [...dialog.querySelectorAll("li, [class*='sku-item']")];
+      const textOf = (el) => ((el.querySelector(".sku-text") && el.querySelector(".sku-text").innerText) || el.innerText || "")
+        .replace(/\s+/g, " ").trim();
+      const matches = items.filter((el) => {
+        const text = textOf(el);
         return text === want.name || (want.slot && text.includes(want.slot)) || (want.name && text.includes(want.name));
-      }) || items[want.index];
+      });
+      const indexed = items[want.index];
+      const item = (indexed && matches.includes(indexed) ? indexed : null)
+        || matches[want.occurrence] || indexed || matches[0];
       if (!item) return "NO_SPEC:" + items.length;
       item.click();
-      return "OK:" + ((item.innerText || "").replace(/\s+/g, " ").trim().slice(0, 60));
-    }, { ...spec, index: specs.indexOf(spec) });
+      return "OK:" + items.indexOf(item) + ":" + ((item.innerText || "").replace(/\s+/g, " ").trim().slice(0, 60));
+    }, {
+      ...spec,
+      index,
+      occurrence: specs.slice(0, index).filter((item) => item.name === spec.name).length,
+    });
     await sleep(260);
     if (!frame) return { skuClick, picClick: { ok: false, error: "NO_FRAME" } };
-    const query = spec.slot || spec.file || spec.name;
-    let searched = await searchSucai(frame, query);
-    let picClick = await clickSucaiCard(frame, spec.file || spec.slot || spec.name);
-    if (!picClick.ok && spec.file) {
-      searched = await searchSucai(frame, spec.file.replace(/\.[^.]+$/, ""));
-      picClick = await clickSucaiCard(frame, spec.file);
+    // Newly uploaded cards are usually all in the current material list.
+    // Avoid a remote search for every SKU: repeated searches can leave the
+    // picker showing the previous SKU's results when one request stalls.
+    let searched = "CURRENT_LIST";
+    // The picker listens on the image inside the material card. Clicking the
+    // outer card reports success but does not assign anything to the SKU row.
+    let picClick = await clickSucaiCard(frame, spec.file || spec.slot || spec.name, true);
+    if (!picClick.ok) {
+      searched = await searchSucai(frame, spec.slot || spec.file || spec.name, undefined, true);
+      picClick = await clickSucaiCard(frame, spec.file || spec.slot || spec.name, true);
+      if (!picClick.ok && spec.file) {
+        searched = await searchSucai(frame, spec.file.replace(/\.[^.]+$/, ""), undefined, true);
+        picClick = await clickSucaiCard(frame, spec.file, true);
+      }
     }
     await sleep(350);
     await confirmCrop();
-    return { skuClick, searched, picClick };
+    let row = await specRowImageState(index);
+    for (let i = 0; i < 6 && row.found && !row.hasImage; i++) {
+      await sleep(300);
+      row = await specRowImageState(index);
+    }
+    let innerClick = null;
+    if (picClick.ok && row.found && !row.hasImage) {
+      innerClick = await clickSucaiCard(frame, spec.file || spec.slot || spec.name);
+      for (let i = 0; i < 6 && !row.hasImage; i++) {
+        await sleep(300);
+        row = await specRowImageState(index);
+      }
+    }
+    return { skuClick, searched, picClick, innerClick, row };
   }
 
   if (phase === "open" || phase === "open_library") {
+    if (await hasUploadResult() && (await waitUploadResultClosed(20)) !== "CLOSED") {
+      throw new Error("图片上传结果弹窗未关闭");
+    }
     const opened = await openSpecImagePicker();
     const frame = opened.frame;
     if (phase === "open_library") {
@@ -264,10 +354,14 @@ async page => {
     }
     if (opened.prefilled) return JSON.stringify({ targetColumn, opened: opened.clicked, prefilled: true, already: true, uploaded: true, filledCount: opened.current.filled, dialog: await pickerOpen() });
     if (!frame) return JSON.stringify({ targetColumn, opened: opened.clicked, uploaded: false, hadFrame: false, error: "规格图素材库 iframe 未加载", diagnostics: opened.diagnostics || await specDiagnostics(), dialog: await pickerOpen() });
+    await waitSpecUploadOverlay(frame);
     const listed = await listSucaiPics(frame);
+    // The initial library view already contains recent uploads. Searching
+    // every filename here sends many file.query requests before upload starts.
     const missing = missingPictureNames(listed, names);
     if (!missing.length) return JSON.stringify({ targetColumn, opened: opened.clicked, already: true, uploaded: true, pics: listed, dialog: await pickerOpen() });
-    const finished = await finishLocalUpload(frame, files, names);
+    const pending = filesForNames(files, missing);
+    const finished = await finishLocalUpload(frame, pending, missing);
     return JSON.stringify({ targetColumn, opened: opened.clicked, ...finished, pics: listed, missing, dialog: await pickerOpen() });
   }
 
@@ -275,15 +369,22 @@ async page => {
     const frame = sucaiFrame();
     if (!frame) {
       const current = await drawerImageState();
-      if (current.open && specs.length && current.filled >= specs.length) {
+      if (current.open && specs.length && current.filled >= minFilled) {
         return JSON.stringify({ targetColumn, uploaded: true, prefilled: true, already: true, filledCount: current.filled, dialog: await pickerOpen() });
       }
       return JSON.stringify({ targetColumn, uploaded: false, hadFrame: false, error: "规格图素材库 iframe 未加载", diagnostics: await specDiagnostics(), dialog: await pickerOpen() });
     }
-    const retried = await retryUntilUploaded(frame, files, names);
+    if (!(await hasUploadResult())) {
+      const missing = await missingSucaiNames(frame, uploadNames, 5);
+      return JSON.stringify({ targetColumn, uploaded: !missing.length, verifiedBy: "library-search", missing, hadFrame: true, dialog: await pickerOpen() });
+    }
+    const retried = await retryUntilUploaded(frame, files, uploadNames);
     return JSON.stringify({ targetColumn, ...retried, hadFrame: true, dialog: await pickerOpen() });
   }
 
+  if (await hasUploadResult() && (await waitUploadResultClosed(20)) !== "CLOSED") {
+    throw new Error("图片上传结果弹窗未关闭");
+  }
   let frame = sucaiFrame();
   const opened = frame ? { clicked: "REUSE_PICKER", frame } : await openSpecImagePicker();
   frame = opened.frame || sucaiFrame();
@@ -299,8 +400,11 @@ async page => {
       dialog: await pickerOpen(),
     });
   }
+  if (frame) await waitSpecUploadOverlay(frame);
   const bindLog = [];
-  if (frame) for (const spec of specs) {
+  const bindTargets = onlyRows ? onlyRows.map((index) => specs[index]) : specs.slice(bindStart, bindEnd);
+  if (frame) for (const spec of bindTargets) {
+    await assertNoSecurityChallenge();
     if (!(await pickerOpen())) {
       const reopened = await openSpecImagePicker();
       frame = reopened.frame || sucaiFrame();
@@ -316,7 +420,16 @@ async page => {
         });
       }
     }
-    bindLog.push({ name: spec.name, slot: spec.slot, ...(await selectSpec(spec, frame)) });
+    const selected = await selectSpec(spec, frame);
+    bindLog.push({ name: spec.name, slot: spec.slot, ...selected });
+    if (!selected.row || !selected.row.hasImage) {
+      return JSON.stringify({ targetColumn, error: "素材卡片点击后规格行仍为空", hadFrame: true,
+        bindStart, bindEnd, bindLog, dialog: await pickerOpen() });
+    }
+  }
+
+  if (!onlyRows && bindEnd < specs.length && !prefilled) {
+    return JSON.stringify({ targetColumn, hadFrame: true, bindStart, bindEnd, bindLog, partial: true, dialog: await pickerOpen() });
   }
 
   let confirm = "NO_DIALOG";
@@ -325,8 +438,7 @@ async page => {
     const dialogItems = page.locator(".batch-fill-sku-image-dialog li.sku-item, .batch-fill-sku-image-dialog li, .batch-fill-sku-image-dialog [class*='sku-item']");
     const filled = await dialogItems.filter({ has: page.locator("img") }).count().catch(() => 0);
     const button = dialogButtons.first();
-    await button.scrollIntoViewIfNeeded();
-    await button.click({ timeout: 8000 });
+    await button.evaluate((el) => { el.scrollIntoView({ block: "center" }); el.click(); });
     confirm = "OK:" + filled;
   }
   const overlaysGone = await waitPickerOverlaysGone();
@@ -340,11 +452,15 @@ async page => {
     drawerConfirm.retry = await clickVisibleDrawerConfirm();
   }
   let persisted = await persistedImageState();
-  for (let i = 0; i < 12 && ((await page.locator(".sku-decouple-drawer").count()) || persisted.filled < specs.length); i++) {
+  for (let i = 0; i < 12 && ((await page.locator(".sku-decouple-drawer").count()) || persisted.filled < minFilled); i++) {
     await sleep(500);
     persisted = await persistedImageState();
   }
-  const tableSaved = persisted.rowCount >= specs.length && persisted.filled >= specs.length;
+  // 分批时只要求本批行已写入；其余行属于后续批次，不能据此判失败。
+  const scopeSaved = onlyRows
+    ? onlyRows.every((index) => !persisted.missing.includes(index))
+    : persisted.filled >= specs.length;
+  const tableSaved = persisted.rowCount >= specs.length && scopeSaved;
   const state = await drawerImageState();
   const filledCount = persisted.filled;
   const saved = tableSaved;

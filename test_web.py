@@ -44,6 +44,47 @@ class FakeSession:
 
 
 class WebSafetyTests(unittest.TestCase):
+    def test_process_command_line_sets_utf8_for_chinese_profile(self):
+        command = f'chrome.exe --user-data-dir="{web.PROFILE}" --remote-debugging-port={web.CDP_PORT}'
+        with unittest.mock.patch.object(web.os, "name", "nt"), \
+             unittest.mock.patch.object(web, "_hidden_subprocess_kwargs", return_value={}), \
+             unittest.mock.patch.object(web.subprocess, "check_output", return_value=command) as query:
+            actual = web._process_command_line(123)
+        self.assertEqual(actual, command)
+        self.assertTrue(web._is_automation_chrome_command(actual))
+        self.assertIn("[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)", query.call_args.args[0][-1])
+        self.assertEqual(query.call_args.kwargs["encoding"], "utf-8")
+
+    def test_attach_removes_redundant_home_before_connecting(self):
+        home = {"id": "home", "type": "page", "url": "https://myseller.taobao.com/home.htm/QnworkbenchHome/"}
+        listing = {"id": "list", "type": "page", "url": "https://myseller.taobao.com/home.htm/SellManage/all_skucenter"}
+        publish = {"id": "publish", "type": "page", "url": "https://item.upload.taobao.com/sell/v2/publish.htm?catId=1"}
+        calls = []
+        def runner(args, raw=True):
+            calls.append(args)
+            self.assertIn("home", closed)
+            return listing["url"]
+        closed = []
+        with unittest.mock.patch.object(web, "start_persistent_chrome"), \
+             unittest.mock.patch.object(web, "_adopt_connected_automation_chrome", return_value=123), \
+             unittest.mock.patch.object(web, "cdp_tabs", return_value=[home, listing, publish]), \
+             unittest.mock.patch.object(web, "_cdp_close_tab", side_effect=closed.append):
+            self.assertEqual(web.CliSession(runner=runner).attach(), listing["url"])
+        self.assertEqual(closed, ["home"])
+        self.assertEqual(calls, [("eval", "location.href")])
+
+    def test_connect_cleanup_preserves_only_home_login_and_unowned_browser(self):
+        home = {"id": "home", "type": "page", "url": "https://myseller.taobao.com/home.htm/QnworkbenchHome/"}
+        listing = {"id": "list", "type": "page", "url": "https://myseller.taobao.com/home.htm/SellManage/all_skucenter"}
+        login = {"id": "login", "type": "page", "url": "https://login.taobao.com/member/login.jhtml"}
+        for owner, tabs in [(123, [home]), (123, [home, listing, login]), (0, [home, listing])]:
+            with self.subTest(owner=owner, tabs=tabs), \
+                 unittest.mock.patch.object(web, "_adopt_connected_automation_chrome", return_value=owner), \
+                 unittest.mock.patch.object(web, "cdp_tabs", return_value=tabs), \
+                 unittest.mock.patch.object(web, "_cdp_close_tab") as close:
+                self.assertEqual(web.close_redundant_seller_home_tabs(), [])
+                close.assert_not_called()
+
     def test_rejects_edit_urls(self):
         with self.assertRaises(web.UnsafeUrl):
             web.assert_safe_url('https://upload.taobao.com/auction/publish/edit.htm?itemId=1074400219062')
@@ -119,6 +160,25 @@ class WebSafetyTests(unittest.TestCase):
         self.assertFalse(web.is_seller_url(login_url))
         home = web.login_status_from_tabs([{"id": "b", "url": "https://myseller.taobao.com/home.htm"}])
         self.assertTrue(home["logged_in"])
+
+    def test_login_page_wins_over_stale_seller_tab(self):
+        tabs = [
+            {"id": "old", "url": "https://myseller.taobao.com/home.htm"},
+            {"id": "login", "url": "https://loginmyseller.taobao.com/?from=taobaoindex"},
+        ]
+        status = web.login_status_from_tabs(tabs)
+        self.assertFalse(status["logged_in"])
+        self.assertEqual(status["blocker"], "登录页")
+        with unittest.mock.patch.object(web, "_cdp_get") as activate:
+            web.activate_seller_tab(tabs)
+        activate.assert_called_once_with("/json/activate/login")
+
+    def test_reveal_seller_retries_until_window_exists(self):
+        with unittest.mock.patch.object(web, "activate_seller_tab"), \
+             unittest.mock.patch.object(web, "reveal_automation_chrome", side_effect=[False, False, True]) as reveal, \
+             unittest.mock.patch.object(web.time, "sleep"):
+            self.assertTrue(web.reveal_seller_chrome(timeout=1.0))
+        self.assertEqual(reveal.call_count, 3)
 
     def test_item_open_urls_are_limited(self):
         self.assertTrue(web.is_allowed_item_url("https://item.taobao.com/item.htm?id=1086638256748"))
@@ -197,7 +257,7 @@ class WebSafetyTests(unittest.TestCase):
             return [(99, "用户 Chrome", (0, 0, 800, 600))]
 
         def fake_set(hwnd, x, y, w=0, h=0, show=None, activate=False):
-            moved.append((hwnd, x, y, activate))
+            moved.append((hwnd, x, y, show, activate))
             return True
 
         with unittest.mock.patch.object(web, "_hwnds_for_pids", side_effect=fake_hwnds), \
@@ -211,11 +271,48 @@ class WebSafetyTests(unittest.TestCase):
         self.assertFalse(any(99 in pids for pids in seen))
         self.assertEqual(moved[0][0], 11)
         self.assertEqual(moved[0][1], web.OFFSCREEN_POS[0])
-        self.assertTrue(any(item[0] == 11 and item[3] for item in moved))
+        self.assertEqual(moved[0][3], 0)
+        self.assertTrue(any(item[0] == 11 and item[4] for item in moved))
 
     def test_process_tree_includes_fake_root_pid(self):
         pids = web.process_tree_pids(424242)
         self.assertIn(424242, pids)
+
+    def test_hide_offscreen_window_reapplies_hide_and_keeps_placement(self):
+        original = (10, 20, 1210, 820)
+        offscreen = (-32000, -32000, -30800, -31200)
+        with unittest.mock.patch.dict(web._CHROME_PLACEMENTS, {11: original}, clear=True), \
+             unittest.mock.patch.object(web, "_hwnds_for_pids", return_value=[(11, "Chrome", offscreen)]), \
+             unittest.mock.patch.object(web, "_set_window_rect", return_value=True) as move:
+            self.assertTrue(web.hide_automation_chrome(pids={90001}))
+            self.assertEqual(move.call_args.kwargs["show"], 0)
+            self.assertEqual(web._CHROME_PLACEMENTS[11], original)
+
+    def test_background_attach_never_reveals_during_login_settling(self):
+        for logged_in in (False, True):
+            with self.subTest(logged_in=logged_in), \
+                 unittest.mock.patch.object(web, "reload_paths"), \
+                 unittest.mock.patch.object(web, "cdp_available", return_value=True), \
+                 unittest.mock.patch.object(web, "_adopt_connected_automation_chrome"), \
+                 unittest.mock.patch.object(web, "login_status_from_tabs", return_value={"logged_in": logged_in}), \
+                 unittest.mock.patch.object(web, "hide_automation_chrome", return_value=True) as hide, \
+                 unittest.mock.patch.object(web, "reveal_seller_chrome") as reveal:
+                self.assertEqual(web.start_persistent_chrome(focus=False, hide_if_logged_in=True), "hidden")
+                hide.assert_called_once()
+                reveal.assert_not_called()
+
+    def test_background_start_uses_hidden_launch_and_never_reveals(self):
+        with unittest.mock.patch.object(web, "reload_paths"), \
+             unittest.mock.patch.object(web, "cdp_available", side_effect=[False, True]), \
+             unittest.mock.patch.object(web, "_spawn_chrome") as spawn, \
+             unittest.mock.patch.object(web, "_wait_cdp_ready", return_value=True), \
+             unittest.mock.patch.object(web.time, "sleep"), \
+             unittest.mock.patch.object(web, "login_status_from_tabs", return_value={"logged_in": True}), \
+             unittest.mock.patch.object(web, "hide_automation_chrome", return_value=True), \
+             unittest.mock.patch.object(web, "reveal_seller_chrome") as reveal:
+            self.assertEqual(web.start_persistent_chrome(focus=False, hide_if_logged_in=True), "started")
+            spawn.assert_called_once_with(hidden=True)
+            reveal.assert_not_called()
 
     def test_close_automation_chrome_only_closes_owned_process(self):
         class FakeProcess:

@@ -57,7 +57,13 @@ export default function Sidebar({ current, onChange, className = "" }: SidebarPr
           );
         })}
       </nav>
-      <p className="px-5 py-4 text-xs text-sidebar-muted">本机控制面板 · 仅连接本机 Chrome</p>
+      <div className="shrink-0 px-5 pb-5" aria-label="千牛自动上架品牌标识">
+        <img
+          src="/app-logo.png"
+          alt="千牛自动上架 Logo"
+          className="mx-auto h-auto w-full max-w-46 drop-shadow-[0_10px_28px_rgba(34,211,238,0.25)]"
+        />
+      </div>
     </aside>
   );
 }
@@ -72,7 +78,7 @@ export function PanelFrame({
   children: ReactNode;
 }) {
   return (
-    <section className="flex min-h-0 min-w-0 flex-1 flex-col gap-3 overflow-hidden [@media(min-height:840px)]:gap-4">
+    <section className="flex min-h-0 min-w-0 flex-1 flex-col gap-3 overflow-hidden">
       <header className="shrink-0">
         <h2 className="text-xl font-semibold">{title}</h2>
         {hint ? <p className="mt-1 line-clamp-2 text-sm text-slate-500" title={hint}>{hint}</p> : null}

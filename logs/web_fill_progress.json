@@ -1,0 +1,234 @@
+[
+  {
+    "step": "tab",
+    "url": "https://item.upload.taobao.com/sell/v2/publish.htm?catId=50012720&gpfRenderTrace=213e03b317900911184798449e0a9a&fromAICategory=true&keyProps=%7B%22p-20000%22%3A%7B%22value%22%3A79384374%2C%22text%22%3A%22%E5%8D%A1%E6%B8%B8%22%7D%2C%22p-20000-117700749%22%3A%7B%22value%22%3A-1%2C%22text%22%3A%22%E5%BF%8D%E9%81%93%E7%89%88%E7%AC%AC1%E5%BC%B9%22%7D%7D&fromAIPublish=true&newRouter=1&paramCacheId=merge_router_cache_736472218_1790091129372_784&x-gpf-submit-trace-id=213e03b317900911293448930e0a9a",
+    "how": "reuse-publish"
+  },
+  {
+    "step": "probe",
+    "result": {
+      "title": "",
+      "skuRows": 0,
+      "specImgs": 0,
+      "mainImgs": 0,
+      "p34Imgs": 0,
+      "detailImgs": 4,
+      "popup": false,
+      "specDialog": false
+    },
+    "skips": []
+  },
+  {
+    "step": "tab",
+    "url": "https://item.upload.taobao.com/sell/ai/category.htm",
+    "how": "conflict-new-category"
+  },
+  {
+    "step": "category",
+    "result": {
+      "url": "https://item.upload.taobao.com/sell/v2/publish.htm?catId=50012720&gpfRenderTrace=213e04e017901679153327351e0b94&fromAICategory=true&keyProps=%7B%22p-20000%22%3A%7B%22value%22%3A79384374%2C%22text%22%3A%22%E5%8D%A1%E6%B8%B8%22%7D%2C%22p-20000-117700749%22%3A%7B%22value%22%3A-1%2C%22text%22%3A%22%E5%BF%8D%E9%81%93%E7%89%88%E7%AC%AC1%E5%BC%B9%22%7D%7D&fromAIPublish=true&newRouter=1&paramCacheId=merge_router_cache_736472218_1790167927522_137&x-gpf-submit-trace-id=213e04e017901679274887985e0b94",
+      "leaf": "中性笔",
+      "brand": "卡游",
+      "model": "忍道版第1弹",
+      "opened": "ready",
+      "leafHow": "tab",
+      "brandHow": "exact:卡游",
+      "modelHow": "combo-2"
+    },
+    "attempt": 1
+  },
+  {
+    "step": "attributes",
+    "result": {
+      "title": "晨光大美之诗静音按动中性笔书写行家速干水笔中国风ins高颜值学",
+      "log": [
+        "笔头类型=ITEM:子弹头:stuck",
+        "笔芯颜色=NO_WRAP:none+ITEM:炭黑:stuck",
+        "闭合方式=NO_WRAP:none+ITEM:按动式:stuck",
+        "风格=ITEM:简约:stuck",
+        "功能=ITEM:考试专用:stuck",
+        "适用场景=NO_WRAP:none+ITEM:日常书写:stuck",
+        "适用人群=NO_WRAP:none+ITEM:通用:stuck",
+        "包装方式=ITEM:单支装:stuck",
+        "采购地=already",
+        "IP联名=NO_WRAP:none+ITEM:火影忍者:stuck"
+      ],
+      "missing": [],
+      "href": "https://item.upload.taobao.com/sell/v2/publish.htm?catId=50012720&gpfRenderTrace=213e04e017901679153327351e0b94&fromAICategory=true&keyProps=%7B%22p-20000%22%3A%7B%22value%22%3A79384374%2C%22text%22%3A%22%E5%8D%A1%E6%B8%B8%22%7D%2C%22p-20000-117700749%22%3A%7B%22value%22%3A-1%2C%22text%22%3A%22%E5%BF%8D%E9%81%93%E7%89%88%E7%AC%AC1%E5%BC%B9%22%7D%7D&fromAIPublish=true&newRouter=1&paramCacheId=merge_router_cache_736472218_1790167927522_137&x-gpf-submit-trace-id=213e04e017901679274887985e0b94"
+    },
+    "attempt": 1
+  },
+  {
+    "step": "skus",
+    "result": {
+      "opened": "OPEN",
+      "confirm": "CLICKED",
+      "log": [
+        "【半年够用】12支盒送20支笔芯:ok 商品规格(1)",
+        "【性价比高】5支送20支笔芯:ok 商品规格(2)",
+        "【店铺热销】3支送20支笔芯:ok 商品规格(3)",
+        "【大美之诗静音】12支盒:ok 商品规格(4)",
+        "【大美之诗静音】5支:ok 商品规格(5)",
+        "【大美之诗静音】3支:ok 商品规格(6)",
+        "【体验-不推荐】1支:ok 商品规格(7)",
+        "【两个月推荐】1支笔+10支晨光笔芯:ok 商品规格(8)",
+        "【大美之诗静音】3支+10支晨光笔芯:ok 商品规格(9)",
+        "【大美之诗静音】6支+10支晨光笔芯:ok 商品规格(10)",
+        "【大美之诗静音】3支+20支晨光笔芯:ok 商品规格(11)",
+        "【大美之诗静音】6支+20支晨光笔芯:ok 商品规格(12)",
+        "【够用一学期】1支笔+30支晨光笔芯:ok 商品规格(13)",
+        "多人购买-原装替芯【ST秒干】30支1桶装:ok 商品规格(14)",
+        "原装替芯【ST秒干】10支1盒装:ok 商品规格(15)",
+        "半年够用-【香菜笔】12支送20支笔芯:ok 商品规格(16)",
+        "人气优先-【香菜笔】5支送20支笔芯:ok 商品规格(17)",
+        "热销推荐-【香菜笔】3支送20支笔芯:ok 商品规格(18)",
+        "爆款尝鲜-【香菜笔】3支:ok 商品规格(19)",
+        "品质选择-【香菜笔】5支:ok 商品规格(20)",
+        "整盒推荐-【香菜笔】12支:ok 商品规格(21)"
+      ],
+      "filled": 42,
+      "catLog": [
+        "CLICKED:单品",
+        "CLICKED:单品",
+        "CLICKED:单品",
+        "CLICKED:单品",
+        "CLICKED:单品",
+        "CLICKED:单品",
+        "CLICKED:单品",
+        "CLICKED:单品",
+        "CLICKED:单品",
+        "CLICKED:单品",
+        "CLICKED:单品",
+        "CLICKED:单品",
+        "CLICKED:单品",
+        "CLICKED:单品",
+        "CLICKED:单品",
+        "CLICKED:单品",
+        "CLICKED:单品",
+        "CLICKED:单品",
+        "CLICKED:单品",
+        "CLICKED:单品",
+        "CLICKED:单品"
+      ],
+      "thickLog": [
+        "CLICKED:0.05mm",
+        "CLICKED:0.05mm",
+        "CLICKED:0.05mm",
+        "CLICKED:0.05mm",
+        "CLICKED:0.05mm",
+        "CLICKED:0.05mm",
+        "CLICKED:0.05mm",
+        "CLICKED:0.05mm",
+        "CLICKED:0.05mm",
+        "CLICKED:0.05mm",
+        "CLICKED:0.05mm",
+        "CLICKED:0.05mm",
+        "CLICKED:0.05mm",
+        "CLICKED:0.05mm",
+        "CLICKED:0.05mm",
+        "CLICKED:0.05mm",
+        "CLICKED:0.05mm",
+        "CLICKED:0.05mm",
+        "CLICKED:0.05mm",
+        "CLICKED:0.05mm",
+        "CLICKED:0.05mm"
+      ],
+      "after": {
+        "drawer": false,
+        "skuMode": true,
+        "cats": [
+          {
+            "cat": "",
+            "thick": ""
+          },
+          {
+            "cat": "",
+            "thick": ""
+          },
+          {
+            "cat": "",
+            "thick": ""
+          },
+          {
+            "cat": "",
+            "thick": ""
+          },
+          {
+            "cat": "",
+            "thick": ""
+          },
+          {
+            "cat": "",
+            "thick": ""
+          },
+          {
+            "cat": "",
+            "thick": ""
+          },
+          {
+            "cat": "",
+            "thick": ""
+          },
+          {
+            "cat": "",
+            "thick": ""
+          },
+          {
+            "cat": "",
+            "thick": ""
+          },
+          {
+            "cat": "",
+            "thick": ""
+          },
+          {
+            "cat": "",
+            "thick": ""
+          },
+          {
+            "cat": "",
+            "thick": ""
+          },
+          {
+            "cat": "",
+            "thick": ""
+          },
+          {
+            "cat": "",
+            "thick": ""
+          },
+          {
+            "cat": "",
+            "thick": ""
+          },
+          {
+            "cat": "",
+            "thick": ""
+          },
+          {
+            "cat": "",
+            "thick": ""
+          },
+          {
+            "cat": "",
+            "thick": ""
+          },
+          {
+            "cat": "",
+            "thick": ""
+          },
+          {
+            "cat": "",
+            "thick": ""
+          }
+        ]
+      }
+    },
+    "attempt": 1
+  },
+  {
+    "step": "spec_images",
+    "attempt": 1,
+    "error": "页面操作超时，请重试"
+  }
+]

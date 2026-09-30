@@ -101,25 +101,81 @@ async page => {
     return page.locator('input[placeholder="请输入"][role="combobox"], input[placeholder="请输入"], input[placeholder*="品牌"]');
   }
 
-  async function pickBrandOption(want) {
-    const exact = page.getByText(want, { exact: true });
-    if (await exact.count()) {
-      try {
-        await exact.first().click({ timeout: 2500, force: true });
-        return "exact:" + want;
-      } catch (e) {}
-    }
-    return page.evaluate((value) => {
-      const wraps = [...document.querySelectorAll(".next-overlay-wrapper, .next-menu, [role='listbox']")].filter((el) => getComputedStyle(el).display !== "none");
-      const wrap = wraps[wraps.length - 1];
-      if (!wrap) return "NO_WRAP";
-      const nodes = [...wrap.querySelectorAll("li, .next-menu-item, [role='option'], div, span")];
-      const hit = nodes.find((el) => (el.innerText || "").trim() === value)
-        || nodes.find((el) => (el.innerText || "").includes(value) && (el.innerText || "").trim().length < 40);
-      if (!hit) return "NO_OPTION:" + (wrap.innerText || "").replace(/\s+/g, " ").slice(0, 160);
+  async function pickBrandOption(want, input) {
+    return input.evaluate((field, { value }) => {
+      const visible = el => {
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0 && getComputedStyle(el).visibility !== "hidden";
+      };
+      const norm = text => String(text || "").normalize("NFKC").replace(/\s+/g, "").toLowerCase();
+      // Category brands use custom .options-item[title] divs, not ARIA options.
+      // Scope to the popup containing this search field; other menus may be open.
+      const linked = document.getElementById(field.getAttribute("aria-controls") || field.getAttribute("aria-owns") || "");
+      const parent = field.closest('.next-overlay-wrapper, [role="listbox"]');
+      const popups = [...document.querySelectorAll('.next-overlay-wrapper, [role="listbox"], .next-menu')]
+        .filter(visible);
+      const roots = popups.filter(el => !popups.some(other => other !== el && other.contains(el)));
+      const root = parent || (linked && visible(linked) ? linked : roots.length === 1 ? roots[0] : null);
+      if (!root) return "NO_POPUP:visible=" + roots.length + ":input=" + field.value;
+      const nodes = [...root.querySelectorAll(".options-item, .next-menu-item, [role='option'], [role='menuitem'], li")]
+        .filter(el => visible(el) && el.getAttribute("aria-disabled") !== "true" && !/disabled/.test(el.className || ""));
+      const hit = nodes.find(el => norm(el.getAttribute("title")) === norm(value) || norm(el.innerText) === norm(value));
+      if (!hit) return "NO_OPTION:input=" + field.value + ":options="
+        + nodes.map(el => el.getAttribute("title") || el.innerText).join("|").slice(0, 180)
+        + ":popup=" + (root.innerText || "").replace(/\s+/g, " ").slice(0, 100);
+      const label = hit.getAttribute("title") || hit.innerText;
       hit.click();
-      return "CLICKED:" + (hit.innerText || "").trim().slice(0, 40);
-    }, want);
+      return "CLICKED:" + label.trim().slice(0, 40);
+    }, { value: want });
+  }
+
+  async function brandCommitted(combo, want) {
+    return combo.evaluate((el, { value }) => {
+      const norm = text => String(text || "").normalize("NFKC").replace(/\s+/g, "").toLowerCase();
+      const selected = [el.value, el.getAttribute("aria-valuetext")];
+      const wrap = el.closest('.next-select') || el;
+      for (const item of wrap.querySelectorAll('.next-select-single, .next-select-values, .next-select-tag')) {
+        selected.push(item.textContent, item.getAttribute('title'));
+      }
+      return selected.some(text => norm(text) === norm(value));
+    }, { value: want });
+  }
+
+  async function searchBrand(combo, want) {
+    // Search aliases only narrow the server query; selection still requires the full brand.
+    const queries = [...new Set([want, (want.match(/[\u3400-\u9fff]+/g) || []).join("")].filter(Boolean))];
+    let last = "NO_OPTION";
+    const attempts = [];
+    for (let attempt = 0; attempt < 2; attempt++) {
+      for (const query of queries) {
+        await combo.click({ timeout: 5000 });
+        await sleep(200);
+        const customInputs = page.locator('.next-overlay-wrapper .options-search input:not([readonly]):visible');
+        const popupInputs = page.locator('.next-overlay-wrapper input:not([readonly]):not([type="checkbox"]):not([type="radio"]):visible, [role="listbox"] input:not([readonly]):visible');
+        const ownInput = combo.locator('input:visible');
+        const input = await customInputs.count() === 1 ? customInputs.first()
+          : await popupInputs.count() === 1 ? popupInputs.first()
+          : await ownInput.count() ? ownInput.first() : combo;
+        // Never type into an unrelated textbox (for example the model field).
+        await input.fill("");
+        await input.fill(query);
+        for (let poll = 0; poll < 12; poll++) {
+          await sleep(350);
+          last = await pickBrandOption(want, input);
+          if (last.startsWith("CLICKED:")) {
+            for (let check = 0; check < 5; check++) {
+              await sleep(120);
+              if (await brandCommitted(combo, want)) return last + ":query=" + query + ":verified";
+            }
+            last = "NOT_COMMITTED:" + last;
+            break;
+          }
+        }
+        attempts.push(query + "=>" + last);
+        await page.keyboard.press("Escape");
+      }
+    }
+    return last + ":attempts=" + attempts.join(";").slice(0, 900);
   }
 
   const opened = await openSearchPublish();
@@ -152,13 +208,7 @@ async page => {
         throw new Error("PAUSE:类目页没有品牌输入框，请确认已选择 " + leaf);
       }
     } else {
-      await combos.first().click({ force: true, timeout: 5000 });
-      await sleep(300);
-      const box = page.getByRole("textbox").last();
-      if (await box.count()) await box.fill(brand);
-      else await page.keyboard.type(brand, { delay: 25 });
-      await sleep(800);
-      brandHow = await pickBrandOption(brand);
+      brandHow = await searchBrand(combos.first(), brand);
       if (String(brandHow).indexOf("CLICKED") < 0 && String(brandHow).indexOf("exact") < 0) {
         throw new Error("PAUSE:类目页未选中品牌 " + brand + " " + brandHow);
       }

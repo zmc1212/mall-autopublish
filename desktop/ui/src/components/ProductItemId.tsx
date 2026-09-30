@@ -10,8 +10,12 @@ interface ProductItemIdProps {
 
 async function copyText(value: string) {
   if (navigator.clipboard?.writeText) {
-    await navigator.clipboard.writeText(value);
-    return;
+    try {
+      await navigator.clipboard.writeText(value);
+      return;
+    } catch {
+      // Some embedded browser contexts expose Clipboard API but deny permission.
+    }
   }
 
   const input = document.createElement("textarea");

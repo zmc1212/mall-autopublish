@@ -5,26 +5,34 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import sys
+import threading
 
 from .paths import find_resource, project_root
 
+_load_lock = threading.RLock()
+
 
 def load_named(module_name: str, filename: str):
-    existing = sys.modules.get(module_name)
-    if existing is not None:
-        return existing
-    path = find_resource(filename)
-    if not path.is_file():
-        path = project_root() / filename
-    if path.is_file():
-        spec = importlib.util.spec_from_file_location(module_name, path)
-        if spec is None or spec.loader is None:
-            raise ImportError(f"无法加载 {filename}")
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[module_name] = module
-        spec.loader.exec_module(module)
-        return module
-    return importlib.import_module(module_name)
+    with _load_lock:
+        existing = sys.modules.get(module_name)
+        if existing is not None:
+            return existing
+        path = find_resource(filename)
+        if not path.is_file():
+            path = project_root() / filename
+        if path.is_file():
+            spec = importlib.util.spec_from_file_location(module_name, path)
+            if spec is None or spec.loader is None:
+                raise ImportError(f"无法加载 {filename}")
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = module
+            try:
+                spec.loader.exec_module(module)
+            except BaseException:
+                sys.modules.pop(module_name, None)
+                raise
+            return module
+        return importlib.import_module(module_name)
 
 
 def load_seller():

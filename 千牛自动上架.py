@@ -1,4 +1,4 @@
-import argparse, json, os, re, sys, uuid, importlib, importlib.util
+import argparse, json, os, re, sys, uuid, importlib, importlib.util, hashlib
 from io import BytesIO
 from collections import Counter
 from pathlib import Path
@@ -31,7 +31,7 @@ TEMPLATE_HEADERS = [
     "商品标识*", "商品标题*", "品牌*", "型号", "图片包路径*",
     "商品属性模板*", "物流模板*", "销售模板*",
     "价格*", "库存*", "运费模板", "导购标题", "货号",
-    "处理状态", "错误信息",
+    "处理状态", "错误信息", "商品属性(JSON)",
 ]
 SKU_HEADERS = ["商品标识", "色号", "规格名称", "价格", "库存"]
 NARUTO_PACK_NAME = "卡游火影忍者中性笔盲盒忍道版第1弹隐藏款鸣人水门动漫文具周边"
@@ -57,6 +57,7 @@ def _load_parser():
 
 _parser = _load_parser()
 scan_image_pack = _parser.scan_image_pack
+IMAGE_EXTS = _parser.IMAGE_EXTS
 load_templates = _parser.load_templates
 load_registry = _parser.load_registry
 resolve_product = _parser.resolve_product
@@ -179,6 +180,22 @@ def hydrate_template_row(data, sku_rows, base_dir, errors):
 
 def category_profile(category):
     text = str(category or "")
+    # 必填属性优先取属性模板 JSON 的 required_attributes：新增类目只需加模板
+    # 文件并在 registry 登记，不必改代码。硬编码表保留为模板缺失时的回退
+    # （如修正带尚无模板数据）。
+    try:
+        registry = load_registry()
+    except Exception:
+        registry = {"attributes": []}
+    for name in registry.get("attributes") or []:
+        if name and name in text:
+            try:
+                template = load_templates({"attributes": name}).get("attributes") or {}
+            except Exception:
+                template = {}
+            required = template.get("required_attributes")
+            if isinstance(required, list) and required:
+                return str(template.get("name") or name), {str(item) for item in required}
     for name, required in CATEGORY_ATTRIBUTES.items():
         if name in text:
             return name, required
@@ -194,9 +211,34 @@ def resolve_path(raw, base_dir):
     return path if path.is_absolute() else Path(base_dir or Path.cwd()) / path
 
 
+def pack_fingerprint(raw, base_dir):
+    """图片包内容指纹：顶层图片的（文件名, 内容 md5）摘要，与 scan_image_pack
+    同样只看第一层。用于识别同一商品文件夹被换成新商品的情况。"""
+    value = str(raw or "").strip()
+    if not value:
+        return ""
+    folder = resolve_path(value, base_dir)
+    if not folder.is_dir():
+        return ""
+    parts = []
+    try:
+        for path in sorted(folder.iterdir()):
+            if not path.is_file() or path.suffix.lower() not in IMAGE_EXTS:
+                continue
+            digest = hashlib.md5(path.read_bytes()).hexdigest()
+            parts.append(f"{path.name}:{digest}")
+    except OSError:
+        return ""
+    if not parts:
+        return ""
+    return hashlib.md5("\n".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
 def inspect_images(value, field, base_dir, kind, errors):
     paths = split_paths(value)
-    if kind != "detail" and len(paths) > 5:
+    # 1:1主图不设5张上限：图片包可能同时带“宝贝主图”“方图主图”两组备选，
+    # 只要其中一组存在即视为通过；超出页面上传位的部分在执行阶段截取。
+    if kind == "portrait" and len(paths) > 5:
         errors.append(f"{field}: 最多5张，当前{len(paths)}张")
     for raw in paths:
         path = resolve_path(raw, base_dir)
@@ -287,8 +329,6 @@ def validate_row(headers, values, row, base_dir=None, sku_rows=None):
         brand = str(data.get("品牌")).strip()
     if brand and present(data.get("品牌")) and str(data.get("品牌")).strip() != brand:
         errors.append("品牌: 与商品属性中的品牌不一致")
-    if brand and brand not in title:
-        errors.append("商品标题*: 必须包含品牌属性，避免标题与品牌不一致")
     for field in ("价格*", "库存*"):
         if present(data.get(field)) and not valid_number(data[field], field == "库存*"):
             errors.append(f"{field}: 必须为非负整数" if field == "库存*" else f"{field}: 必须为大于零的有限数字")
@@ -351,8 +391,6 @@ def validate_product(product, base_dir=None):
                 errors.append(f"商品属性(JSON): 缺少{name}必填属性: " + "、".join(missing))
     if not brand:
         errors.append("品牌: 必须填写")
-    elif brand not in title:
-        errors.append("商品标题*: 必须包含品牌属性，避免标题与品牌不一致")
     if present(title) and title_width(title) > 60:
         errors.append("商品标题*: 超过30个汉字（60字符）")
     listing = str(product.get("listing_time") or product.get("上架时间") or "").strip()
@@ -460,6 +498,37 @@ def read_products(path):
     yield from rows
 
 
+def stamp_list_item_ids(wb, entries):
+    """把淘宝商品ID按Excel行号回填到“商品清单”sheet，方便在商品列表里直接看到新商品ID。"""
+    if "商品清单" not in wb.sheetnames:
+        return
+    ws = wb["商品清单"]
+    id_col = None
+    last_header_col = 0
+    for col in range(1, ws.max_column + 1):
+        header = str(ws.cell(row=1, column=col).value or "").strip()
+        if header == "淘宝商品ID":
+            id_col = col
+            break
+        if present(ws.cell(row=1, column=col).value):
+            last_header_col = col
+    if id_col is None:
+        id_col = last_header_col + 1
+        ws.cell(row=1, column=id_col, value="淘宝商品ID")
+    ids = {}
+    for entry in entries:
+        values = list(entry) + [""] * (8 - len(entry))
+        try:
+            row_no = int(values[1])
+        except (TypeError, ValueError):
+            continue
+        if values[7]:
+            ids[row_no] = str(values[7])
+    for row_no, item_id in ids.items():
+        if 2 <= row_no <= ws.max_row:
+            ws.cell(row=row_no, column=id_col, value=item_id)
+
+
 def write_log(path, entries, output=None):
     source = Path(path).resolve()
     target = Path(output).resolve() if output else source.with_name(source.stem + ".校验结果.xlsx")
@@ -471,9 +540,10 @@ def write_log(path, entries, output=None):
         ws = wb["处理日志"] if "处理日志" in wb.sheetnames else wb.create_sheet("处理日志")
         previous = [list(row) for row in ws.iter_rows(min_row=2, values_only=True) if any(present(v) for v in row)]
         ws.delete_rows(1, ws.max_row)
-        ws.append(["时间", "Excel行号", "商品标识", "结果", "失败字段", "页面提示", "详情", "淘宝商品ID"])
+        ws.append(["时间", "Excel行号", "商品标识", "结果", "失败字段", "页面提示", "详情", "淘宝商品ID", "耗时"])
         for entry in previous + entries:
             ws.append([excel_safe(v) for v in entry])
+        stamp_list_item_ids(wb, previous + entries)
         target.parent.mkdir(parents=True, exist_ok=True)
         wb.save(temp)
         os.replace(temp, target)
@@ -504,6 +574,7 @@ def validate_workbook(path):
             "execution": "未执行",
             "notice": "",
             "errors": errors,
+            "pack_fingerprint": pack_fingerprint(data.get("图片包路径*"), base_dir),
             "product": row_to_product(data, base_dir, related),
         }
         results.append(item)
@@ -570,9 +641,9 @@ def _write_option_column(sheet, column, values):
 
 FIELD_NOTES = [
     ["商品标识", "工具必填", "火影-001", "日志关联用；不要写「示例」"],
-    ["商品标题", "平台必填", "最多30汉字", "必须包含品牌全文，文件夹全名超长时请缩短"],
-    ["品牌 / 型号", "品牌必填", "卡游 / 忍道版第1弹", "品牌、型号、标题不进分类模板，每条商品自填"],
-    ["图片包路径", "必填", "扁平文件夹", "不要再手填主图路径。文件名规则如下"],
+    ["商品标题", "自动生成", "图片夹名称（最多30汉字）", "扫描时自动采用图片夹名称；表格内非空标题优先"],
+    ["品牌 / 型号", "模板默认", "卡游 / 忍道版第1弹", "留空使用商品属性模板默认值；表格内非空值优先"],
+    ["图片包路径", "必填", NARUTO_PACK_NAME, "填写与 Excel 同目录的文件夹名，或相对于 Excel 的路径；推荐在软件中选择工作空间自动生成总表"],
     ["图片包·1:1主图", "平台必填", "宝贝主图01.jpg …", "按文件名排序，最多用5张"],
     ["图片包·3:4主图", "非必填", "文件名含 3比4 / 3-4", "缺则跳过；也可按接近 3:4 的像素归入"],
     ["图片包·详情图", "建议", "详情01.jpg …", "按文件名排序；扩展名 jpg/png/webp 均可"],
@@ -645,7 +716,7 @@ def write_listing_workbook(path, product_rows=None, sku_rows=None, log_rows=None
         notes.column_dimensions[get_column_letter(index)].width = width
     _style_header(notes, header_fill, header_font, wrap, thin)
     log = wb.create_sheet("处理日志")
-    log.append(["时间", "Excel行号", "商品标识", "结果", "失败字段", "页面提示", "详情", "淘宝商品ID"])
+    log.append(["时间", "Excel行号", "商品标识", "结果", "失败字段", "页面提示", "详情", "淘宝商品ID", "耗时"])
     for entry in log_rows or []:
         log.append([excel_safe(value) for value in entry])
     _style_header(log, header_fill, header_font, wrap, thin)
@@ -655,7 +726,7 @@ def write_listing_workbook(path, product_rows=None, sku_rows=None, log_rows=None
 
 
 def create_template(path):
-    pack_rel = relative_pack_path(path)
+    pack_rel = NARUTO_PACK_NAME
     pack = naruto_pack_dir()
     scanned = scan_image_pack(pack) if pack.is_dir() else {"skus": []}
     product_rows = [{

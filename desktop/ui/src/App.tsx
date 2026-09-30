@@ -3,12 +3,15 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api, nativeOpen, nativePick } from "./api";
 import ConnectPanel from "./components/ConnectPanel";
 import RunPanel from "./components/RunPanel";
+import RunNotifications from "./components/RunNotifications";
 import SettingsPanel from "./components/SettingsPanel";
 import Sidebar from "./components/Sidebar";
 import type { NavId } from "./components/Sidebar";
 import StatusBar from "./components/StatusBar";
+import ToastHost from "./components/ToastHost";
 import WorkbookPanel from "./components/WorkbookPanel";
-import type { AppSettings, AppStatus, WorkspaceDefaults } from "./types";
+import type { AppSettings, AppStatus, SyncSummary, WorkbookRow, WorkspaceDefaults } from "./types";
+import { pushToast } from "./utils/toasts";
 
 const LAST_WORKBOOK_KEY = "qianniu.lastWorkbook";
 const LAST_WORKSPACE_KEY = "qianniu.lastWorkspace";
@@ -18,13 +21,17 @@ const EMPTY_SETTINGS: AppSettings = {
   chrome_profile: "",
   cdp_port: 9222,
   debug_browser: false,
-  confirm_submit: false,
+  sku_template_import: false,
+  skip_spec_images: false,
+  sku_image_strategy: "slim_material",
+  settings_version: 3,
   limit: 0,
+  spec_upload_batch_size: 2,
   results_dir: "",
 };
 
 const EMPTY_DEFAULTS: WorkspaceDefaults = {
-  brand: "",
+  brand: "卡游",
   attributes_template: "中性笔",
   logistics_template: "48小时",
   sales_template: "仓库多规格",
@@ -57,26 +64,47 @@ function clearLocal(key: string) {
   }
 }
 
+function displayName(path: string) {
+  const normalized = path.replace(/[\\/]+$/, "");
+  return normalized.split(/[\\/]/).pop() || normalized;
+}
+
+function syncNotice(snap: { sync?: SyncSummary } | undefined, message: string) {
+  const sync = snap?.sync;
+  if (!sync) return message;
+  const parts: string[] = [];
+  if (sync.added?.length) parts.push(`新增 ${sync.added.length} 款`);
+  if (sync.removed?.length) parts.push(`移除 ${sync.removed.length} 款`);
+  return parts.length ? `${message}（${parts.join("，")}）` : message;
+}
+
 export default function App() {
   const [nav, setNav] = useState<NavId>("connect");
   const [status, setStatus] = useState<AppStatus | null>(null);
-  const [error, setError] = useState("");
-  const [busy, setBusy] = useState(false);
+  const [pending, setPending] = useState<ReadonlySet<string>>(new Set());
   const [pathDraft, setPathDraft] = useState("");
   const [workspaceDraft, setWorkspaceDraft] = useState("");
-  const [confirmSubmit, setConfirmSubmit] = useState(false);
-  const [forceNew, setForceNew] = useState(false);
+  const [detailRow, setDetailRow] = useState<WorkbookRow | null>(null);
   const [retryFailed, setRetryFailed] = useState(false);
   const [limit, setLimit] = useState("");
   const [settingsDraft, setSettingsDraft] = useState<AppSettings>(EMPTY_SETTINGS);
   const [defaultsDraft, setDefaultsDraft] = useState<WorkspaceDefaults>(EMPTY_DEFAULTS);
-  const [notice, setNotice] = useState("");
+  const [selectedCategories, setSelectedCategories] = useState<string[]>([]);
+  const [scanDecisionOpen, setScanDecisionOpen] = useState(false);
   const hydrated = useRef(false);
-  const keepError = useRef(false);
+  const offline = useRef(false);
+  const restoreNotified = useRef(false);
   const autoImporting = useRef(false);
+  const categorySelectionDirty = useRef(false);
+  const pathDraftDirty = useRef(false);
+  const workspaceDraftDirty = useRef(false);
+  const lastRev = useRef("");
 
   const refresh = useCallback(async () => {
     let next = await api.status();
+    if (next._rev && next._rev === lastRev.current) {
+      return next; // 状态内容未变：跳过 setState，避免空闲时整树重渲染
+    }
     if (!next.job.workbook_path && !next.job.workspace_path && !autoImporting.current) {
       const savedWorkspace = readLocal(LAST_WORKSPACE_KEY);
       const saved = readLocal(LAST_WORKBOOK_KEY);
@@ -85,59 +113,83 @@ export default function App() {
         try {
           await api.openWorkspace(savedWorkspace);
           next = await api.status();
-          setNotice(`已恢复上次工作空间：${savedWorkspace}`);
-        } catch (exc) {
+          pushToast("success", `已恢复上次工作空间：${displayName(savedWorkspace)}`);
+        } catch {
           clearLocal(LAST_WORKSPACE_KEY);
-          setNotice(exc instanceof Error ? `上次工作空间无法自动打开：${exc.message}` : "上次工作空间无法自动打开，请重新选择");
+          pushToast("warning", "上次工作空间无法自动打开，请重新选择");
         }
       } else if (saved) {
         autoImporting.current = true;
         try {
           await api.importWorkbook(saved);
           next = await api.status();
-          setNotice(`已恢复上次清单：${saved}`);
-        } catch (exc) {
+          pushToast("success", `已恢复上次清单：${displayName(saved)}`);
+        } catch {
           clearLocal(LAST_WORKBOOK_KEY);
-          setNotice(exc instanceof Error ? `上次清单无法自动打开：${exc.message}` : "上次清单无法自动打开，请重新选择 Excel");
+          pushToast("warning", "上次清单无法自动打开，请重新选择 Excel");
         }
       }
     }
     if (next.job.workspace_path) {
       writeLocal(LAST_WORKSPACE_KEY, next.job.workspace_path);
-      if (next.job.restored) {
-        setNotice((current) => current || `已恢复上次工作空间：${next.job.workspace_path}`);
+      if (next.job.restored && !restoreNotified.current) {
+        restoreNotified.current = true;
+        pushToast("success", `已恢复上次工作空间：${displayName(next.job.workspace_path || "")}`);
       }
     } else if (next.job.workbook_path) {
       writeLocal(LAST_WORKBOOK_KEY, next.job.workbook_path);
-      if (next.job.restored) {
-        setNotice((current) => current || `已恢复上次清单：${next.job.workbook_path}`);
+      if (next.job.restored && !restoreNotified.current) {
+        restoreNotified.current = true;
+        pushToast("success", `已恢复上次清单：${displayName(next.job.workbook_path || "")}`);
       }
     }
     setStatus(next);
-    setWorkspaceDraft((current) => current || next.job.workspace_path || next.workspace?.path || "");
-    setPathDraft((current) => current || next.job.workbook_path || "");
+    lastRev.current = next._rev || "";
+    // 用户编辑过输入框后（含清空），轮询不再回填服务端路径，避免"跳回旧值"
+    if (!workspaceDraftDirty.current) {
+      setWorkspaceDraft(next.job.workspace_path || next.workspace?.path || "");
+    }
+    if (!pathDraftDirty.current) {
+      setPathDraft(next.job.workbook_path || "");
+    }
     if (next.workspace?.defaults) {
       setDefaultsDraft((current) => (hydrated.current ? current : next.workspace?.defaults || current));
+    }
+    if (!categorySelectionDirty.current && next.workspace?.scan?.categories) {
+      setSelectedCategories(
+        next.workspace.scan.categories.filter((item) => item.selected).map((item) => item.name),
+      );
     }
     if (!hydrated.current) {
       hydrated.current = true;
       setSettingsDraft(next.settings);
-      setConfirmSubmit(next.settings.confirm_submit);
       if (next.settings.limit) setLimit(String(next.settings.limit));
       if (next.workspace?.defaults) setDefaultsDraft(next.workspace.defaults);
     }
     return next;
   }, []);
 
+  // 首次进入自动检测一次登录态：浏览器 profile 里有登录记录时直接显示
+  // 「已登录」，不再要求用户手动点击「登录卖家中心」。失败不影响状态轮询。
+  useEffect(() => {
+    void api.checkLogin().catch(() => {});
+  }, []);
+
   useEffect(() => {
     let timer = 0;
     const tick = async () => {
+      if (document.hidden) return; // 窗口隐藏时暂停轮询，回前台后立即补一次
       try {
         await refresh();
-        if (!keepError.current) setError("");
+        if (offline.current) {
+          offline.current = false;
+          pushToast("success", "与本地服务的连接已恢复");
+        }
       } catch (exc) {
-        if (!keepError.current) {
-          setError(exc instanceof Error ? exc.message : String(exc));
+        const message = exc instanceof Error ? exc.message : String(exc);
+        if (!offline.current) {
+          offline.current = true;
+          pushToast("error", `与本地服务失去连接：${message}`);
         }
       }
     };
@@ -145,22 +197,41 @@ export default function App() {
     timer = window.setInterval(() => {
       void tick();
     }, 1200);
-    return () => window.clearInterval(timer);
+    const onVisibility = () => {
+      if (!document.hidden) void tick();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
   }, [refresh]);
 
-  const run = async (action: () => Promise<unknown>) => {
-    setBusy(true);
-    setError("");
-    keepError.current = false;
-    try {
-      await action();
-      await refresh();
-    } catch (exc) {
-      keepError.current = true;
-      setError(exc instanceof Error ? exc.message : String(exc));
-    } finally {
-      setBusy(false);
+  const runAction = useCallback(
+    async (key: string, action: () => Promise<unknown>) => {
+      setPending((current) => new Set(current).add(key));
+      try {
+        await action();
+        await refresh();
+      } catch (exc) {
+        pushToast("error", exc instanceof Error ? exc.message : String(exc));
+      } finally {
+        setPending((current) => {
+          if (!current.has(key)) return current;
+          const next = new Set(current);
+          next.delete(key);
+          return next;
+        });
+      }
+    },
+    [refresh],
+  );
+
+  const familyBusy = (prefix: string) => {
+    for (const key of pending) {
+      if (key.startsWith(prefix)) return true;
     }
+    return false;
   };
 
   const chrome = status?.chrome ?? null;
@@ -171,29 +242,17 @@ export default function App() {
       <Sidebar current={nav} onChange={setNav} />
       <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
         <StatusBar chrome={chrome} loading={!status} />
-        <main className="flex min-h-0 flex-1 flex-col overflow-hidden p-4 [@media(min-height:840px)]:p-6">
-          {error ? (
-            <p className="mb-4 shrink-0 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-destructive" role="alert">
-              {error}
-            </p>
-          ) : null}
-          {notice && nav !== "connect" ? (
-            <p className="mb-4 shrink-0 truncate rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-800" title={notice}>
-              {notice}
-            </p>
-          ) : null}
+        <main className="flex min-h-0 flex-1 flex-col overflow-hidden p-4">
           {nav === "connect" ? (
             <ConnectPanel
               chrome={chrome}
-              busy={busy}
-              notice={notice}
+              busy={familyBusy("connect.")}
               onOpen={() =>
-                run(async () => {
+                runAction("connect.open", async () => {
                   const result = await api.openChrome();
-                  setNotice(result.notice || "请在弹出窗口登录一次");
+                  pushToast("info", result.notice || "请在弹出窗口登录一次");
                 })
               }
-              onRevealProfile={() => nativeOpen(chrome?.profile || "")}
             />
           ) : null}
           {nav === "workbook" ? (
@@ -201,45 +260,69 @@ export default function App() {
               job={job}
               workspace={status?.workspace ?? null}
               workspaceDraft={workspaceDraft}
-              onWorkspaceDraft={setWorkspaceDraft}
+              onWorkspaceDraft={(value) => {
+                workspaceDraftDirty.current = true;
+                setWorkspaceDraft(value);
+              }}
               excelDraft={pathDraft}
-              onExcelDraft={setPathDraft}
+              onExcelDraft={(value) => {
+                pathDraftDirty.current = true;
+                setPathDraft(value);
+              }}
               defaults={defaultsDraft}
               onDefaultsChange={setDefaultsDraft}
-              busy={busy}
+              selectedCategories={selectedCategories}
+              onSelectedCategoriesChange={(value) => {
+                categorySelectionDirty.current = true;
+                setSelectedCategories(value);
+              }}
+              busy={familyBusy("workbook.")}
+              pending={pending}
               onPickWorkspace={() =>
-                run(async () => {
+                runAction("workbook.pickWorkspace", async () => {
                   const picked = await nativePick("pick_folder");
                   if (picked) {
                     setWorkspaceDraft(picked);
                     const snap = await api.openWorkspace(picked);
+                    categorySelectionDirty.current = false;
+                    setSelectedCategories(
+                      (snap.workspace?.scan?.categories || []).filter((item) => item.selected).map((item) => item.name),
+                    );
                     writeLocal(LAST_WORKSPACE_KEY, picked);
                     if (snap.workspace?.defaults) setDefaultsDraft(snap.workspace.defaults);
-                    setNotice(`已打开工作空间：${picked}`);
+                    setScanDecisionOpen((snap.count || 0) > 0);
+                    pushToast("success", syncNotice(snap, `已打开工作空间：${displayName(picked)}`));
                   }
                 })
               }
               onRescan={() =>
-                run(async () => {
+                runAction("workbook.rescan", async () => {
                   const target = workspaceDraft.trim() || job?.workspace_path || "";
-                  const snap =
-                    target && target !== job?.workspace_path
-                      ? await api.openWorkspace(target)
-                      : await api.rescanWorkspace();
+                  const changedWorkspace = Boolean(target && target !== job?.workspace_path);
+                  const snap = changedWorkspace
+                    ? await api.openWorkspace(target)
+                    : await api.rescanWorkspace(
+                        categorySelectionDirty.current ? selectedCategories : undefined,
+                      );
+                  categorySelectionDirty.current = false;
+                  setSelectedCategories(
+                    (snap.workspace?.scan?.categories || []).filter((item) => item.selected).map((item) => item.name),
+                  );
                   if (snap.workspace?.defaults) setDefaultsDraft(snap.workspace.defaults);
-                  setNotice("已扫描并更新商品清单");
+                  setScanDecisionOpen((snap.count || 0) > 0);
+                  pushToast("success", syncNotice(snap, "已扫描并更新商品清单"));
                 })
               }
               onOpenFolder={() => nativeOpen(workspaceDraft.trim() || job?.workspace_path || "")}
               onSaveDefaults={() =>
-                run(async () => {
+                runAction("workbook.saveDefaults", async () => {
                   const saved = await api.saveWorkspaceDefaults(defaultsDraft);
                   setDefaultsDraft(saved.defaults);
-                  setNotice("已保存批次默认");
+                  pushToast("success", "已保存批次默认");
                 })
               }
               onPickExcel={() =>
-                run(async () => {
+                runAction("workbook.pickExcel", async () => {
                   const picked = await nativePick("pick_excel");
                   if (picked) {
                     setPathDraft(picked);
@@ -248,10 +331,27 @@ export default function App() {
                   }
                 })
               }
-              onImportExcel={() => run(() => api.importWorkbook(pathDraft.trim()))}
-              onValidate={() => run(() => api.validateWorkbook())}
+              onImportExcel={() => runAction("workbook.import", () => api.importWorkbook(pathDraft.trim()))}
+              onValidate={() =>
+                runAction("workbook.validate", async () => {
+                  const snap = await api.validateWorkbook();
+                  pushToast("success", syncNotice(snap, "已重新扫描并校验商品清单"));
+                })
+              }
+              scanDecisionOpen={scanDecisionOpen}
+              onCloseScanDecision={() => setScanDecisionOpen(false)}
+              onOpenGeneratedWorkbook={() => {
+                setScanDecisionOpen(false);
+                pushToast("info", "已打开商品清单，补充后回到软件点击“校验”");
+                return nativeOpen(job?.workbook_path || "");
+              }}
+              onUseDefaults={() => {
+                setScanDecisionOpen(false);
+                setNav("run");
+                pushToast("success", "已采用扫描结果和默认值，可直接开始执行");
+              }}
               onTemplate={() =>
-                run(async () => {
+                runAction("workbook.template", async () => {
                   const picked = await nativePick("save_template");
                   const target =
                     picked ||
@@ -268,53 +368,69 @@ export default function App() {
           {nav === "run" ? (
             <RunPanel
               job={job}
-              confirmSubmit={confirmSubmit}
-              forceNew={forceNew}
+              detailRow={detailRow}
               retryFailed={retryFailed}
               limit={limit}
-              busy={busy}
-              onConfirmSubmit={setConfirmSubmit}
-              onForceNew={setForceNew}
+              busy={familyBusy("run.")}
+              pending={pending}
               onRetryFailed={setRetryFailed}
               onLimit={setLimit}
               onStart={() =>
-                run(() => api.startJob(confirmSubmit, Number(limit || 0), forceNew, retryFailed))
+                runAction("run.start", () => api.startJob(Number(limit || 0), false, retryFailed))
               }
-              onStop={() => run(() => api.stopJob())}
+              onStop={() => runAction("run.stop", () => api.stopJob())}
               onOpenResult={() => nativeOpen(job?.result_xlsx || "")}
               onOpenItem={(row, action) =>
-                run(() => api.openItem(row.row, row.product_id, action))
+                runAction(`run.openItem.${row.row}`, () => api.openItem(row.row, row.product_id, action))
               }
+              onClearItem={(row) => runAction(`run.clearItem.${row.row}`, () => api.clearItem(row.row, row.product_id))}
             />
           ) : null}
           {nav === "settings" ? (
             <SettingsPanel
               settings={status?.settings ?? null}
+              chrome={chrome}
+              job={job}
               draft={settingsDraft}
-              busy={busy}
+              busy={familyBusy("settings.")}
+              pending={pending}
               onChange={setSettingsDraft}
               onPickChrome={() =>
-                run(async () => {
+                runAction("settings.pickChrome", async () => {
                   const picked = await nativePick("pick_chrome");
                   if (picked) setSettingsDraft((current) => ({ ...current, chrome_path: picked }));
                 })
               }
               onPickProfile={() =>
-                run(async () => {
+                runAction("settings.pickProfile", async () => {
                   const picked = await nativePick("pick_folder");
                   if (picked) setSettingsDraft((current) => ({ ...current, chrome_profile: picked }));
                 })
               }
               onPickResults={() =>
-                run(async () => {
+                runAction("settings.pickResults", async () => {
                   const picked = await nativePick("pick_folder");
                   if (picked) setSettingsDraft((current) => ({ ...current, results_dir: picked }));
                 })
               }
-              onSave={() => run(() => api.saveSettings(settingsDraft))}
+              onSave={() =>
+                runAction("settings.save", async () => {
+                  const saved = await api.saveSettings(settingsDraft);
+                  // 用服务端返回的规范值刷新草稿，避免保存后草稿与后端脱钩
+                  setSettingsDraft(saved);
+                  pushToast("success", "设置已保存，将用于下一次打开千牛窗口和入库任务");
+                })
+              }
             />
           ) : null}
         </main>
+        <RunNotifications
+          job={job}
+          busy={familyBusy("run.")}
+          onDetails={(row) => { setDetailRow({ ...row }); setNav("run"); }}
+          onEdit={(row) => { void runAction(`run.openItem.${row.row}`, () => api.openItem(row.row, row.product_id, "edit")); }}
+        />
+        <ToastHost />
       </div>
     </div>
   );

@@ -11,6 +11,7 @@ from pathlib import Path
 APP_NAME = "千牛自动上架"
 CDP_DEFAULT = 9222
 SELLER_HOME = "https://myseller.taobao.com/"
+_managed_browser_env = ""
 
 
 def is_frozen() -> bool:
@@ -129,6 +130,25 @@ def cli_js_path() -> Path:
     return find_resource(".work", "node_modules", "playwright-core", "lib", "tools", "cli-client", "cli.js")
 
 
+def bundled_browser_dir() -> Path:
+    """Return the browser directory shipped beside the application, if present."""
+    return find_resource("browser", "chromium")
+
+
+def bundled_browser_path() -> Path | None:
+    candidate = bundled_browser_dir() / "chrome.exe"
+    return candidate if candidate.is_file() else None
+
+
+def webview2_runtime_dir() -> Path | None:
+    """Return the private WebView2 runtime shipped with the application."""
+    candidate = find_resource("webview2")
+    required = ("msedgewebview2.exe", "msedge.dll", "resources.pak", "icudtl.dat")
+    if candidate.is_dir() and all((candidate / item).is_file() for item in required):
+        return candidate
+    return None
+
+
 def node_exe_path() -> Path | None:
     override = os.environ.get("QIANNIU_NODE")
     if override and Path(override).is_file():
@@ -147,10 +167,8 @@ def node_exe_path() -> Path | None:
     return None
 
 
-def detect_chrome() -> Path | None:
-    override = os.environ.get("QIANNIU_CHROME") or os.environ.get("CHROME_PATH")
-    if override and Path(override).is_file():
-        return Path(override)
+def detect_system_chrome() -> Path | None:
+    """Find an installed Google Chrome without considering our bundled browser."""
     candidates = []
     for key in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
         base = os.environ.get(key)
@@ -182,18 +200,62 @@ def detect_chrome() -> Path | None:
     return None
 
 
+def browser_exe_path(chrome_path: str | Path | None = None) -> Path | None:
+    """Resolve the browser in custom -> bundled -> system order."""
+    env_override = os.environ.get("QIANNIU_CHROME") or os.environ.get("CHROME_PATH") or ""
+    if env_override == _managed_browser_env:
+        env_override = ""
+    override = str(chrome_path or env_override).strip()
+    if override:
+        candidate = Path(override).expanduser()
+        if candidate.is_file():
+            return candidate
+    bundled = bundled_browser_path()
+    if bundled:
+        return bundled
+    return detect_system_chrome()
+
+
+def detect_chrome() -> Path | None:
+    """Backward-compatible alias for the effective browser path."""
+    return browser_exe_path()
+
+
+def browser_source(chrome_path: str | Path | None = None) -> str:
+    resolved = browser_exe_path(chrome_path)
+    if not resolved:
+        return "missing"
+    try:
+        if resolved.resolve() == (bundled_browser_path() or Path()).resolve():
+            return "bundled"
+    except OSError:
+        pass
+    if chrome_path and Path(str(chrome_path)).is_file():
+        return "custom"
+    env_override = os.environ.get("QIANNIU_CHROME") or os.environ.get("CHROME_PATH") or ""
+    if env_override and env_override != _managed_browser_env and Path(env_override).is_file():
+        return "custom"
+    return "system"
+
+
 @dataclass
 class Settings:
     chrome_path: str = ""
     chrome_profile: str = ""
     cdp_port: int = CDP_DEFAULT
     debug_browser: bool = False
-    confirm_submit: bool = False
+    sku_template_import: bool = False
+    skip_spec_images: bool = False
+    sku_image_strategy: str = "slim_material"
+    settings_version: int = 3
     limit: int = 0
+    # 入库后进编辑页每批补传的规格图行数；0 表示全部一次上传。
+    spec_upload_batch_size: int = 2
     results_dir: str = ""
 
     def normalized(self) -> "Settings":
-        chrome = Path(self.chrome_path) if self.chrome_path else detect_chrome()
+        # Keep an explicit override in settings; an empty value means bundled browser.
+        chrome = Path(self.chrome_path).expanduser() if self.chrome_path and Path(self.chrome_path).expanduser().is_file() else None
         profile = Path(self.chrome_profile) if self.chrome_profile else chrome_profile_dir()
         results = Path(self.results_dir) if self.results_dir else default_results_dir()
         port = int(self.cdp_port or CDP_DEFAULT)
@@ -201,9 +263,14 @@ class Settings:
             chrome_path=str(chrome) if chrome else "",
             chrome_profile=str(profile),
             cdp_port=port,
+            # 可见性是用户设置，正式构建同样允许开启；默认值仍为 False。
             debug_browser=bool(self.debug_browser),
-            confirm_submit=bool(self.confirm_submit),
+            sku_template_import=bool(self.sku_template_import),
+            skip_spec_images=bool(self.skip_spec_images),
+            sku_image_strategy=self.sku_image_strategy if self.sku_image_strategy in {"slim_material", "publish_page", "both"} else "slim_material",
+            settings_version=max(3, int(self.settings_version or 3)),
             limit=max(0, int(self.limit or 0)),
+            spec_upload_batch_size=max(0, min(99, int(self.spec_upload_batch_size or 0))),
             results_dir=str(results),
         )
 
@@ -216,13 +283,22 @@ def load_settings() -> Settings:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             data = {}
+    strategy = str(data.get("sku_image_strategy") or "slim_material")
+    if int(data.get("settings_version") or 0) < 3:
+        strategy = "slim_material"
+    if strategy not in {"slim_material", "publish_page", "both"}:
+        strategy = "slim_material"
     settings = Settings(
         chrome_path=str(data.get("chrome_path") or ""),
         chrome_profile=str(data.get("chrome_profile") or ""),
         cdp_port=int(data.get("cdp_port") or CDP_DEFAULT),
         debug_browser=bool(data.get("debug_browser")),
-        confirm_submit=bool(data.get("confirm_submit")),
+        sku_template_import=bool(data.get("sku_template_import", False)),
+        skip_spec_images=bool(data.get("skip_spec_images", False)),
+        sku_image_strategy=strategy,
+        settings_version=int(data.get("settings_version") or 2),
         limit=int(data.get("limit") or 0),
+        spec_upload_batch_size=max(0, int(data.get("spec_upload_batch_size", 2) or 0)),
         results_dir=str(data.get("results_dir") or ""),
     ).normalized()
     return settings
@@ -238,12 +314,20 @@ def save_settings(settings: Settings) -> Settings:
 
 
 def configure_environ(settings: Settings | None = None) -> Settings:
+    global _managed_browser_env
     current = (settings or load_settings()).normalized()
     os.environ["QIANNIU_APPDATA"] = str(appdata_dir())
-    os.environ["QIANNIU_ROOT"] = str(project_root())
+    # Runtime resources copied next to the frozen executable live in install_dir,
+    # while project_root points at PyInstaller's internal directory.
+    os.environ["QIANNIU_ROOT"] = str(install_dir())
     os.environ["QIANNIU_PROFILE"] = current.chrome_profile
-    if current.chrome_path:
-        os.environ["QIANNIU_CHROME"] = current.chrome_path
+    effective_browser = browser_exe_path(current.chrome_path)
+    if effective_browser:
+        os.environ["QIANNIU_CHROME"] = str(effective_browser)
+        _managed_browser_env = str(effective_browser)
+    else:
+        os.environ.pop("QIANNIU_CHROME", None)
+        _managed_browser_env = ""
     os.environ["QIANNIU_CLI_JS"] = str(cli_js_path())
     node = node_exe_path()
     if node:

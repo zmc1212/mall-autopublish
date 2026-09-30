@@ -4,6 +4,7 @@ from pathlib import Path
 
 import web_fill
 from web_fill import pipeline
+from web_fill import material_import
 
 
 class FakeSession:
@@ -108,8 +109,28 @@ class WebFillTests(unittest.TestCase):
         self.assertEqual(payload["skus"][0]["file"], image.name)
         self.assertTrue(Path(payload["main_images"][0]).is_file())
 
+    def test_payload_caps_main_images_to_five(self):
+        image = Path(__file__).resolve().parent / "testdata"
+        mains = [image.as_posix()] * 8
+        product = {
+            "title": "卡游火影忍者中性笔盲盒忍道版",
+            "category": "文具用品/文化用品/商务用品>>笔类/书写工具>>中性笔",
+            "attributes": {},
+            "main_images": mains,
+        }
+        payload = web_fill.product_to_payload(product)
+        self.assertEqual(len(payload["main_images"]), 5)
+        self.assertEqual(payload["main_images"], mains[:5])
+
+    def test_payload_carries_main_video_absolute_path(self):
+        video = next(p for p in (Path(__file__).resolve().parent / "testdata").rglob("主视频.mp4"))
+        payload = web_fill.product_to_payload({"title": "卡游", "main_video": video})
+        self.assertTrue(payload["main_video"].endswith("主视频.mp4"))
+        self.assertTrue(Path(payload["main_video"]).is_file())
+        self.assertEqual(web_fill.product_to_payload({"title": "卡游"})["main_video"], "")
+
     def test_scripts_are_parameterized_and_avoid_drop(self):
-        for name in ("category.js", "attributes.js", "skus.js", "sku_category.js", "spec_images.js", "main_images.js", "details.js", "logistics.js"):
+        for name in ("category.js", "attributes.js", "skus.js", "sku_category.js", "spec_images.js", "main_images.js", "details.js", "logistics.js", "main_video.js"):
             text = (pipeline.SCRIPTS / name).read_text(encoding="utf-8")
             self.assertIn("/*PAYLOAD*/", text)
             self.assertNotIn("page.goto(\"https://item.upload.taobao.com/sell/ai/category.htm\"", text)
@@ -146,6 +167,14 @@ class WebFillTests(unittest.TestCase):
         self.assertIn("via: \"library\"", details)
         self.assertIn("retryUntilUploaded", details)
         self.assertNotIn('trim() === "上传图片"', details)
+        video = (pipeline.SCRIPTS / "main_video.js").read_text(encoding="utf-8")
+        self.assertIn("商品视频", video)
+        self.assertIn("上传视频", video)
+        self.assertIn("videoSelector", video)
+        self.assertIn("setFilesAnywhere", video)
+        self.assertIn("already", video)
+        self.assertNotIn(".drop(", video)
+        self.assertNotIn("waitForEvent(\"filechooser\"", video)
         click_upload = (pipeline.SCRIPTS / "click_upload_btn.js").read_text(encoding="utf-8")
         self.assertIn("上传文件", click_upload)
         category = (pipeline.SCRIPTS / "category.js").read_text(encoding="utf-8")
@@ -236,6 +265,138 @@ class WebFillTests(unittest.TestCase):
         self.assertNotIn("submit.js", names)
         self.assertEqual(result["execution"], "已填写未提交")
 
+    def test_fill_uploads_main_video_and_records_checkpoint(self):
+        video = next(p for p in (Path(__file__).resolve().parent / "testdata").rglob("主视频.mp4"))
+        session = FakeSession()
+        product = {
+            "title": "卡游",
+            "category": "中性笔",
+            "skus": [],
+            "main_images": [],
+            "portrait_images": [],
+            "detail_images": [],
+            "main_video": video,
+        }
+        checkpoints = []
+
+        def fake_run(session_obj, name, payload, timeout=120):
+            if name == "category.js":
+                session_obj._href = "https://item.upload.taobao.com/sell/v2/publish.htm?catId=50012720"
+            if name == "checkpoint.js":
+                checkpoints.append(payload["completed"])
+            if name == "main_video.js":
+                self.assertEqual(payload["phase"], "open")
+                self.assertEqual(payload["files"], [video.resolve().as_posix()])
+                return {"uploaded": True, "verifiedBy": "slot", "slot": {"videos": 1}}
+            return {"ok": True, "script": name}
+
+        with unittest.mock.patch.object(pipeline, "run_script", side_effect=fake_run):
+            result = pipeline.fill_new_product(session, product, confirm_submit=False)
+        self.assertEqual(result["execution"], "已填写未提交")
+        self.assertTrue(any("video" in completed for completed in checkpoints))
+
+    def test_fill_skips_video_when_upload_unconfirmed(self):
+        video = next(p for p in (Path(__file__).resolve().parent / "testdata").rglob("主视频.mp4"))
+        session = FakeSession()
+        product = {
+            "title": "卡游",
+            "category": "中性笔",
+            "skus": [],
+            "main_images": [],
+            "portrait_images": [],
+            "detail_images": [],
+            "main_video": video,
+        }
+        names = []
+        checkpoints = []
+
+        def fake_run(session_obj, name, payload, timeout=120):
+            names.append(name)
+            if name == "category.js":
+                session_obj._href = "https://item.upload.taobao.com/sell/v2/publish.htm?catId=50012720"
+            if name == "checkpoint.js":
+                checkpoints.append(payload["completed"])
+            if name == "main_video.js":
+                return {"error": "视频已发布但选择列表未就绪"}
+            return {"ok": True, "script": name}
+
+        with unittest.mock.patch.object(pipeline, "run_script", side_effect=fake_run):
+            result = pipeline.fill_new_product(session, product, confirm_submit=False)
+        # 视频是可选项：上传未成功不暂停，跳过后继续入库流程。
+        self.assertEqual(result["execution"], "已填写未提交")
+        self.assertEqual(names.count("main_video.js"), 1)
+        self.assertIn("logistics.js", names)
+        self.assertTrue(any("video" in completed for completed in checkpoints))
+
+    def test_video_step_security_pause_stops_flow(self):
+        video = next(p for p in (Path(__file__).resolve().parent / "testdata").rglob("主视频.mp4"))
+        session = FakeSession()
+
+        def fake_run(session_obj, name, payload, timeout=120):
+            raise RuntimeError("PAUSE:淘宝提示操作过于频繁；上传结果尚未确认，已停止自动重试并保留现场")
+
+        with unittest.mock.patch.object(pipeline, "run_script", side_effect=fake_run):
+            with self.assertRaises(RuntimeError) as ctx:
+                pipeline.video_step(session, {"main_video": str(video)})
+        self.assertIn("PAUSE:", str(ctx.exception))
+
+    def test_video_step_dispatches_file_into_native_chooser(self):
+        video = next(p for p in (Path(__file__).resolve().parent / "testdata").rglob("主视频.mp4"))
+        session = FakeSession()
+        calls = []
+
+        def fake_run(session_obj, name, payload, timeout=120):
+            calls.append((name, payload.get("phase")))
+            if payload.get("phase") == "open":
+                raise pipeline.FileChooserNeeded("File chooser opened")
+            self.assertEqual(payload.get("phase"), "verify")
+            return {"uploaded": True, "verifiedBy": "slot", "slot": {"videos": 1}}
+
+        with unittest.mock.patch.object(pipeline, "run_script", side_effect=fake_run):
+            result = pipeline.video_step(session, {"main_video": str(video)})
+        self.assertTrue(result["uploaded"])
+        self.assertEqual(session.uploads, [str(video)])
+        self.assertEqual(calls, [("main_video.js", "open"), ("main_video.js", "verify")])
+
+    def test_video_step_skips_when_chooser_dispatch_fails(self):
+        video = next(p for p in (Path(__file__).resolve().parent / "testdata").rglob("主视频.mp4"))
+        session = FakeSession()
+
+        def fake_run(session_obj, name, payload, timeout=120):
+            self.assertEqual(payload.get("phase"), "open")
+            raise pipeline.FileChooserNeeded("File chooser opened")
+
+        def failing_upload(*paths, timeout=180):
+            raise RuntimeError("no pending chooser")
+
+        with unittest.mock.patch.object(pipeline, "run_script", side_effect=fake_run), \
+                unittest.mock.patch.object(session, "upload_files", side_effect=failing_upload):
+            result = pipeline.video_step(session, {"main_video": str(video)})
+        self.assertFalse(result["uploaded"])
+        self.assertIn("视频文件选择器不可用", result["warning"])
+
+    def test_fill_without_video_never_calls_video_script(self):
+        session = FakeSession()
+        product = {
+            "title": "卡游",
+            "category": "中性笔",
+            "skus": [],
+            "main_images": [],
+            "portrait_images": [],
+            "detail_images": [],
+        }
+
+        def fake_run(session_obj, name, payload, timeout=120):
+            if name == "category.js":
+                session_obj._href = "https://item.upload.taobao.com/sell/v2/publish.htm?catId=50012720"
+            if name == "main_video.js":
+                raise AssertionError("无主视频时不应调用视频上传脚本")
+            return {"ok": True, "script": name}
+
+        with unittest.mock.patch.object(pipeline, "run_script", side_effect=fake_run):
+            result = pipeline.fill_new_product(session, product, confirm_submit=False)
+        self.assertEqual(result["execution"], "已填写未提交")
+
     def test_fill_opens_new_tab_and_never_submits(self):
         session = FakeSession()
         product = {
@@ -320,7 +481,7 @@ class WebFillTests(unittest.TestCase):
         with unittest.mock.patch.object(pipeline, "run_script", side_effect=fake_run):
             result = pipeline.fill_new_product(session, product, confirm_submit=False)
         self.assertNotEqual(result["execution"], "暂停")
-        self.assertTrue(any(call[0] == "upload" for call in session.calls))
+        self.assertEqual(session.uploads, [])
         self.assertFalse(result.get("errors"))
 
     def test_spec_images_unbound_detects_empty_bind(self):
@@ -343,6 +504,45 @@ class WebFillTests(unittest.TestCase):
         self.assertFalse(pipeline.spec_images_unbound(passed, payload))
         self.assertEqual(str(pipeline._spec_unbound_error(failed, payload)), "规格图未保存到SKU表格")
         self.assertTrue(pipeline.gate_error_retryable(pipeline._spec_unbound_error(failed, payload)))
+
+    def test_spec_images_bind_large_sku_list_in_batches(self):
+        skus = [{"name": f"规格{i}", "image": f"{i}.jpg"} for i in range(12)]
+        payload = {"skus": skus}
+        ranges = []
+
+        def fake_run(session, name, data, timeout=120):
+            if data["phase"] == "open":
+                return {"already": True, "uploaded": True}
+            start, end = data["bindStart"], data["bindEnd"]
+            ranges.append((start, end))
+            return {
+                "partial": end < len(skus),
+                "hadFrame": True,
+                "bindLog": [{"name": item["name"], "picClick": {"ok": True}} for item in skus[start:end]],
+                "saved": end == len(skus),
+                "filledCount": end,
+            }
+
+        with unittest.mock.patch.object(pipeline, "run_script", side_effect=fake_run):
+            result = pipeline._image_step(FakeSession(), "spec_images.js", payload, [item["image"] for item in skus])
+        self.assertEqual(ranges, [(0, 5), (5, 10), (10, 12)])
+        self.assertEqual(len(result["bind"]["bindLog"]), len(skus))
+        self.assertTrue(result["bind"]["saved"])
+
+    def test_spec_images_prefilled_drawer_finishes_without_more_batches(self):
+        skus = [{"name": f"规格{i}", "image": f"{i}.jpg"} for i in range(8)]
+        ranges = []
+
+        def fake_run(session, name, data, timeout=120):
+            if data["phase"] == "open":
+                return {"already": True, "uploaded": True}
+            ranges.append((data["bindStart"], data["bindEnd"]))
+            return {"saved": True, "filledCount": len(skus), "bindLog": []}
+
+        with unittest.mock.patch.object(pipeline, "run_script", side_effect=fake_run):
+            result = pipeline._image_step(FakeSession(), "spec_images.js", {"skus": skus}, [item["image"] for item in skus])
+        self.assertEqual(ranges, [(0, 5)])
+        self.assertTrue(result["bind"]["saved"])
 
     def test_fill_stops_when_spec_images_not_bound(self):
         session = FakeSession()
@@ -371,7 +571,7 @@ class WebFillTests(unittest.TestCase):
         self.assertEqual(result["execution"], "失败")
         self.assertIn("规格图未绑定", result["notice"])
 
-    def test_spec_images_retry_then_succeed(self):
+    def test_spec_images_does_not_replay_ambiguous_binding(self):
         session = FakeSession()
         product = {
             "title": "卡游",
@@ -395,8 +595,8 @@ class WebFillTests(unittest.TestCase):
 
         with unittest.mock.patch.object(pipeline, "run_script", side_effect=fake_run):
             result = pipeline.fill_new_product(session, product, confirm_submit=False)
-        self.assertEqual(result["execution"], "已填写未提交")
-        self.assertEqual(len(attempts), 3)
+        self.assertEqual(result["execution"], "失败")
+        self.assertEqual(len(attempts), 1)
 
     def test_spec_images_retry_exhaustion_does_not_pause(self):
         session = FakeSession()
@@ -421,7 +621,7 @@ class WebFillTests(unittest.TestCase):
         with unittest.mock.patch.object(pipeline, "run_script", side_effect=fake_run):
             result = pipeline.fill_new_product(session, product, confirm_submit=False)
         self.assertEqual(result["execution"], "失败")
-        self.assertEqual(len(attempts), 5)
+        self.assertEqual(len(attempts), 1)
 
     def test_filechooser_dump_is_not_user_pause(self):
         dump = "### Ran Playwright code\nthrow new Error(\"PAUSE:滑块\");\n### Modal state\n- [File chooser]: can be handled by upload"
@@ -435,7 +635,7 @@ class WebFillTests(unittest.TestCase):
             {"product_id": "B", "title": "B", "category": "中性笔", "skus": [], "main_images": [], "detail_images": []},
         ]
 
-        def fake_fill(session_obj, product, confirm_submit=False, web=None, force_new=False):
+        def fake_fill(session_obj, product, confirm_submit=False, web=None, force_new=False, **kwargs):
             return {"execution": "暂停", "notice": "页面出现验证码", "errors": ["页面出现验证码"], "steps": []}
 
         with unittest.mock.patch.object(pipeline, "fill_new_product", side_effect=fake_fill):
@@ -460,13 +660,15 @@ class WebFillTests(unittest.TestCase):
             if name == "details.js" and payload.get("phase") == "open":
                 raise pipeline.FileChooserNeeded("### Modal state\n- [File chooser]: can be handled by upload")
             if name == "details.js" and payload.get("phase") == "select":
-                return {"picked": [{"name": "d1.jpg", "ok": True}], "confirm": "OK", "after": {"imgs": 2, "dialog": False}}
+                return {"picked": [{"name": "d1.jpg", "ok": True}, {"name": "d2.jpg", "ok": True}],
+                        "confirm": "OK", "after": {"imgs": 2, "dialog": False}}
             return {"ok": True, "uploaded": True, "script": name, "phase": payload.get("phase")}
 
-        with unittest.mock.patch.object(pipeline, "run_script", side_effect=fake_run):
+        with unittest.mock.patch.object(pipeline, "run_script", side_effect=fake_run), \
+             unittest.mock.patch.object(pipeline, "_prepare_media_uploads", side_effect=lambda files: files):
             result = pipeline.fill_new_product(session, product, confirm_submit=False)
         self.assertNotEqual(result["execution"], "暂停")
-        self.assertTrue(any(call[0] == "upload" for call in session.calls))
+        self.assertEqual(session.uploads, [])
         self.assertFalse(result.get("errors"))
 
     def test_run_web_batch_uses_web_fill(self):
@@ -495,7 +697,7 @@ class WebFillTests(unittest.TestCase):
             "popup": False,
             "specDialog": False,
         }
-        self.assertEqual(pipeline.decide_skips(filled, payload), {"skus", "spec_images", "main_images"})
+        self.assertEqual(pipeline.decide_skips(filled, payload), {"skus", "main_images"})
         dialog = {**filled, "specImgs": 3, "specDialog": True, "popup": True, "mainImgs": 0}
         self.assertEqual(pipeline.decide_skips(dialog, payload), {"attributes", "skus"})
         other = {**filled, "title": "得力中性笔"}
@@ -505,6 +707,23 @@ class WebFillTests(unittest.TestCase):
         self.assertTrue(pipeline.page_conflicts(smoke, payload))
         sibling = {**filled, "title": "卡游火影忍者中性笔盲盒忍道版02"}
         self.assertTrue(pipeline.page_conflicts(sibling, payload))
+
+    def test_decide_skips_video_only_after_own_checkpoint(self):
+        payload = {"title": "卡游火影忍者中性笔盲盒忍道版", "main_video": "C:/v/主视频.mp4"}
+        state = {
+            "title": "卡游火影忍者中性笔盲盒忍道版",
+            "videos": 1,
+            "checkpoint": {"key": pipeline.resume_key(payload), "completed": ["video"]},
+        }
+        self.assertEqual(pipeline.decide_skips(state, payload), {"video"})
+        state["checkpoint"]["completed"] = []
+        self.assertEqual(pipeline.decide_skips(state, payload), set())
+        # 页面自带视频但无本商品 checkpoint 时不跳过，交给脚本的 already 探测兜底。
+        other = {"title": "卡游火影忍者中性笔盲盒忍道版", "videos": 1}
+        self.assertEqual(pipeline.decide_skips(other, payload), set())
+        no_video = {"title": "卡游火影忍者中性笔盲盒忍道版", "videos": 1,
+                    "checkpoint": {"key": pipeline.resume_key({"title": "卡游火影忍者中性笔盲盒忍道版"}), "completed": ["video"]}}
+        self.assertEqual(pipeline.decide_skips(no_video, {"title": "卡游火影忍者中性笔盲盒忍道版"}), set())
 
     def test_fill_reuses_publish_tab_from_home(self):
         publish = "https://item.upload.taobao.com/sell/v2/publish.htm?catId=50012720"
@@ -516,9 +735,20 @@ class WebFillTests(unittest.TestCase):
 
         def fake_run(session_obj, name, payload, timeout=120):
             names.append(name)
+            if name == "upload_files.js":
+                return {"uploaded": True}
             if name == "probe_state.js":
                 return {"title": "卡游", "skuRows": 16, "specImgs": 0, "mainImgs": 0, "detailImgs": 0, "popup": True, "specDialog": True}
+            if name == "spec_row_status.js":
+                return {"total": 16, "filled": 16, "missing": [], "sources": [
+                    {"index": i + 1, "src": f"url{i}"} for i in range(16)]}
+            if name == "spec_row_images.js":
+                return {"ready": True} if payload.get("phase") == "open" else {
+                    "saved": True, "imageSrc": f"url{payload['index']}"}
             if name == "spec_images.js":
+                if payload.get("phase") == "bind":
+                    start, end = payload["bindStart"], payload["bindEnd"]
+                    return {"ok": True, "partial": end < 16, "bindLog": [{"picClick": {"ok": True}}] * (end - start)}
                 return {"ok": True, "phase": payload.get("phase")}
             return {"ok": True, "script": name}
 
@@ -530,7 +760,8 @@ class WebFillTests(unittest.TestCase):
             "main_images": [],
             "detail_images": [],
         }
-        with unittest.mock.patch.object(pipeline, "run_script", side_effect=fake_run):
+        with unittest.mock.patch.object(pipeline, "run_script", side_effect=fake_run), \
+             unittest.mock.patch.object(pipeline.time, "sleep"):
             result = pipeline.fill_new_product(session, product, confirm_submit=False)
         self.assertEqual(result["execution"], "已填写未提交")
         self.assertFalse(any(call[0] == "tab-new" for call in session.calls))
@@ -538,7 +769,7 @@ class WebFillTests(unittest.TestCase):
         self.assertNotIn("category.js", names)
         self.assertNotIn("skus.js", names)
         self.assertNotIn("attributes.js", names)
-        self.assertIn("spec_images.js", names)
+        self.assertIn("spec_row_images.js", names)
         self.assertNotIn("close_overlays.js", names)
 
     def test_fill_skips_completed_steps_on_resume(self):
@@ -547,6 +778,8 @@ class WebFillTests(unittest.TestCase):
 
         def fake_run(session_obj, name, payload, timeout=120):
             names.append(name)
+            if name == "upload_files.js":
+                return {"uploaded": True}
             if name == "probe_state.js":
                 return {
                     "title": "卡游火影忍者中性笔盲盒忍道版",
@@ -557,6 +790,9 @@ class WebFillTests(unittest.TestCase):
                     "popup": False,
                     "specDialog": False,
                 }
+            if name == "main_images.js" and payload.get("phase") == "select":
+                return {"selected": [{"name": "m.jpg", "pic": {"ok": True}}],
+                        "slot": {"imgs": 1}}
             return {"ok": True, "script": name}
 
         product = {
@@ -567,7 +803,8 @@ class WebFillTests(unittest.TestCase):
             "main_images": ["m.jpg"],
             "detail_images": [],
         }
-        with unittest.mock.patch.object(pipeline, "run_script", side_effect=fake_run):
+        with unittest.mock.patch.object(pipeline, "run_script", side_effect=fake_run), \
+             unittest.mock.patch.object(pipeline, "_prepare_media_uploads", side_effect=lambda files: files):
             result = pipeline.fill_new_product(session, product, confirm_submit=False)
         self.assertEqual(result["execution"], "已填写未提交")
         self.assertNotIn("skus.js", names)
@@ -613,7 +850,7 @@ class WebFillTests(unittest.TestCase):
         session = FakeSession()
         called = []
 
-        def fake_fill(session_obj, product, confirm_submit=False, web=None, force_new=False):
+        def fake_fill(session_obj, product, confirm_submit=False, web=None, force_new=False, **kwargs):
             called.append(product.get("product_id"))
             return {"execution": "已填写未提交", "notice": "ok", "errors": [], "steps": []}
 
@@ -632,7 +869,7 @@ class WebFillTests(unittest.TestCase):
         session = FakeSession()
         flags = []
 
-        def fake_fill(session_obj, product, confirm_submit=False, web=None, force_new=False):
+        def fake_fill(session_obj, product, confirm_submit=False, web=None, force_new=False, **kwargs):
             flags.append((product.get("product_id"), bool(force_new)))
             return {"execution": "已填写未提交", "notice": "ok", "errors": [], "steps": [], "url": "https://item.upload.taobao.com/sell/v2/publish.htm?catId=1"}
 
@@ -648,7 +885,7 @@ class WebFillTests(unittest.TestCase):
         session = FakeSession()
         flags = []
 
-        def fake_fill(session_obj, product, confirm_submit=False, web=None, force_new=False):
+        def fake_fill(session_obj, product, confirm_submit=False, web=None, force_new=False, **kwargs):
             flags.append((product.get("product_id"), bool(force_new)))
             return {"execution": "已填写未提交", "notice": "ok", "errors": [], "steps": []}
 
@@ -660,11 +897,11 @@ class WebFillTests(unittest.TestCase):
             pipeline.run_batch(products, session=session)
         self.assertEqual(flags, [("B", True)])
 
-    def test_run_batch_failure_then_next_force_new(self):
+    def test_run_batch_failure_preserves_current_product_for_resume(self):
         session = FakeSession()
         flags = []
 
-        def fake_fill(session_obj, product, confirm_submit=False, web=None, force_new=False):
+        def fake_fill(session_obj, product, confirm_submit=False, web=None, force_new=False, **kwargs):
             flags.append((product.get("product_id"), bool(force_new)))
             if product.get("product_id") == "A":
                 return {"execution": "失败", "notice": "x", "errors": ["x"], "steps": []}
@@ -676,7 +913,166 @@ class WebFillTests(unittest.TestCase):
         ]
         with unittest.mock.patch.object(pipeline, "fill_new_product", side_effect=fake_fill):
             pipeline.run_batch(products, session=session)
-        self.assertEqual(flags, [("A", False), ("B", True)])
+        self.assertEqual(flags, [("A", False)])
+
+    def test_run_batch_fill_failure_stops_before_material_stage(self):
+        session = FakeSession()
+
+        def fake_fill(session_obj, product, **kwargs):
+            return {
+                "execution": "失败",
+                "notice": "图片上传失败：批量上传未确认成功，已停止后续图片",
+                "errors": ["图片上传失败：批量上传未确认成功，已停止后续图片"],
+                "steps": [],
+            }
+
+        products = [{
+            "product_id": "A",
+            "title": "晨光大美之诗静音按动中性笔",
+            "execution": "未执行",
+            "skus": [],
+            "main_images": ["main.jpg"],
+            "detail_images": [],
+        }]
+        with unittest.mock.patch.object(pipeline, "fill_new_product", side_effect=fake_fill), \
+             unittest.mock.patch.object(material_import, "run_material_flow") as material:
+            updated = pipeline.run_batch(products, session=session, confirm_submit=True)
+        material.assert_not_called()
+        self.assertEqual(updated[0]["execution"], "失败")
+        self.assertEqual(
+            updated[0]["notice"],
+            "图片上传失败：批量上传未确认成功，已停止后续图片",
+        )
+        self.assertEqual(updated[0]["run_status"], "error")
+        self.assertIsNone(updated[0].get("taobao_item_id") or None)
+
+    def test_run_batch_material_error_keeps_fill_failure_notice(self):
+        session = FakeSession()
+
+        def fake_fill(session_obj, product, **kwargs):
+            return {
+                "execution": "失败",
+                "notice": "图片上传失败：批量上传未确认成功，已停止后续图片",
+                "errors": ["图片上传失败：批量上传未确认成功，已停止后续图片"],
+                "steps": [],
+            }
+
+        products = [{
+            "product_id": "A",
+            "title": "晨光大美之诗静音按动中性笔",
+            "execution": "未执行",
+            "skus": [],
+            "main_images": ["main.jpg"],
+            "detail_images": [],
+        }]
+        with unittest.mock.patch.object(pipeline, "fill_new_product", side_effect=fake_fill), \
+             unittest.mock.patch.object(material_import, "run_material_flow") as material:
+            updated = pipeline.run_batch(products, session=session, confirm_submit=True)
+        material.assert_not_called()
+        self.assertEqual(updated[0]["errors"], ["图片上传失败：批量上传未确认成功，已停止后续图片"])
+        self.assertNotIn("列表未找到目标商品", updated[0]["notice"])
+
+    def test_run_batch_failed_then_resumed_material_pause_keeps_fill_notice(self):
+        session = FakeSession()
+
+        def fake_fill(session_obj, product, **kwargs):
+            return {
+                "execution": "暂停",
+                "notice": "图片上传失败：批量上传未确认成功，已停止后续图片",
+                "errors": ["图片上传失败：批量上传未确认成功，已停止后续图片"],
+                "taobao_item_id": "1087608952245",
+                "steps": [],
+            }
+
+        products = [{
+            "product_id": "A",
+            "title": "晨光大美之诗静音按动中性笔",
+            "execution": "未执行",
+            "skus": [{"name": "蓝杆-1支", "image": "spec.jpg", "price": 6.9, "stock": 10}],
+            "main_images": [],
+            "detail_images": [],
+        }]
+        with unittest.mock.patch.object(pipeline, "fill_new_product", side_effect=fake_fill), \
+             unittest.mock.patch.object(material_import, "run_material_flow") as material:
+            updated = pipeline.run_batch(products, session=session, confirm_submit=True)
+        material.assert_not_called()
+        self.assertEqual(updated[0]["execution"], "暂停")
+        self.assertEqual(
+            updated[0]["notice"],
+            "图片上传失败：批量上传未确认成功，已停止后续图片",
+        )
+        self.assertNotIn("列表未找到目标商品", updated[0]["notice"])
+
+    def test_run_batch_resume_created_imports_search_main_without_spec_upload(self):
+        session = FakeSession()
+        seen = []
+
+        def fake_material(session_obj, web, product, item_id, state, on_stage=None, **kwargs):
+            seen.append(item_id)
+            if on_stage:
+                on_stage("complete", {"baseline": [], "folder": "", "verified": []})
+            return {**state, "stage": "complete"}
+
+        products = [{
+            "product_id": "A",
+            "title": "晨光大美之诗静音按动中性笔",
+            "execution": "暂停",
+            "notice": "图片上传失败：批量上传未确认成功，已停止后续图片",
+            "errors": ["图片上传失败：批量上传未确认成功，已停止后续图片"],
+            "taobao_item_id": "1087608952245",
+            "flow_stage": "created",
+            "flow_version": material_import.FLOW_VERSION,
+            "sku_image_strategy": "slim_material",
+            "skus": [{"name": "蓝杆-1支", "image": "spec.jpg", "price": 6.9, "stock": 10}],
+            "main_images": [],
+            "detail_images": [],
+        }]
+        with unittest.mock.patch.object(pipeline, "fill_new_product") as fill, \
+             unittest.mock.patch.object(pipeline, "_repair_existing_spec_images", return_value={
+                 "flow_stage": "complete", "execution": "已入库，图片已核验"}) as repair, \
+             unittest.mock.patch.object(
+                 material_import, "run_material_flow", side_effect=fake_material
+             ):
+            updated = pipeline.run_batch(products, session=session, confirm_submit=True)
+        fill.assert_not_called()
+        self.assertEqual(seen, ["1087608952245"])
+        repair.assert_not_called()
+        self.assertEqual(updated[0]["flow_stage"], "complete")
+        self.assertEqual(updated[0]["execution"], "已入库，搜索主图已核验")
+
+    def test_run_batch_existing_id_with_both_strategy_repairs_in_edit_flow(self):
+        session = FakeSession()
+        repairs = []
+
+        def fake_repair(session_obj, web, product, item_id, confirm_submit, **kwargs):
+            repairs.append((item_id, confirm_submit))
+            return {"flow_stage": "complete", "execution": "已入库，图片已核验"}
+
+        def fake_material(session_obj, web, product, item_id, state, on_stage=None, **kwargs):
+            if on_stage:
+                on_stage("complete", {"baseline": [], "folder": "", "verified": []})
+            return {**state, "stage": "complete"}
+
+        product = {
+            "product_id": "A",
+            "title": "已有商品",
+            "execution": "结果待核实",
+            "taobao_item_id": "1088898192279",
+            # 模拟旧记录缺少阶段字段；有 ID 仍必须进入编辑/补图流程。
+            "sku_image_strategy": "both",
+            "skus": [{"name": "黑色", "image": "spec.jpg", "price": 6.9, "stock": 10}],
+            "main_images": [],
+            "detail_images": [],
+        }
+        with unittest.mock.patch.object(pipeline, "fill_new_product") as fill, \
+             unittest.mock.patch.object(pipeline, "_repair_existing_spec_images", side_effect=fake_repair), \
+             unittest.mock.patch.object(material_import, "run_material_flow", side_effect=fake_material):
+            updated = pipeline.run_batch([product], session=session, confirm_submit=True)
+
+        fill.assert_not_called()
+        self.assertEqual(repairs, [("1088898192279", True)])
+        self.assertEqual(updated[0]["taobao_item_id"], "1088898192279")
+        self.assertEqual(updated[0]["execution"], "已入库，图片已核验")
 
     def test_submit_script_collects_item_links(self):
         text = (pipeline.SCRIPTS / "submit.js").read_text(encoding="utf-8")
@@ -698,6 +1094,78 @@ class WebFillTests(unittest.TestCase):
         self.assertEqual(captured["view_url"], "https://item.taobao.com/item.htm?id=1")
         self.assertIn("itemId=1", captured["edit_url"])
 
+    def test_action_links_skip_notice_scrape_for_failed_execution(self):
+        import job_session
+        notice = ("拒绝使用已有商品编辑页: https://item.upload.taobao.com/sell/v2/publish.htm"
+                  "?itemId=1086386107585&fromAiPublish=true")
+        for state in ("失败", "暂停", "提交失败", "已停止"):
+            links = job_session.product_action_links(notice=notice, execution=state)
+            self.assertEqual(links["taobao_item_id"], "", state)
+            self.assertEqual(links["view_url"], "", state)
+            self.assertEqual(links["edit_url"], "", state)
+        # 显式可信 ID（提交成功但验收失败的续跑场景）不受失败态影响。
+        kept = job_session.product_action_links(
+            notice=notice, item={"taobao_item_id": "1086386107585"}, execution="失败")
+        self.assertEqual(kept["taobao_item_id"], "1086386107585")
+        # apply_action_links 从记录自身取 execution，失败记录不再派生链接。
+        data = job_session.apply_action_links({"execution": "失败", "notice": notice, "url": notice})
+        self.assertEqual(data["taobao_item_id"], "")
+        # 待核实态保留刮取，供人工核实商品 ID。
+        pending = job_session.product_action_links(
+            notice="提交成功 商品ID: 1086638256748", execution="结果待核实")
+        self.assertEqual(pending["taobao_item_id"], "1086638256748")
+
+    def test_ensure_fill_tab_force_new_ignores_stale_edit_page(self):
+        # 回归：上一条入库成功后活动标签停在它的 publish.htm?itemId=… 编辑页，
+        # 下一条 force_new 必须直接新开类目页，而不是对旧标签抛 UnsafeUrl。
+        session = FakeSession(
+            href="https://item.upload.taobao.com/sell/v2/publish.htm?itemId=1086386107585&fromAiPublish=true")
+        href, how = pipeline.ensure_fill_tab(session, pipeline._load_web(), force_new=True)
+        self.assertEqual(how, "new-category")
+        self.assertIn("category.htm", href)
+        self.assertTrue(any(call[0] == "tab-new" for call in session.calls))
+
+    def test_ensure_fill_tab_falls_through_stale_edit_page(self):
+        # 非 force_new：当前活动标签是编辑页且没有可复用的干净发布页时，
+        # 应新开类目页继续，而不是整条失败。
+        session = FakeSession(
+            href="https://item.upload.taobao.com/sell/v2/publish.htm?itemId=1086386107585&fromAiPublish=true")
+        href, how = pipeline.ensure_fill_tab(session, pipeline._load_web(), force_new=False)
+        self.assertEqual(how, "new-category")
+        self.assertIn("category.htm", href)
+
+    def test_run_batch_drops_scraped_prior_id_from_rejected_notice(self):
+        # 回归：历史缺陷把被拒 URL 里的上一条商品 ID 刮进了失败记录；
+        # 重跑时必须丢弃这个 ID 按全新建品处理。
+        session = FakeSession()
+        rejected_id = "1086386107585"
+        notice = (f"拒绝使用已有商品编辑页: https://item.upload.taobao.com/sell/v2/publish.htm"
+                  f"?itemId={rejected_id}&fromAiPublish=true")
+        polluted = {
+            "product_id": "A", "title": "东米211胜利刷题按动式中性笔",
+            "execution": "失败", "notice": notice, "taobao_item_id": rejected_id,
+            "skus": [], "main_images": [], "detail_images": [],
+        }
+        called = []
+        with unittest.mock.patch.object(pipeline, "fill_new_product", side_effect=lambda *a, **k: (
+                called.append(a[1].get("product_id")),
+                {"execution": "失败", "notice": "页面超时", "errors": ["页面超时"], "steps": []})[1]):
+            updated = pipeline.run_batch([polluted], session=session)
+        self.assertEqual(called, ["A"])
+        self.assertEqual(updated[0]["taobao_item_id"], "")
+        # 对照：失败记录的 notice 不含"拒绝使用已有商品编辑页"指纹时，
+        # 已有 ID 属于可信 prior_id，按原样保留。
+        trusted = {
+            "product_id": "B", "title": "东米211A表情包刷题按动中性笔",
+            "execution": "失败", "notice": "页面操作超时，请重试",
+            "taobao_item_id": rejected_id,
+            "skus": [], "main_images": [], "detail_images": [],
+        }
+        with unittest.mock.patch.object(pipeline, "fill_new_product", return_value={
+                "execution": "失败", "notice": "页面超时", "errors": ["页面超时"], "steps": []}):
+            updated = pipeline.run_batch([trusted], session=session)
+        self.assertEqual(updated[0]["taobao_item_id"], rejected_id)
+
     def test_warehouse_script_does_not_force_click(self):
         warehouse = (pipeline.SCRIPTS / "warehouse.js").read_text(encoding="utf-8")
         helpers = (pipeline.SCRIPTS / "_helpers.inc.js").read_text(encoding="utf-8")
@@ -705,7 +1173,6 @@ class WebFillTests(unittest.TestCase):
         self.assertNotIn("force: true", warehouse)
         self.assertIn("selectWarehouseRadio", warehouse)
         self.assertIn("selectWarehouseRadio", helpers)
-        self.assertIn("dispatchEvent", helpers)
         self.assertIn("selectWarehouseRadio", logistics)
         self.assertNotIn('getByRole("radio", { name: "放入仓库" }).click({ force: true })', logistics)
 
@@ -862,12 +1329,57 @@ class WebFillTests(unittest.TestCase):
             "failedNames": ["详情01.jpg"],
         }))
 
-    def test_image_step_retries_network_error_file(self):
+    def test_main_images_confirmed_upload_is_not_uploaded_again(self):
+        files = [r"C:\tmp\宝贝主图01.jpg", r"C:\tmp\宝贝主图02.jpg"]
+        phases = []
+
+        def fake_run(_session, script, payload, timeout=120):
+            self.assertEqual(script, "main_images.js")
+            phases.append(payload.get("phase"))
+            if payload.get("phase") == "open":
+                return {"uploaded": True, "verifiedBy": "library-search"}
+            if payload.get("phase") == "select":
+                return {"selected": [{"name": Path(path).name, "pic": {"ok": True}} for path in files],
+                        "slot": {"imgs": len(files)}}
+            self.fail("Confirmed files should go directly to binding")
+
+        with unittest.mock.patch.object(pipeline, "run_script", side_effect=fake_run):
+            pipeline._image_step(FakeSession(), "main_images.js", {
+                "files": files, "names": [Path(path).name for path in files],
+            }, files)
+        self.assertEqual(phases, ["open", "select"])
+
+    def test_confirmed_batch_upload_is_carried_into_main_binding(self):
+        files = [r"C:\tmp\宝贝主图01.jpg", r"C:\tmp\宝贝主图02.jpg"]
+        calls = []
+
+        def fake_run(_session, script, payload, timeout=120):
+            calls.append((script, payload.get("phase")))
+            if script == "main_images.js" and payload.get("phase") == "open":
+                return {"uploaded": False, "need_cli_upload": True}
+            if script == "upload_files.js":
+                return {"uploaded": True, "verifiedBy": "library-search"}
+            if script == "main_images.js" and payload.get("phase") == "select":
+                return {"selected": [{"name": Path(path).name, "pic": {"ok": True}} for path in files],
+                        "slot": {"imgs": len(files)}}
+            self.fail("The confirmed batch must not be checked against a closed upload popup")
+
+        with unittest.mock.patch.object(pipeline, "run_script", side_effect=fake_run):
+            result = pipeline._image_step(FakeSession(), "main_images.js", {
+                "files": files, "names": [Path(path).name for path in files],
+            }, files)
+        self.assertEqual(result["open"]["verifiedBy"], "library-search")
+        self.assertEqual(calls, [("main_images.js", "open"), ("upload_files.js", None),
+                                 ("main_images.js", "select")])
+
+    def test_detail_upload_failure_stops_without_resubmitting_files(self):
         session = FakeSession()
         files = [r"C:\tmp\详情01.jpg", r"C:\tmp\详情02.jpg"]
         after_calls = []
 
         def fake_run(session_obj, name, payload, timeout=120):
+            if name == "upload_files.js":
+                raise pipeline.FileChooserNeeded("file chooser")
             if name == "click_upload_btn.js":
                 return {"clicked": "OK"}
             if name == "details.js" and payload.get("phase") == "open":
@@ -895,21 +1407,36 @@ class WebFillTests(unittest.TestCase):
                     "uploaded": True,
                 }
             if name == "details.js" and payload.get("phase") == "select":
-                return {"picked": [{"name": "详情01.jpg", "ok": True}], "confirm": "OK"}
+                return {"picked": [{"name": "详情01.jpg", "ok": True}, {"name": "详情02.jpg", "ok": True}],
+                        "confirm": "OK", "after": {"imgs": 2, "dialog": False}}
             return {"ok": True, "script": name, "phase": payload.get("phase")}
 
-        with unittest.mock.patch.object(pipeline, "run_script", side_effect=fake_run):
+        with unittest.mock.patch.object(pipeline, "run_script", side_effect=fake_run) as run:
             with unittest.mock.patch.object(pipeline.time, "sleep"):
-                result = pipeline._image_step(session, "details.js", {
-                    "files": files,
-                    "names": ["详情01.jpg", "详情02.jpg"],
-                }, files)
-        self.assertIn(("upload", r"C:\tmp\详情01.jpg"), session.calls)
-        self.assertNotIn(("upload", r"C:\tmp\详情02.jpg"), session.calls)
-        self.assertGreaterEqual(len(after_calls), 2)
-        self.assertEqual(after_calls[1], [r"C:\tmp\详情01.jpg"])
-        self.assertEqual(result["upload"].get("failedNames"), [])
-        self.assertTrue(result["upload"].get("cli_retries"))
+                with self.assertRaisesRegex(RuntimeError, "已停止绑定"):
+                    pipeline._image_step(session, "details.js", {
+                        "files": files,
+                        "names": ["详情01.jpg", "详情02.jpg"],
+                    }, files)
+        self.assertEqual(session.uploads, [])
+        self.assertEqual(after_calls, [files])
+        self.assertEqual([(call.args[1], call.args[2].get("phase")) for call in run.call_args_list],
+                         [("details.js", "open"), ("details.js", "after_upload")])
+
+    def test_image_step_rejects_partial_image_binding(self):
+        names = [f"详情{i:02}.jpg" for i in range(1, 7)]
+        with self.assertRaisesRegex(RuntimeError, "图片包 6 张，页面 4 张"):
+            pipeline._verify_image_binding("details.js", {"names": names}, {
+                "picked": [{"name": name, "ok": True} for name in names],
+                "confirm": "OK",
+                "after": {"imgs": 4, "dialog": False},
+            })
+        with self.assertRaisesRegex(RuntimeError, "图片包 6 张，页面 7 张"):
+            pipeline._verify_image_binding("details.js", {"names": names}, {
+                "picked": [{"name": name, "ok": True} for name in names],
+                "confirm": "OK",
+                "after": {"imgs": 7, "dialog": False},
+            })
 
 
 if __name__ == "__main__":

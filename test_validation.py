@@ -87,10 +87,10 @@ class ValidationTests(unittest.TestCase):
         data['商品属性(JSON)'] = json.dumps(attrs, ensure_ascii=False)
         self.assertEqual(seller.validate_row(list(data), list(data.values()), 2, self.root)[1], [])
 
-    def test_brand_and_title_and_spec3(self):
+    def test_title_can_use_scanned_name_and_spec3(self):
         data = {**self.data, '商品标题*': '普通标题', '品牌': '点石制笔', '商品属性(JSON)': json.dumps({'品牌': '点石制笔'}, ensure_ascii=False)}
         errors = seller.validate_row(list(data), list(data.values()), 2, self.root)[1]
-        self.assertTrue(any('必须包含品牌属性' in e for e in errors))
+        self.assertFalse(any('品牌属性' in e for e in errors))
         sku = {'规格': {'颜色': '红', '粗细': '0.5', '支数': '1支'}, '价格': 10, '库存': 1}
         fields = {
             '商品标题*': '点石制笔中性笔',
@@ -171,6 +171,26 @@ class ValidationTests(unittest.TestCase):
         log = w['处理日志']
         self.assertEqual(log.cell(1, 8).value, '淘宝商品ID')
         self.assertEqual(log.cell(2, 8).value, '1086638256748')
+        sheet = w['商品清单']
+        self.assertEqual(sheet.cell(1, 9).value, '淘宝商品ID')
+        self.assertEqual(sheet.cell(2, 9).value, '1086638256748')
+        w.close()
+
+    def test_write_log_reuses_product_sheet_item_id_column(self):
+        p = self.workbook()
+        out = seller.write_log(p, [['t', 2, 'ID1', '入库成功', '', '', '', '1086638256748']])
+        out2 = seller.write_log(out, [['t2', 2, 'ID1', '入库成功', '', '', '', '1086638256749']], self.root / 'second.xlsx')
+        w = load_workbook(out2)
+        sheet = w['商品清单']
+        headers = [sheet.cell(1, c).value for c in range(1, sheet.max_column + 1)]
+        self.assertEqual(headers.count('淘宝商品ID'), 1)
+        self.assertEqual(sheet.cell(2, headers.index('淘宝商品ID') + 1).value, '1086638256749')
+        w.close()
+        blank = seller.write_log(p, [['t', 2, 'ID1', '校验通过']])
+        w = load_workbook(blank)
+        sheet = w['商品清单']
+        self.assertEqual(sheet.cell(1, 9).value, '淘宝商品ID')
+        self.assertIsNone(sheet.cell(2, 9).value)
         w.close()
 
     def test_failed_excel_retains_report(self):
@@ -204,6 +224,18 @@ def naruto_pack():
 
 
 class ImagePackAndTemplateTests(unittest.TestCase):
+    def test_scan_keeps_every_main_and_detail_image(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for number in range(1, 8):
+                Image.new('RGB', (8, 8)).save(root / f'宝贝主图{number:02}.jpg')
+                Image.new('RGB', (8, 8)).save(root / f'详情{number:02}.jpg')
+                Image.new('RGB', (3, 4)).save(root / f'主图3比4-{number:02}.jpg')
+            pack = seller.scan_image_pack(root)
+        self.assertEqual([p.name for p in pack['main_1_1']], [f'宝贝主图{i:02}.jpg' for i in range(1, 8)])
+        self.assertEqual([p.name for p in pack['main_3_4']], [f'主图3比4-{i:02}.jpg' for i in range(1, 8)])
+        self.assertEqual([p.name for p in pack['details']], [f'详情{i:02}.jpg' for i in range(1, 8)])
+
     def test_scan_naruto_pack(self):
         pack = seller.scan_image_pack(naruto_pack())
         self.assertEqual(len(pack['main_1_1']), 5)
@@ -217,10 +249,45 @@ class ImagePackAndTemplateTests(unittest.TestCase):
         self.assertEqual(pack['skus'][-1]['slot'], '颜色16')
         self.assertEqual(pack['skus'][-1]['name'], '忍道版1弹【经典款】李洛克')
 
-    def test_merge_templates_missing_brand(self):
+    def test_scan_prefers_named_main_video(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            Image.new('RGB', (8, 8)).save(root / '宝贝主图01.jpg')
+            (root / '产品展示.mp4').write_bytes(b'v')
+            (root / '主视频.mp4').write_bytes(b'v')
+            pack = seller.scan_image_pack(root)
+        self.assertEqual(pack['main_video'].name, '主视频.mp4')
+        self.assertEqual(len(pack['main_1_1']), 1)
+        self.assertEqual(len(pack['details']), 0)
+
+    def test_scan_falls_back_to_sorted_first_video(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            Image.new('RGB', (8, 8)).save(root / '宝贝主图01.jpg')
+            (root / '开箱视频.mov').write_bytes(b'v')
+            (root / '产品展示.MP4').write_bytes(b'v')
+            pack = seller.scan_image_pack(root)
+        self.assertEqual(pack['main_video'].name, '产品展示.MP4')
+
+    def test_scan_without_video_returns_none_main_video(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            Image.new('RGB', (8, 8)).save(root / '宝贝主图01.jpg')
+            pack = seller.scan_image_pack(root)
+        self.assertIsNone(pack['main_video'])
+
+    def test_resolve_product_carries_main_video(self):
+        pack = {'main_1_1': [], 'main_3_4': [], 'details': [], 'skus': [],
+                'main_video': Path('C:/pack/主视频.mp4')}
+        product = seller.resolve_product({'商品标题*': '标题', '价格*': 1, '库存*': 1}, [], pack)
+        self.assertEqual(product['main_video'], Path('C:/pack/主视频.mp4'))
+        product = seller.resolve_product({'商品标题*': '标题', '价格*': 1, '库存*': 1}, [], {})
+        self.assertIsNone(product['main_video'])
+
+    def test_merge_templates_provides_brand_and_model_defaults(self):
         templates = seller.load_templates({'attributes': '中性笔', 'logistics': '48小时', 'sales': '仓库多规格'})
-        self.assertNotIn('品牌', templates['attributes']['attributes'])
-        self.assertNotIn('型号', templates['attributes']['attributes'])
+        self.assertEqual(templates['attributes']['attributes']['品牌'], '卡游')
+        self.assertEqual(templates['attributes']['attributes']['型号'], '忍道版第1弹')
         self.assertEqual(templates['logistics']['ship_time'], '48小时内发货')
         self.assertEqual(templates['logistics']['freight'], '文具用品 包邮')
         product = seller.resolve_product({
@@ -230,9 +297,10 @@ class ImagePackAndTemplateTests(unittest.TestCase):
             '库存*': 10,
         }, [], None, templates)
         self.assertEqual(product['category'], '文具用品/文化用品/商务用品>>笔类/书写工具>>中性笔')
-        self.assertFalse(product.get('brand'))
+        self.assertEqual(product['brand'], '卡游')
+        self.assertEqual(product['model'], '忍道版第1弹')
         errors = seller.validate_product(product)
-        self.assertTrue(any('品牌' in e for e in errors))
+        self.assertFalse(any('品牌' in e or '商品属性(JSON)' in e for e in errors))
 
     def test_template_row_does_not_need_attribute_json(self):
         pack = naruto_pack()
@@ -267,6 +335,18 @@ class ImagePackAndTemplateTests(unittest.TestCase):
         self.assertEqual(product['sku_category'], '单品')
         self.assertTrue(str(product.get('pack_dir') or '').endswith(pack.name) or pack.name in str(product.get('pack_dir') or ''))
 
+    def test_user_brand_and_model_override_template_defaults(self):
+        templates = seller.load_templates({'attributes': '中性笔'})
+        product = seller.resolve_product({
+            '商品标题*': '用户自定义标题',
+            '品牌*': '用户品牌',
+            '型号': '用户型号',
+        }, [], None, templates)
+        self.assertEqual(product['brand'], '用户品牌')
+        self.assertEqual(product['model'], '用户型号')
+        self.assertEqual(product['attributes']['品牌'], '用户品牌')
+        self.assertEqual(product['attributes']['型号'], '用户型号')
+
     def test_create_template_dropdowns_and_naruto_row(self):
         root = Path(tempfile.mkdtemp())
         self.addCleanup(lambda: __import__('shutil').rmtree(root, ignore_errors=True))
@@ -289,7 +369,7 @@ class ImagePackAndTemplateTests(unittest.TestCase):
         self.assertEqual(row['商品属性模板*'], '中性笔')
         self.assertEqual(row['物流模板*'], '48小时')
         self.assertEqual(row['销售模板*'], '仓库多规格')
-        self.assertIn('火影', str(row['图片包路径*']))
+        self.assertEqual(row['图片包路径*'], seller.NARUTO_PACK_NAME)
         sku_headers = [cell.value for cell in wb['SKU规格'][1]]
         self.assertEqual(sku_headers, seller.SKU_HEADERS)
         self.assertEqual(wb['SKU规格'].max_row, 17)
@@ -300,8 +380,8 @@ class ImagePackAndTemplateTests(unittest.TestCase):
         wb.close()
         results = seller.validate_workbook(path)
         self.assertEqual(len(results), 1)
-        self.assertEqual(results[0]['errors'], [])
-        self.assertEqual(len(results[0]['product']['skus']), 16)
+        self.assertTrue(any('图片包路径*' in error for error in results[0]['errors']))
+        self.assertEqual(len(results[0]['product']['skus']), 0)
 
     def test_legacy_json_workbook_still_validates(self):
         root = Path(tempfile.mkdtemp())
@@ -376,6 +456,70 @@ class ImagePackAndTemplateTests(unittest.TestCase):
         pack = seller.scan_image_pack(root)
         self.assertEqual([p.name for p in pack['main_1_1']], ['宝贝主图01.jpg'])
         self.assertEqual([p.name for p in pack['main_3_4']], ['主图3比4-01.jpg'])
+
+    def test_main_image_name_and_ratio_are_combined(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__('shutil').rmtree(root, ignore_errors=True))
+        Image.new('RGB', (960, 1280)).save(root / '宝贝主图01.jpg')
+        Image.new('RGB', (1280, 1280)).save(root / '方图主图01.jpg')
+        pack = seller.scan_image_pack(root)
+        self.assertEqual([p.name for p in pack['main_1_1']], ['方图主图01.jpg'])
+        self.assertEqual([p.name for p in pack['main_3_4']], ['宝贝主图01.jpg'])
+
+    def test_scan_orders_dual_square_main_sets_group_coherent(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__('shutil').rmtree(root, ignore_errors=True))
+        for number in range(1, 6):
+            Image.new('RGB', (800, 800)).save(root / f'宝贝主图{number:02}.jpg')
+            Image.new('RGB', (800, 800)).save(root / f'方图主图{number:02}.jpg')
+        pack = seller.scan_image_pack(root)
+        self.assertEqual(
+            [p.name for p in pack['main_1_1']],
+            [f'宝贝主图{i:02}.jpg' for i in range(1, 6)] + [f'方图主图{i:02}.jpg' for i in range(1, 6)],
+        )
+        self.assertEqual(pack['main_3_4'], [])
+
+    def test_template_row_passes_with_more_than_five_square_mains(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__('shutil').rmtree(root, ignore_errors=True))
+        for number in range(1, 6):
+            Image.new('RGB', (800, 800)).save(root / f'宝贝主图{number:02}.jpg')
+            Image.new('RGB', (800, 800)).save(root / f'方图主图{number:02}.jpg')
+        data = {
+            '商品标识*': '双主图-001',
+            '商品标题*': '双主图图片包校验商品',
+            '品牌*': '测试品牌',
+            '图片包路径*': str(root),
+            '商品属性模板*': '中性笔',
+            '物流模板*': '48小时',
+            '销售模板*': '仓库多规格',
+            '价格*': 9.9,
+            '库存*': 20,
+        }
+        errors = seller.validate_row(list(data), list(data.values()), 2, root.parent)[1]
+        self.assertFalse(any('最多5张' in e for e in errors), errors)
+
+    def test_portrait_mains_still_limited_to_five(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__('shutil').rmtree(root, ignore_errors=True))
+        paths = []
+        for number in range(1, 7):
+            path = root / f'竖图{number:02}.jpg'
+            Image.new('RGB', (960, 1280)).save(path)
+            paths.append(str(path))
+        data = {
+            '商品标识*': '竖图-001',
+            '商品标题*': '竖图主图数量校验商品',
+            '品牌*': '测试品牌',
+            '类目*': '中性笔',
+            '主图路径*': str(root / 'main.png'),
+            '3:4主图路径': '|'.join(paths),
+            '价格*': 9.9,
+            '库存*': 20,
+        }
+        Image.new('RGB', (800, 800)).save(root / 'main.png')
+        errors = seller.validate_row(list(data), list(data.values()), 2, root)[1]
+        self.assertTrue(any('3:4主图路径: 最多5张' in e for e in errors), errors)
 
 
 if __name__ == '__main__':

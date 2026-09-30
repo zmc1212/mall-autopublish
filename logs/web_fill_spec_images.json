@@ -1,0 +1,338 @@
+{
+  "targetColumn": "商品规格",
+  "opened": "READY_SPEC_IMAGE",
+  "local": "SKIP",
+  "inputs": [],
+  "setFiles": "NO_INPUT",
+  "status": {
+    "uploading": false,
+    "success": false,
+    "fail": false,
+    "found": [],
+    "hasComplete": false,
+    "snippet": [
+      "本地上传",
+      "已设置商品详情页优先展示1:1主图图片要求：比例为1:1，推荐尺寸1440x1440及以上；至多可上传5张，拖拽可调整顺序",
+      "上传图片",
+      "上传图片",
+      "上传图片",
+      "上传图片",
+      "上传图片",
+      "图片要求：宽高比为3:4，推荐尺寸1440x1920及以上；至多可上传5张，拖拽可调整顺序"
+    ],
+    "okNames": [],
+    "failedNames": [],
+    "networkError": false,
+    "retryable": false,
+    "items": [
+      {
+        "name": "颜色01-【半年够用】12支盒送20支笔芯.jpg",
+        "failed": false,
+        "ok": false,
+        "text": ""
+      },
+      {
+        "name": "颜色02-【性价比高】5支送20支笔芯.jpg",
+        "failed": false,
+        "ok": false,
+        "text": ""
+      },
+      {
+        "name": "颜色03-【店铺热销】3支送20支笔芯.jpg",
+        "failed": false,
+        "ok": false,
+        "text": ""
+      },
+      {
+        "name": "颜色04-【大美之诗静音】12支盒.jpg",
+        "failed": false,
+        "ok": false,
+        "text": ""
+      },
+      {
+        "name": "颜色05-【大美之诗静音】5支.jpg",
+        "failed": false,
+        "ok": false,
+        "text": ""
+      },
+      {
+        "name": "颜色06-【大美之诗静音】3支.jpg",
+        "failed": false,
+        "ok": false,
+        "text": ""
+      },
+      {
+        "name": "颜色07-【体验-不推荐】1支.jpg",
+        "failed": false,
+        "ok": false,
+        "text": ""
+      },
+      {
+        "name": "颜色08-【两个月推荐】1支笔+10支晨光笔芯.jpg",
+        "failed": false,
+        "ok": false,
+        "text": ""
+      },
+      {
+        "name": "颜色09-【大美之诗静音】3支+10支晨光笔芯.jpg",
+        "failed": false,
+        "ok": false,
+        "text": ""
+      },
+      {
+        "name": "颜色10-【大美之诗静音】6支+10支晨光笔芯.jpg",
+        "failed": false,
+        "ok": false,
+        "text": ""
+      },
+      {
+        "name": "颜色11-【大美之诗静音】3支+20支晨光笔芯.jpg",
+        "failed": false,
+        "ok": false,
+        "text": ""
+      },
+      {
+        "name": "颜色12-【大美之诗静音】6支+20支晨光笔芯.jpg",
+        "failed": false,
+        "ok": false,
+        "text": ""
+      },
+      {
+        "name": "颜色13-【够用一学期】1支笔+30支晨光笔芯.jpg",
+        "failed": false,
+        "ok": false,
+        "text": ""
+      },
+      {
+        "name": "颜色14-多人购买-原装替芯【ST秒干】30支1桶装.jpg",
+        "failed": false,
+        "ok": false,
+        "text": ""
+      },
+      {
+        "name": "颜色15-原装替芯【ST秒干】10支1盒装.jpg",
+        "failed": false,
+        "ok": false,
+        "text": ""
+      },
+      {
+        "name": "颜色16-半年够用-【香菜笔】12支送20支笔芯.jpg",
+        "failed": false,
+        "ok": false,
+        "text": ""
+      },
+      {
+        "name": "颜色17-人气优先-【香菜笔】5支送20支笔芯.jpg",
+        "failed": false,
+        "ok": false,
+        "text": ""
+      },
+      {
+        "name": "颜色18-热销推荐-【香菜笔】3支送20支笔芯.jpg",
+        "failed": false,
+        "ok": false,
+        "text": ""
+      },
+      {
+        "name": "颜色19-爆款尝鲜-【香菜笔】3支.jpg",
+        "failed": false,
+        "ok": false,
+        "text": ""
+      },
+      {
+        "name": "颜色20-品质选择-【香菜笔】5支.jpg",
+        "failed": false,
+        "ok": false,
+        "text": ""
+      },
+      {
+        "name": "颜色21-整盒推荐-【香菜笔】12支.jpg",
+        "failed": false,
+        "ok": false,
+        "text": ""
+      },
+      {
+        "name": "颜色01-【半年够用】12支盒送20支笔芯.jpg",
+        "failed": false,
+        "ok": false,
+        "text": ""
+      },
+      {
+        "name": "颜色02-【性价比高】5支送20支笔芯.jpg",
+        "failed": false,
+        "ok": false,
+        "text": ""
+      },
+      {
+        "name": "颜色03-【店铺热销】3支送20支笔芯.jpg",
+        "failed": false,
+        "ok": false,
+        "text": ""
+      },
+      {
+        "name": "颜色04-【大美之诗静音】12支盒.jpg",
+        "failed": false,
+        "ok": false,
+        "text": ""
+      },
+      {
+        "name": "颜色05-【大美之诗静音】5支.jpg",
+        "failed": false,
+        "ok": false,
+        "text": ""
+      },
+      {
+        "name": "颜色06-【大美之诗静音】3支.jpg",
+        "failed": false,
+        "ok": false,
+        "text": ""
+      },
+      {
+        "name": "颜色07-【体验-不推荐】1支.jpg",
+        "failed": false,
+        "ok": false,
+        "text": ""
+      },
+      {
+        "name": "颜色08-【两个月推荐】1支笔+10支晨光笔芯.jpg",
+        "failed": false,
+        "ok": false,
+        "text": ""
+      },
+      {
+        "name": "颜色09-【大美之诗静音】3支+10支晨光笔芯.jpg",
+        "failed": false,
+        "ok": false,
+        "text": ""
+      },
+      {
+        "name": "颜色10-【大美之诗静音】6支+10支晨光笔芯.jpg",
+        "failed": false,
+        "ok": false,
+        "text": ""
+      },
+      {
+        "name": "颜色11-【大美之诗静音】3支+20支晨光笔芯.jpg",
+        "failed": false,
+        "ok": false,
+        "text": ""
+      },
+      {
+        "name": "颜色12-【大美之诗静音】6支+20支晨光笔芯.jpg",
+        "failed": false,
+        "ok": false,
+        "text": ""
+      },
+      {
+        "name": "颜色13-【够用一学期】1支笔+30支晨光笔芯.jpg",
+        "failed": false,
+        "ok": false,
+        "text": ""
+      },
+      {
+        "name": "颜色14-多人购买-原装替芯【ST秒干】30支1桶装.jpg",
+        "failed": false,
+        "ok": false,
+        "text": ""
+      },
+      {
+        "name": "颜色15-原装替芯【ST秒干】10支1盒装.jpg",
+        "failed": false,
+        "ok": false,
+        "text": ""
+      },
+      {
+        "name": "颜色16-半年够用-【香菜笔】12支送20支笔芯.jpg",
+        "failed": false,
+        "ok": false,
+        "text": ""
+      },
+      {
+        "name": "颜色17-人气优先-【香菜笔】5支送20支笔芯.jpg",
+        "failed": false,
+        "ok": false,
+        "text": ""
+      },
+      {
+        "name": "颜色18-热销推荐-【香菜笔】3支送20支笔芯.jpg",
+        "failed": false,
+        "ok": false,
+        "text": ""
+      },
+      {
+        "name": "颜色19-爆款尝鲜-【香菜笔】3支.jpg",
+        "failed": false,
+        "ok": false,
+        "text": ""
+      }
+    ]
+  },
+  "need_cli_upload": true,
+  "uploaded": false,
+  "pics": [
+    "颜色05-1支黑笔（粉杆）.jpg 800x800",
+    "颜色04-1支黑笔（绿杆）.jpg 800x800",
+    "颜色01-3支黑笔（图案各1）.jpg 1440x1440",
+    "颜色06-1支黑笔（透明绿杆）.jpg 800x800",
+    "详情13.jpg 790x1316",
+    "详情14.jpg 3160x3952",
+    "详情11.jpg 790x1566",
+    "详情12.jpg 790x1484",
+    "详情10.jpg 790x103",
+    "详情09.jpg 790x1580",
+    "详情08.jpg 790x1548",
+    "详情07.jpg 790x1439",
+    "详情06.jpg 790x194",
+    "详情04.jpg 790x1563",
+    "详情05.jpg 790x1580",
+    "详情03.jpg 5000x2561",
+    "详情02.jpg 790x411",
+    "详情01.jpg 790x1580",
+    "宝贝主图02.jpg 800x800",
+    "宝贝主图05.jpg 800x800",
+    "宝贝主图04.jpg 800x800",
+    "宝贝主图01.jpg 1254x1254",
+    "宝贝主图03.jpg 800x800",
+    "颜色03-【开芯摇摇乐】2支丨蓝杆 白杆.jpg 1254x1254",
+    "颜色02-【开芯摇摇乐】3支丨黄杆 白杆 蓝杆.jpg 1024x1024",
+    "颜色04-【开芯摇摇乐】1支丨白色笔杆.jpg 1024x1024",
+    "颜色01-【开芯摇摇乐】4支丨4色各1.jpg 1024x1024",
+    "方图主图05.jpg 1440x1440",
+    "方图主图03.jpg 1440x1440",
+    "方图主图04.jpg 1440x1440",
+    "方图主图02.jpg 1440x1440",
+    "详情13.jpg 790x1388",
+    "详情11.jpg 790x1388",
+    "详情12.jpg 790x1388",
+    "详情09.jpg 790x1388",
+    "详情10.jpg 790x1388",
+    "详情07.jpg 790x1388",
+    "详情08.jpg 790x1388",
+    "详情06.jpg 790x1388",
+    "详情05.jpg 790x1388"
+  ],
+  "missing": [
+    "颜色01-【半年够用】12支盒送20支笔芯.jpg",
+    "颜色02-【性价比高】5支送20支笔芯.jpg",
+    "颜色03-【店铺热销】3支送20支笔芯.jpg",
+    "颜色04-【大美之诗静音】12支盒.jpg",
+    "颜色05-【大美之诗静音】5支.jpg",
+    "颜色06-【大美之诗静音】3支.jpg",
+    "颜色07-【体验-不推荐】1支.jpg",
+    "颜色08-【两个月推荐】1支笔+10支晨光笔芯.jpg",
+    "颜色09-【大美之诗静音】3支+10支晨光笔芯.jpg",
+    "颜色10-【大美之诗静音】6支+10支晨光笔芯.jpg",
+    "颜色11-【大美之诗静音】3支+20支晨光笔芯.jpg",
+    "颜色12-【大美之诗静音】6支+20支晨光笔芯.jpg",
+    "颜色13-【够用一学期】1支笔+30支晨光笔芯.jpg",
+    "颜色14-多人购买-原装替芯【ST秒干】30支1桶装.jpg",
+    "颜色15-原装替芯【ST秒干】10支1盒装.jpg",
+    "颜色16-半年够用-【香菜笔】12支送20支笔芯.jpg",
+    "颜色17-人气优先-【香菜笔】5支送20支笔芯.jpg",
+    "颜色18-热销推荐-【香菜笔】3支送20支笔芯.jpg",
+    "颜色19-爆款尝鲜-【香菜笔】3支.jpg",
+    "颜色20-品质选择-【香菜笔】5支.jpg",
+    "颜色21-整盒推荐-【香菜笔】12支.jpg"
+  ],
+  "dialog": true
+}

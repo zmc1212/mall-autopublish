@@ -4,8 +4,12 @@ from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 spec_dir = Path(SPECPATH).resolve()
 root = spec_dir.parent
+app_icon = root / "logo" / "40c40691-9747-453a-a1d1-f2c94d393f34.ico"
+if not app_icon.is_file():
+    raise FileNotFoundError(f"application icon missing: {app_icon}")
 
 datas = [
+    (str(app_icon), "logo"),
     (str(root / "templates"), "templates"),
     (str(root / "web_fill"), "web_fill"),
     (str(root / "千牛字段映射.json"), "."),
@@ -65,6 +69,7 @@ exe = EXE(
     strip=False,
     upx=False,
     console=False,
+    icon=str(app_icon),
     disable_windowed_traceback=False,
 )
 coll = COLLECT(

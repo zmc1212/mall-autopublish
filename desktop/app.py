@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from desktop import paths  # noqa: E402
 from desktop.paths import configure_environ, logs_dir  # noqa: E402
 
 
@@ -86,10 +87,47 @@ def _cleanup_automation_chrome() -> None:
         pass
 
 
+def _runtime_preflight(require_bundle: bool = False) -> list[str]:
+    """Validate every runtime component needed on a clean Windows machine."""
+    problems: list[str] = []
+    root = paths.install_dir()
+    browser = paths.browser_exe_path(paths.load_settings().chrome_path)
+    if not browser or not browser.is_file():
+        problems.append("缺少可用浏览器（browser\\chromium\\chrome.exe）")
+    node = paths.node_exe_path()
+    if not node or not node.is_file():
+        problems.append("缺少 Node.js 运行时（node\\node.exe）")
+    if not paths.cli_js_path().is_file():
+        problems.append("缺少 Playwright CLI")
+    if not (root / "web_fill" / "scripts" / "material_import.js").is_file():
+        problems.append("缺少素材导入页面脚本 web_fill/scripts/material_import.js")
+    if require_bundle:
+        if not paths.bundled_browser_path():
+            problems.append("正式安装包没有内置 Chromium")
+        if not paths.webview2_runtime_dir():
+            problems.append("正式安装包没有固定版 WebView2 Runtime")
+        if not paths.find_resource("runtime-manifest.json").is_file():
+            problems.append("正式安装包缺少 runtime-manifest.json")
+    return problems
+
+
+def _write_self_test(problems: list[str]) -> None:
+    target = logs_dir() / "self-test.log"
+    message = "运行时自检通过" if not problems else "运行时自检失败：\n- " + "\n- ".join(problems)
+    target.write_text(message, encoding="utf-8")
+
+
 def main(argv=None) -> int:
     freeze_support()
     try:
+        argv = list(sys.argv[1:] if argv is None else argv)
         configure_environ()
+        problems = _runtime_preflight(require_bundle=paths.is_frozen())
+        _write_self_test(problems)
+        if "--self-test" in argv:
+            return 1 if problems else 0
+        if problems:
+            raise RuntimeError("运行环境不完整：\n- " + "\n- ".join(problems))
         from desktop.server import pick_free_port, run_server
         from urllib.request import urlopen
 
@@ -121,17 +159,29 @@ def main(argv=None) -> int:
             print(f"未安装 pywebview，请用浏览器打开 {url}")
             thread.join()
             return 0
+        runtime = paths.webview2_runtime_dir()
+        if runtime:
+            webview.settings["WEBVIEW2_RUNTIME_PATH"] = str(runtime)
+        window_icon = paths.find_resource(
+            "logo", "40c40691-9747-453a-a1d1-f2c94d393f34.ico"
+        )
         webview.create_window(
             "千牛自动上架",
             target,
             js_api=JsBridge(),
-            width=1280,
-            height=840,
-            min_size=(1100, 720),
+            width=1360,
+            height=900,
+            min_size=(1180, 760),
             background_color="#F8FAFC",
         )
         try:
-            webview.start(debug=debug)
+            webview.start(
+                gui="edgechromium",
+                icon=str(window_icon),
+                debug=debug,
+                private_mode=False,
+                storage_path=str(paths.appdata_dir() / "webview-profile"),
+            )
         finally:
             _cleanup_automation_chrome()
         return 0

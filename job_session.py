@@ -12,6 +12,25 @@ SESSION_NAME = "job_session.json"
 _ITEM_ID_RE = re.compile(r"(?:商品ID[:：]\s*|primaryId=|itemId=)(\d{8,})", re.I)
 _CAT_ID_RE = re.compile(r"catId=(\d+)", re.I)
 ACTION_LINK_KEYS = ("taobao_item_id", "view_url", "edit_url")
+# 这些状态下 notice/url 里的 itemId 属于"被拒绝进入的页面"或"中断时所在页面"，
+# 可能是别的商品；只信显式传入的 ID，不再从文本刮取。
+FAIL_EXECUTIONS = frozenset({"失败", "暂停", "提交失败", "已停止"})
+FLOW_KEYS = (
+    "flow_version",
+    "sku_image_strategy",
+    "seller_account",
+    "flow_stage",
+    "spec_image_stage",
+    "run_status",
+    "sku_material_manifest",
+    "material_result",
+    "material_preview",
+    "material_folder",
+    "last_error",
+    "updated_at",
+)
+ALL_EXTENDED_KEYS = tuple(dict.fromkeys(ACTION_LINK_KEYS + FLOW_KEYS))
+HISTORY_LIMIT = 500
 
 
 def _clip(text, limit=240):
@@ -31,10 +50,11 @@ def _http_url(url):
     return text
 
 
-def product_action_links(submitted=None, notice="", href="", item=None):
+def product_action_links(submitted=None, notice="", href="", item=None, execution=""):
     """从提交成功页或说明文字里取出查看/编辑商品链接。"""
     submitted = dict(submitted or {})
     item = dict(item or {})
+    state = str(execution or item.get("execution") or "").strip()
     item_id = str(
         submitted.get("itemId")
         or submitted.get("item_id")
@@ -57,14 +77,15 @@ def product_action_links(submitted=None, notice="", href="", item=None):
         )
         if part
     )
-    if not item_id:
-        match = _ITEM_ID_RE.search(blob)
-        if match:
-            item_id = match.group(1)
-    if not cat_id:
-        match = _CAT_ID_RE.search(blob)
-        if match:
-            cat_id = match.group(1)
+    if state not in FAIL_EXECUTIONS:
+        if not item_id:
+            match = _ITEM_ID_RE.search(blob)
+            if match:
+                item_id = match.group(1)
+        if not cat_id:
+            match = _CAT_ID_RE.search(blob)
+            if match:
+                cat_id = match.group(1)
     if item_id:
         if not view_url:
             view_url = f"https://item.taobao.com/item.htm?id={item_id}"
@@ -79,16 +100,29 @@ def product_action_links(submitted=None, notice="", href="", item=None):
     }
 
 
-def apply_action_links(target, submitted=None, notice="", href=""):
+def apply_action_links(target, submitted=None, notice="", href="", execution=""):
     data = dict(target or {})
     links = product_action_links(
         submitted=submitted if submitted is not None else data,
         notice=notice or data.get("notice") or "",
         href=href or data.get("url") or "",
         item=data,
+        execution=execution or data.get("execution") or "",
     )
     for key, value in links.items():
         data[key] = value or _http_url(data.get(key)) or ""
+    return data
+
+
+def extend_flow_fields(target, source=None):
+    """把扩展流程字段复制进记录，且不覆盖目标里已有的非空值。"""
+    data = dict(target or {})
+    source = dict(source or {})
+    for key in FLOW_KEYS:
+        if data.get(key) not in (None, ""):
+            continue
+        if source.get(key) not in (None, ""):
+            data[key] = source[key]
     return data
 
 
@@ -186,8 +220,123 @@ def save_session(data):
     return path
 
 
+def _fingerprint_allows(old_fingerprint, current_fingerprint):
+    """内容指纹守卫：两边指纹都存在且不一致时阻断回贴，防止同一文件夹被换成
+    新商品后误跳过上架。任一侧指纹缺失（旧会话数据或图片夹暂不可读）视为
+    无法判断，保持原有回贴行为。"""
+    old = str(old_fingerprint or "")
+    current = str(current_fingerprint or "")
+    if not old or not current:
+        return True
+    return old == current
+
+
+def _has_execution_state(row):
+    if str(row.get("execution") or "").strip() not in ("", "未执行"):
+        return True
+    if any(row.get(key) for key in ACTION_LINK_KEYS):
+        return True
+    return bool(str(row.get("flow_stage") or "").strip())
+
+
+def _history_record(row):
+    record = {
+        "product_id": str(row.get("product_id") or ""),
+        "title": str(row.get("title") or ""),
+        "execution": str(row.get("execution") or ""),
+        "notice": _clip(row.get("notice") or ""),
+        "pack_fingerprint": str(row.get("pack_fingerprint") or ""),
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    for key in ACTION_LINK_KEYS:
+        record[key] = row.get(key) or ""
+    for key in FLOW_KEYS:
+        if row.get(key) not in (None, ""):
+            record[key] = row.get(key)
+    return record
+
+
+def _prune_history(history):
+    if len(history) <= HISTORY_LIMIT:
+        return history
+    ranked = sorted(history.items(), key=lambda kv: str((kv[1] or {}).get("updated_at") or ""))
+    return dict(ranked[-HISTORY_LIMIT:])
+
+
+def _sync_history_from_rows(data, row=None, product_id=""):
+    """把当前行最新执行状态归档进 execution_history（行被移除后仍可回贴）。"""
+    history = dict(data.get("execution_history") or {})
+    pid = str(product_id or "")
+    changed = False
+    for item in data.get("rows") or []:
+        if row is not None and item.get("row") != row:
+            continue
+        item_pid = str(item.get("product_id") or "")
+        if not item_pid or (pid and item_pid != pid):
+            continue
+        if not _has_execution_state(item):
+            continue
+        history[item_pid] = _history_record(item)
+        changed = True
+    if changed:
+        data["execution_history"] = _prune_history(history)
+    return changed
+
+
+def forget_execution(row=None, product_id=""):
+    """清空某商品的执行状态并删除其历史归档（手动清除入口），
+    否则下次校验会被 merge_execution 按会话行或历史再次回贴。"""
+    data = load_session()
+    if not data:
+        return None
+    pid = str(product_id or "")
+    targets = set()
+    cleared_keys = ("taobao_item_id", "view_url", "edit_url", *FLOW_KEYS)
+    changed = False
+    for item in data.get("rows") or []:
+        if row is not None and item.get("row") != row:
+            continue
+        item_pid = str(item.get("product_id") or "")
+        if pid and item_pid and item_pid != pid:
+            continue
+        if item_pid:
+            targets.add(item_pid)
+        item["execution"] = "未执行"
+        item["notice"] = ""
+        item["errors"] = []
+        for key in cleared_keys:
+            item[key] = ""
+        changed = True
+    for bundle in data.get("products") or []:
+        meta = bundle.get("meta") or {}
+        if row is not None and meta.get("row") != row:
+            continue
+        item_pid = str(meta.get("product_id") or "")
+        if pid and item_pid and item_pid != pid:
+            continue
+        if item_pid:
+            targets.add(item_pid)
+        meta["execution"] = "未执行"
+        meta["notice"] = ""
+        for key in cleared_keys:
+            meta[key] = ""
+        bundle["meta"] = meta
+        changed = True
+    if not targets and not changed:
+        return None
+    history = dict(data.get("execution_history") or {})
+    for key in targets:
+        history.pop(key, None)
+    data["execution_history"] = history
+    return save_session(data)
+
+
 def merge_execution(results, workbook_path):
-    """把上次同一份清单的执行状态填回重新校验后的结果。"""
+    """把上次同一份清单的执行状态填回重新校验后的结果。
+
+    匹配顺序：清单行 (row, product_id) 精确匹配 → 执行历史按 product_id 回贴
+    （覆盖文件夹删除后重新出现的场景）。内容指纹不一致或当前指纹缺失时跳过。
+    """
     session = load_session()
     if not session:
         return results
@@ -196,19 +345,18 @@ def merge_execution(results, workbook_path):
     if saved and current and saved != current:
         return results
     previous_by_key = {}
-    previous_by_row = {}
     for row in session.get("rows") or []:
         previous_by_key[(row.get("row"), str(row.get("product_id") or ""))] = row
-        if row.get("row") not in previous_by_row:
-            previous_by_row[row.get("row")] = row
     for bundle in session.get("products") or []:
         meta = bundle.get("meta") or {}
         previous_by_key[(meta.get("row"), str(meta.get("product_id") or ""))] = meta
-        if meta.get("row") not in previous_by_row:
-            previous_by_row[meta.get("row")] = meta
+    history_by_id = dict(session.get("execution_history") or {})
     for item in results or []:
-        old = previous_by_key.get((item.get("row"), str(item.get("product_id") or ""))) or previous_by_row.get(item.get("row"))
+        pid = str(item.get("product_id") or "")
+        old = previous_by_key.get((item.get("row"), pid)) or history_by_id.get(pid)
         if not old:
+            continue
+        if not _fingerprint_allows(old.get("pack_fingerprint"), item.get("pack_fingerprint")):
             continue
         execution = old.get("execution") or "未执行"
         if execution and execution != "未执行":
@@ -217,6 +365,9 @@ def merge_execution(results, workbook_path):
             for key in ACTION_LINK_KEYS:
                 if old.get(key):
                     item[key] = old.get(key)
+            for key in FLOW_KEYS:
+                if old.get(key) not in (None, ""):
+                    item[key] = old[key]
             item.update(apply_action_links(item))
     return results
 
@@ -244,6 +395,8 @@ def remember_workbook(workbook_path, results):
             "taobao_item_id": links.get("taobao_item_id") or "",
             "view_url": links.get("view_url") or "",
             "edit_url": links.get("edit_url") or "",
+            "pack_fingerprint": str(item.get("pack_fingerprint") or ""),
+            **{key: item.get(key) or "" for key in FLOW_KEYS},
         })
     mtime = None
     try:
@@ -260,6 +413,13 @@ def remember_workbook(workbook_path, results):
         "count": len(rows),
     })
     existing.setdefault("status", "idle")
+    history = dict(existing.get("execution_history") or {})
+    for row in rows:
+        row_pid = str(row.get("product_id") or "")
+        if not row_pid or not _has_execution_state(row):
+            continue
+        history[row_pid] = _history_record(row)
+    existing["execution_history"] = _prune_history(history)
     return save_session(existing)
 
 
@@ -269,7 +429,10 @@ def patch_execution(row, product_id, execution, notice="", errors=None, status=N
         return None
     pid = str(product_id or "")
     extra = extra or {}
-    links = apply_action_links({"notice": notice, **extra})
+    links = apply_action_links({"notice": notice, **extra}, execution=execution)
+    flow_patch = {key: extra.get(key) for key in FLOW_KEYS if extra.get(key) not in (None, "")}
+    if flow_patch.get("flow_stage") == "complete":
+        flow_patch.update(run_status="completed", last_error="")
     for bundle in data.get("products") or []:
         meta = bundle.get("meta") or {}
         if meta.get("row") != row:
@@ -278,6 +441,8 @@ def patch_execution(row, product_id, execution, notice="", errors=None, status=N
             continue
         meta["execution"] = execution
         meta["notice"] = notice
+        meta.update(flow_patch)
+        meta["updated_at"] = datetime.now().isoformat(timespec="seconds")
         if errors is not None:
             meta["errors"] = list(errors)
         for key in ACTION_LINK_KEYS:
@@ -292,15 +457,47 @@ def patch_execution(row, product_id, execution, notice="", errors=None, status=N
             continue
         item["execution"] = execution
         item["notice"] = notice
+        item.update(flow_patch)
+        item["updated_at"] = datetime.now().isoformat(timespec="seconds")
         for key in ACTION_LINK_KEYS:
             if links.get(key):
                 item[key] = links[key]
+    _sync_history_from_rows(data, row=row, product_id=pid)
     if status:
         data["status"] = status
     if phase is not None:
         data["phase"] = phase
     if blocker is not None:
         data["blocker"] = blocker
+    return save_session(data)
+
+
+def patch_flow_state(row, product_id, fields=None):
+    """商品 ID 与最新阶段即时落盘；不改变 execution 展示字段。"""
+    data = load_session()
+    if not data:
+        return None
+    pid = str(product_id or "")
+    patch = {key: value for key, value in (fields or {}).items() if key in FLOW_KEYS}
+    links = apply_action_links(patch)
+    patch.update({key: links[key] for key in ACTION_LINK_KEYS if links.get(key)})
+    patch["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    if not patch:
+        return None
+    for bundle in data.get("products") or []:
+        meta = bundle.get("meta") or {}
+        if meta.get("row") != row:
+            continue
+        if pid and str(meta.get("product_id") or "") not in {"", pid}:
+            continue
+        meta.update(patch)
+        bundle["meta"] = meta
+        bundle["product"] = extend_flow_fields(bundle.get("product") or {}, meta)
+    for item in data.get("rows") or []:
+        if item.get("row") != row:
+            continue
+        item.update(patch)
+    _sync_history_from_rows(data, row=row, product_id=pid)
     return save_session(data)
 
 

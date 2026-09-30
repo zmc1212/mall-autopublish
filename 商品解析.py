@@ -20,8 +20,14 @@ def reload_paths():
 
 TEMPLATES_DIR = get_templates_dir()
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".avi", ".wmv", ".flv", ".3gp", ".mkv", ".webm"}
 PORTRAIT_NAME = re.compile(r"3比4|3-4")
-MAIN_NAME = re.compile(r"^(?:宝贝)?主图(\d+)")
+# 兼容常见的“方图主图NN”命名。文件名只是提示，最终仍结合像素比例判断
+# “宝贝主图NN”到底是 1:1 还是 3:4，避免把竖图误当成正方形主图。
+MAIN_NAME = re.compile(r"^(?:(?:宝贝|方图)?主图)(\d+)")
+# 图片包可能同时带“宝贝主图”和“方图主图”两套备选主图。分组排序保证
+# 两组各自连续，页面上传位不足时截取前几张仍是完整的一组而不是交错混合。
+MAIN_GROUP_ORDER = {"宝贝主图": 0, "方图主图": 1}
 DETAIL_NAME = re.compile(r"^详情(\d+)")
 SKU_NAME = re.compile(r"^(颜色\d+)\s*[-－](.+)$")
 KIND_KEYS = {
@@ -64,6 +70,11 @@ def _pixel_ratio(path):
         return width / height if height else 0
     except Exception:
         return None
+
+
+def _is_portrait_ratio(path):
+    ratio = _pixel_ratio(path)
+    return ratio is not None and 0.7 <= ratio <= 0.8
 
 
 def _sort_num(stem):
@@ -117,8 +128,25 @@ def load_templates(names=None, templates_dir=None):
     return merged
 
 
+def _main_group(stem):
+    for prefix, order in MAIN_GROUP_ORDER.items():
+        if stem.startswith(prefix):
+            return order
+    return len(MAIN_GROUP_ORDER)
+
+
+def scan_main_video(folder):
+    """在扁平图片包里选主视频：优先文件名含“主视频”，否则取排序第一个视频。"""
+    videos = sorted(
+        (p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in VIDEO_EXTS),
+        key=lambda p: p.name,
+    )
+    named = [p for p in videos if "主视频" in p.stem]
+    return (named or videos or [None])[0]
+
+
 def scan_image_pack(dir_path):
-    """扫描扁平图片包：宝贝主图 / 详情 / 颜色NN-规格名，缺 3:4 则跳过。"""
+    """扫描扁平图片包：方图/宝贝主图、3:4 主图、详情和颜色NN-规格名。"""
     folder = Path(dir_path)
     if not folder.is_dir():
         raise FileNotFoundError(f"图片包不存在或不是目录: {folder}")
@@ -133,7 +161,12 @@ def scan_image_pack(dir_path):
             continue
         match = MAIN_NAME.match(stem)
         if match:
-            mains.append((int(match.group(1)), path.name, path))
+            # “宝贝主图”在不同来源中既可能是方图，也可能是 3:4 竖图；
+            # “方图主图”则保留为 1:1 主图。无法读取尺寸时沿用主图命名。
+            if stem.startswith("宝贝主图") and _is_portrait_ratio(path):
+                portraits.append((_sort_num(stem), path.name, path))
+            else:
+                mains.append((_main_group(stem), int(match.group(1)), path.name, path))
             classified.add(path)
             continue
         match = DETAIL_NAME.match(stem)
@@ -161,10 +194,11 @@ def scan_image_pack(dir_path):
     details.sort()
     skus.sort(key=lambda item: (item["_n"], item["slot"]))
     return {
-        "main_1_1": [item[2] for item in mains[:5]],
-        "main_3_4": [item[2] for item in portraits[:5]],
+        "main_1_1": [item[3] for item in mains],
+        "main_3_4": [item[2] for item in portraits],
         "details": [item[2] for item in details],
         "skus": [{k: v for k, v in item.items() if k != "_n"} for item in skus],
+        "main_video": scan_main_video(folder),
     }
 
 
@@ -305,5 +339,6 @@ def resolve_product(row, sku_rows=None, pack=None, templates=None, base_dir=None
         "spec_mode": str(sales_tpl.get("spec_mode") or "").strip(),
         "spec_name": spec_name,
         "warehouse": (str(first_present(row, "上架时间") or sales_tpl.get("listing_time") or "放入仓库").strip() == "放入仓库"),
+        "main_video": pack.get("main_video"),
         "pack_dir": pack_dir,
     }

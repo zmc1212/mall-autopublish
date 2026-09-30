@@ -26,7 +26,8 @@ def detect_chrome():
     override = os.environ.get("QIANNIU_CHROME") or os.environ.get("CHROME_PATH")
     if override and Path(override).is_file():
         return Path(override)
-    candidates = []
+    module_dir = Path(__file__).resolve().parent
+    candidates = [module_dir / "browser" / "chromium" / "chrome.exe"]
     for key in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
         base = os.environ.get(key)
         if base:
@@ -116,6 +117,7 @@ CHROME_ANTI_THROTTLE_ARGS = (
 )
 OFFSCREEN_POS = (-32000, -32000)
 _CHROME_PLACEMENTS = {}
+_CHROME_EXSTYLES = {}
 _CHROME_PROC = None
 _CHROME_ROOT_PID = 0
 EDIT_MARKERS = ("itemid=", "item_num_id=", "/edit.htm", "/subitem/publish.htm")
@@ -130,6 +132,7 @@ LOGIN_HOSTS = (
 )
 SELLER_HOSTS = ("myseller.taobao.com", "item.upload.taobao.com", "qn.taobao.com")
 BLOCKER_TEXTS = ("请登录", "扫码登录", "验证码", "请完成验证", "滑块", "请拖动", "请按住滑块")
+SELLER_ACCOUNT_HOME = "https://myseller.taobao.com/home.htm"
 NODE_RE = re.compile(
     r'^\s*-\s+(?P<role>radio|textbox|button|tab|combobox|checkbox|listitem|heading|option|switch|link|generic)'
     r'(?:\s+"(?P<name>[^"]*)")?'
@@ -336,6 +339,14 @@ def chrome_launch_args(chrome=None, profile=None, port=None, url=None):
         "--hide-crash-restore-bubble",
         *CHROME_ANTI_THROTTLE_ARGS,
     ]
+    bundled = ROOT / "browser" / "chromium" / "chrome.exe"
+    try:
+        if chrome.resolve() == bundled.resolve():
+            # Playwright's Chrome for Testing build is distributed for automation
+            # and requires the same sandbox opt-out used by Playwright launchers.
+            args.append("--no-sandbox")
+    except OSError:
+        pass
     if url:
         args.append(url)
     elif profile_has_saved_session(profile):
@@ -358,7 +369,7 @@ def _hidden_subprocess_kwargs():
     return kwargs
 
 
-def _spawn_chrome():
+def _spawn_chrome(hidden=False):
     global _CHROME_PROC, _CHROME_ROOT_PID
     if not CHROME.is_file():
         raise RuntimeError(f"未找到 Chrome: {CHROME}")
@@ -369,7 +380,15 @@ def _spawn_chrome():
     }
     if os.name == "nt":
         kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
-    _CHROME_PROC = subprocess.Popen(chrome_launch_args(), **kwargs)
+        if hidden:
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = 0
+            kwargs["startupinfo"] = startupinfo
+    args = chrome_launch_args()
+    if hidden:
+        args.append(f"--window-position={OFFSCREEN_POS[0]},{OFFSCREEN_POS[1]}")
+    _CHROME_PROC = subprocess.Popen(args, **kwargs)
     _CHROME_ROOT_PID = int(_CHROME_PROC.pid or 0)
 
 
@@ -380,6 +399,7 @@ def _process_command_line(pid):
     try:
         # 只查询一个已知 PID，并不遍历或结束其他进程。
         script = (
+            "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); "
             "(Get-CimInstance Win32_Process -Filter 'ProcessId = "
             + str(int(pid))
             + "').CommandLine"
@@ -482,6 +502,7 @@ def close_automation_chrome(timeout=3.0):
     _CHROME_PROC = None
     _CHROME_ROOT_PID = 0
     _CHROME_PLACEMENTS.clear()
+    _CHROME_EXSTYLES.clear()
     return closed
 
 
@@ -537,6 +558,35 @@ def _page_tabs(tabs=None):
             continue
         pages.append(tab)
     return pages
+
+
+def close_redundant_seller_home_tabs():
+    """连接前关闭独立 Chrome 中多余的工作台首页，保留业务页和登录页。
+
+    Playwright 会等待所有已有页面初始化；失去响应的历史首页会阻塞
+    整个连接。仅当另有卖家业务页时清理确定的首页，不处理发布断点。
+    """
+    if not _adopt_connected_automation_chrome():
+        return []
+    pages = _page_tabs()
+    if any(is_login_url(str(tab.get("url") or "")) for tab in pages):
+        return []
+
+    def is_home(tab):
+        url = urlparse(str(tab.get("url") or ""))
+        return (url.hostname or "").lower() == "myseller.taobao.com" and url.path.rstrip("/").lower() == "/home.htm/qnworkbenchhome"
+
+    if not any(is_seller_url(str(tab.get("url") or "")) and not is_home(tab) for tab in pages):
+        return []
+    closed = []
+    for tab in pages:
+        if is_home(tab):
+            try:
+                _cdp_close_tab(tab["id"])
+                closed.append(tab["id"])
+            except Exception:
+                pass
+    return closed
 
 
 def tab_should_keep(url, keep_url=""):
@@ -596,7 +646,12 @@ def prune_automation_tabs(keep_url="", keep_fill_pages=False, tabs=None):
 
 def activate_seller_tab(tabs=None):
     tabs = tabs if tabs is not None else cdp_tabs()
-    chosen = pick_seller_tab(tabs)
+    # 登录窗口可能与旧卖家标签同时存在。人工登录时应激活真正的登录页，
+    # 否则用户只看到旧标签，以为弹出的窗口无法输入账号密码。
+    chosen = next(
+        (tab for tab in tabs or [] if is_login_url(str(tab.get("url") or "")) and tab.get("id")),
+        None,
+    ) or pick_seller_tab(tabs)
     if chosen and chosen.get("id"):
         _cdp_get("/json/activate/" + str(chosen["id"]))
         return chosen
@@ -747,8 +802,22 @@ def _hwnds_for_pids(pids):
             return True
         if not user32.IsWindow(hwnd):
             return True
+        class_name = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, class_name, len(class_name))
+        if class_name.value == "Chrome_WidgetWin_0":
+            # Older versions of this app could expose Chrome's blank helper
+            # window. Hide that stray black window when enumerating the browser.
+            if user32.IsWindowVisible(hwnd) and not user32.GetWindowTextLengthW(hwnd):
+                user32.ShowWindow(hwnd, 0)
+            return True
+        if class_name.value != "Chrome_WidgetWin_1":
+            return True
         rect = wintypes.RECT()
         user32.GetWindowRect(hwnd, ctypes.byref(rect))
+        # Chrome 同一进程树里还有消息窗口和渲染辅助窗口。它们没有可用
+        # 的用户区域，若被当作第一个窗口激活，会表现为窗口可见但无法输入。
+        if rect.right - rect.left < 200 or rect.bottom - rect.top < 150:
+            return True
         length = user32.GetWindowTextLengthW(hwnd)
         title = ""
         if length:
@@ -762,6 +831,34 @@ def _hwnds_for_pids(pids):
     return found
 
 
+def _set_window_taskbar_visible(hwnd, visible):
+    """Prevent tab activation from recreating a taskbar button for hidden Chrome."""
+    if os.name != "nt":
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    handle = wintypes.HWND(int(hwnd))
+    get_style = user32.GetWindowLongW
+    get_style.argtypes = [wintypes.HWND, ctypes.c_int]
+    get_style.restype = wintypes.LONG
+    set_style = user32.SetWindowLongW
+    set_style.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.LONG]
+    set_style.restype = wintypes.LONG
+    style = get_style(handle, -20)
+    if visible:
+        original = _CHROME_EXSTYLES.pop(int(hwnd), None)
+        # Recover windows hidden by a previous app instance as well.
+        next_style = original if original is not None else (style & ~0x80)
+    else:
+        _CHROME_EXSTYLES.setdefault(int(hwnd), style & ~0x80)
+        next_style = (style | 0x80) & ~0x40000  # TOOLWINDOW, clear APPWINDOW
+        user32.ShowWindow(handle, 0)
+    set_style(handle, -20, next_style)
+    user32.SetWindowPos(handle, 0, 0, 0, 0, 0, 0x0037)  # FRAMECHANGED, no move/size/activate
+
+
 def _set_window_rect(hwnd, x, y, w=0, h=0, show=None, activate=False):
     if os.name != "nt":
         return False
@@ -770,6 +867,8 @@ def _set_window_rect(hwnd, x, y, w=0, h=0, show=None, activate=False):
 
     user32 = ctypes.windll.user32
     handle = wintypes.HWND(int(hwnd))
+    if show is not None:
+        _set_window_taskbar_visible(hwnd, visible=(show != 0))
     SWP_NOSIZE = 0x0001
     SWP_NOZORDER = 0x0004
     SWP_NOACTIVATE = 0x0010
@@ -788,9 +887,11 @@ def _set_window_rect(hwnd, x, y, w=0, h=0, show=None, activate=False):
             current = user32.GetWindowThreadProcessId(foreground, None)
             target = user32.GetWindowThreadProcessId(handle, None)
             user32.AttachThreadInput(current, target, True)
+            user32.BringWindowToTop(handle)
             user32.SetForegroundWindow(handle)
             user32.AttachThreadInput(current, target, False)
         else:
+            user32.BringWindowToTop(handle)
             user32.SetForegroundWindow(handle)
     return True
 
@@ -804,13 +905,16 @@ def hide_automation_chrome(pids=None, root_pid=None, port=None):
     moved = False
     for hwnd, _title, rect in _hwnds_for_pids(targets):
         left, top, right, bottom = rect
-        if left <= OFFSCREEN_POS[0] + 100 and top <= OFFSCREEN_POS[1] + 100:
-            continue
-        _CHROME_PLACEMENTS[hwnd] = rect
+        # Even an offscreen window may have been made visible by tab-select.
+        # Reapply SW_HIDE without replacing its saved on-screen placement.
+        if left > OFFSCREEN_POS[0] + 100 or top > OFFSCREEN_POS[1] + 100:
+            _CHROME_PLACEMENTS.setdefault(hwnd, rect)
         width = max(1, right - left)
         height = max(1, bottom - top)
         try:
-            _set_window_rect(hwnd, OFFSCREEN_POS[0], OFFSCREEN_POS[1], width, height, activate=False)
+            # 移到屏幕外保留原有窗口位置，同时使用 SW_HIDE 移除任务栏按钮。
+            # 仅移动窗口不会从 Windows 任务栏消失，导致“默认隐藏”仍占用任务栏。
+            _set_window_rect(hwnd, OFFSCREEN_POS[0], OFFSCREEN_POS[1], width, height, show=0, activate=False)
             moved = True
         except Exception:
             continue
@@ -846,15 +950,23 @@ def focus_chrome_windows():
     return reveal_automation_chrome()
 
 
-def reveal_seller_chrome():
+def reveal_seller_chrome(timeout=4.0):
     try:
         activate_seller_tab()
     except Exception:
         pass
-    try:
-        reveal_automation_chrome()
-    except Exception:
-        pass
+    deadline = time.time() + max(0.0, float(timeout))
+    while True:
+        try:
+            if reveal_automation_chrome():
+                return True
+        except Exception:
+            pass
+        if time.time() >= deadline:
+            return False
+        # Chrome 的 CDP 端口通常早于原生窗口就绪；首次启动时等待 HWND
+        # 出现，避免按钮已经返回但登录窗口仍留在屏幕外或尚不可交互。
+        time.sleep(0.1)
 
 
 def _wait_cdp_ready(timeout=10):
@@ -906,7 +1018,7 @@ def start_persistent_chrome(focus=False, hide_if_logged_in=None):
     reload_paths()
     started = False
     if not cdp_available():
-        _spawn_chrome()
+        _spawn_chrome(hidden=not focus and bool(hide_if_logged_in))
         if not _wait_cdp_ready(10) and not cdp_available():
             raise RuntimeError(f"已启动 Chrome，但 {CDP_PORT} 调试端口未就绪")
         started = True
@@ -921,7 +1033,15 @@ def start_persistent_chrome(focus=False, hide_if_logged_in=None):
             status = login_status_from_tabs()
     except Exception:
         pass
-    if status.get("logged_in"):
+    if not focus and hide_if_logged_in:
+        # Background attachment must never reveal the window. Login/captcha
+        # blockers are handled by the desktop pause-and-reveal flow.
+        hide_automation_chrome()
+        return "started" if started else "hidden"
+    # Chrome 首次打开卖家中心时，未登录用户也会短暂出现在卖家域名，
+    # 随后才重定向到登录页。新启动的窗口必须先显示，不能在这个过渡
+    # 阶段按“已登录”收起；桌面端会在状态稳定后再自动收起。
+    if status.get("logged_in") and not started:
         if hide_if_logged_in:
             try:
                 hide_automation_chrome()
@@ -933,7 +1053,8 @@ def start_persistent_chrome(focus=False, hide_if_logged_in=None):
             return "started" if started else "focused"
         return "started" if started else "connected"
     if focus or started:
-        reveal_seller_chrome()
+        if os.name == "nt" and not reveal_seller_chrome():
+            raise RuntimeError("Chrome 已启动，但未找到可操作的浏览器窗口；请关闭残留的自动化 Chrome 后重试")
         if started:
             wait_for_seller_login_status()
         return "started" if started else "focused"
@@ -951,6 +1072,15 @@ def cdp_tabs(timeout=3):
     return data if isinstance(data, list) else []
 
 
+def seller_account_from_page(page):
+    """从卖家中心页面提取当前登录账号标识（无登录态时返回空串）。
+
+    不声称返回昵称/用户 ID：只有当页面明确出现「店铺名」「掌柜名」等
+    卖家中心字段时才提取；用于防止切店后沿用上一店铺的商品 ID。
+    """
+    return str(page.get("sellerName") or page.get("seller_name") or page.get("shopName") or "").strip()
+
+
 def login_status_from_tabs(tabs=None):
     try:
         tabs = tabs if tabs is not None else cdp_tabs()
@@ -959,10 +1089,12 @@ def login_status_from_tabs(tabs=None):
     urls = [str(tab.get("url") or "") for tab in tabs if str(tab.get("url") or "").startswith("http")]
     seller_urls = [url for url in urls if is_seller_url(url)]
     login_urls = [url for url in urls if is_login_url(url)]
-    if seller_urls:
-        return {"logged_in": True, "blocker": "", "url": seller_urls[0]}
+    # 登录页优先。Chrome 会保留旧卖家标签，也可能在重定向期间同时暴露
+    # 卖家页和登录页；只要仍有登录页，就不能宣称已经登录。
     if login_urls:
         return {"logged_in": False, "blocker": "登录页", "url": login_urls[0]}
+    if seller_urls:
+        return {"logged_in": True, "blocker": "", "url": seller_urls[0]}
     return {"logged_in": False, "blocker": "未打开卖家中心", "url": urls[0] if urls else ""}
 
 
@@ -1127,6 +1259,7 @@ class CliSession:
 
     def attach(self):
         start_persistent_chrome(focus=False)
+        close_redundant_seller_home_tabs()
         try:
             href = self.href()
             if href:
@@ -1150,6 +1283,31 @@ class CliSession:
         if path.is_file():
             return path.read_text(encoding="utf-8", errors="replace")
         return self.cmd("snapshot")
+
+    def eval_json(self, expression):
+        """执行页面 JS 并解析 JSON，返回 dict；失败返回空 dict。"""
+        raw = self.cmd("eval", expression) or ""
+        text = raw.strip().strip('"').strip("'")
+        try:
+            value = json.loads(text)
+            return value if isinstance(value, dict) else {}
+        except (json.JSONDecodeError, ValueError):
+            return {}
+
+    def seller_account(self):
+        """读取当前登录账号标识；用于把商品记录绑定到店铺身份。"""
+        if not is_seller_url(self.href()):
+            return ""
+        try:
+            page = self.eval_json(
+                "() => ({"
+                " sellerName: (document.querySelector('.sellerName') || {}).innerText || '',"
+                " shopName: (document.querySelector('.shopName') || {}).innerText || ''"
+                " })"
+            )
+        except Exception:
+            page = {}
+        return seller_account_from_page(page)
 
     def goto(self, url):
         assert_safe_url(url)
@@ -1238,7 +1396,8 @@ def choose_visible(session, value):
 
 
 def open_new_publish(session, category, brand=""):
-    assert_safe_url(session.href())
+    # 当前标签可能停在上一条成功商品残留的编辑页（URL 含 itemId），
+    # 这是正常状态；直接导航去类目页，保留对类目页与新发布页的守卫。
     session.goto(CATEGORY_ENTRY)
     snap = session.snapshot()
     assert_logged_in(session.href(), snap)
