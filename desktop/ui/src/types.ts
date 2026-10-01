@@ -40,6 +40,10 @@ export interface WorkbookRow {
   portrait_count: number;
   detail_count: number;
   sku_count: number;
+  /** 主视频文件名；无视频为空串。 */
+  video_name?: string;
+  /** 主视频容器校验是否通过（false 时明细表标红“格式错误”）。 */
+  video_ok?: boolean;
   pack: string;
   pack_found?: boolean;
   taobao_item_id?: string;
@@ -113,6 +117,8 @@ export interface AppSettings {
   limit: number;
   /** 入库后进编辑页每批补传的规格图行数；0 表示全部一次上传。 */
   spec_upload_batch_size: number;
+  /** 条目失败后的自动重试次数；0 表示失败不重试直接跳下一条。 */
+  item_retry_limit: number;
   results_dir: string;
 }
 

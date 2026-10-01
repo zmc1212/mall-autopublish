@@ -1,4 +1,4 @@
-import { FolderOpen, Loader2, Save, ScrollText } from "lucide-react";
+import { Download, FolderOpen, Loader2, Save, ScrollText } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import { Button, InputText } from "../theme";
@@ -15,9 +15,11 @@ interface SettingsPanelProps {
   busy: boolean;
   pending: ReadonlySet<string>;
   onChange: (next: AppSettings) => void;
+  onToggleDebugBrowser: (checked: boolean) => void;
   onPickChrome: () => void;
   onPickResults: () => void;
   onPickProfile: () => void;
+  onExportLogs: () => void;
   onSave: () => void;
   className?: string;
 }
@@ -30,9 +32,11 @@ export default function SettingsPanel({
   busy,
   pending,
   onChange,
+  onToggleDebugBrowser,
   onPickChrome,
   onPickResults,
   onPickProfile,
+  onExportLogs,
   onSave,
   className = "",
 }: SettingsPanelProps) {
@@ -48,12 +52,15 @@ export default function SettingsPanel({
   const [portText, setPortText] = useState(String(draft.cdp_port));
   const [limitText, setLimitText] = useState(String(draft.limit));
   const [specBatchText, setSpecBatchText] = useState(String(draft.spec_upload_batch_size));
+  const [retryLimitText, setRetryLimitText] = useState(String(draft.item_retry_limit));
   useEffect(() => setPortText(String(draft.cdp_port)), [draft.cdp_port]);
   useEffect(() => setLimitText(String(draft.limit)), [draft.limit]);
   useEffect(() => setSpecBatchText(String(draft.spec_upload_batch_size)), [draft.spec_upload_batch_size]);
+  useEffect(() => setRetryLimitText(String(draft.item_retry_limit)), [draft.item_retry_limit]);
   const portValid = /^\d+$/.test(portText) && Number(portText) >= 1 && Number(portText) <= 65535;
   const limitValid = limitText === "" || /^\d+$/.test(limitText);
   const specBatchValid = specBatchText === "" || (/^\d+$/.test(specBatchText) && Number(specBatchText) <= 99);
+  const retryLimitValid = retryLimitText === "" || (/^\d+$/.test(retryLimitText) && Number(retryLimitText) <= 5);
 
   const toggleSkuImageTarget = (target: "slim_material" | "publish_page") => {
     const selected = new Set(
@@ -80,7 +87,7 @@ export default function SettingsPanel({
             <div>
               <h3 className="text-sm font-semibold">排障工具</h3>
               <p className="mt-1 text-xs leading-5 text-slate-500">
-                默认隐藏自动化浏览器窗口和任务栏图标。需要查看页面或手动处理异常时，勾选后保存设置即可保持显示。
+                默认隐藏自动化浏览器窗口和任务栏图标。需要查看页面或手动处理异常时，勾选后立即生效并保持显示。
               </p>
             </div>
             <label className="mt-4 flex items-start gap-3 rounded-lg border border-border bg-slate-50 p-3 text-sm">
@@ -89,12 +96,12 @@ export default function SettingsPanel({
                 className="mt-0.5 h-4 w-4 accent-primary"
                 checked={draft.debug_browser}
                 disabled={busy || !chrome?.chrome_found}
-                onChange={(event) => onChange({ ...draft, debug_browser: event.target.checked })}
+                onChange={(event) => onToggleDebugBrowser(event.target.checked)}
               />
               <span>
                 <span className="block font-medium text-slate-800">显示自动化浏览器</span>
                 <span className="mt-1 block text-xs text-slate-500">
-                  勾选后执行任务时浏览器窗口保持显示；取消勾选后窗口会隐藏，任务栏也不会显示浏览器图标。
+                  勾选后浏览器窗口立即显示，执行任务时保持显示；取消勾选后窗口立即隐藏，任务栏也不会显示浏览器图标。
                 </span>
               </span>
             </label>
@@ -107,9 +114,28 @@ export default function SettingsPanel({
               <ScrollText className="h-4 w-4" aria-hidden="true" />
               最近运行日志
             </div>
-            <span className="text-xs text-slate-400">
-              {logLevel === "all" && !query ? `${allLogs.length} 条` : `匹配 ${filteredLogs.length} / ${allLogs.length} 条`}
-            </span>
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-slate-400">
+                {logLevel === "all" && !query ? `${allLogs.length} 条` : `匹配 ${filteredLogs.length} / ${allLogs.length} 条`}
+              </span>
+              <button
+                type="button"
+                onClick={onExportLogs}
+                disabled={pending.has("settings.exportLogs")}
+                className={cn(
+                  "flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs transition-colors",
+                  "text-slate-300 hover:bg-white/10 hover:text-white",
+                  pending.has("settings.exportLogs") && "opacity-60",
+                )}
+              >
+                {pending.has("settings.exportLogs") ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+                ) : (
+                  <Download className="h-3.5 w-3.5" aria-hidden="true" />
+                )}
+                导出日志
+              </button>
+            </div>
           </div>
           <div className="flex flex-wrap items-center gap-2 border-b border-white/10 px-4 py-2">
             <div className="flex gap-1" role="group" aria-label="日志级别过滤">
@@ -326,8 +352,33 @@ export default function SettingsPanel({
               请输入非负整数，留空或 0 表示全部。
             </p>
           )}
+          <label className="mt-6 block text-sm font-medium" htmlFor="item-retry-limit">
+            失败自动重试次数（0-5，0 表示不重试）
+          </label>
+          <p className="mt-1 text-xs text-slate-500">
+            某条数据入库失败时自动重试 N 次，仍失败则跳过该条继续下一条，全程不暂停；跑完后统一列出需人工处理的条目。登录失效、滑块验证等需人工处理的情况以及提交结果不明确的条目不重试，直接跳过。
+          </p>
+          <InputText
+            id="item-retry-limit"
+            className="mt-2 w-32"
+            inputMode="numeric"
+            aria-invalid={!retryLimitValid}
+            value={retryLimitText}
+            onChange={(event) => {
+              const text = event.target.value;
+              setRetryLimitText(text);
+              if (text === "" || /^\d+$/.test(text)) {
+                onChange({ ...draft, item_retry_limit: text === "" ? 0 : Number(text) });
+              }
+            }}
+          />
+          {!retryLimitValid && (
+            <p className="mt-1 text-xs text-red-600" role="alert">
+              请输入 0-5 的整数，0 表示失败后直接跳下一条。
+            </p>
+          )}
           <div className="mt-6">
-            <Button onClick={onSave} disabled={busy || !portValid || !limitValid || !specBatchValid}>
+            <Button onClick={onSave} disabled={busy || !portValid || !limitValid || !specBatchValid || !retryLimitValid}>
               {pending.has("settings.save") ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" /> : <Save className="h-4 w-4" aria-hidden="true" />}
               保存设置
             </Button>

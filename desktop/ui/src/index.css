@@ -52,6 +52,7 @@ summary {
 
 .data-table-scroll::-webkit-scrollbar {
   height: 12px;
+  width: 12px;
 }
 
 .data-table-scroll::-webkit-scrollbar-track {

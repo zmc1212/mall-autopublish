@@ -251,6 +251,8 @@ class Settings:
     limit: int = 0
     # 入库后进编辑页每批补传的规格图行数；0 表示全部一次上传。
     spec_upload_batch_size: int = 2
+    # 条目失败后的自动重试次数；0 表示失败不重试直接跳下一条。
+    item_retry_limit: int = 1
     results_dir: str = ""
 
     def normalized(self) -> "Settings":
@@ -271,6 +273,7 @@ class Settings:
             settings_version=max(3, int(self.settings_version or 3)),
             limit=max(0, int(self.limit or 0)),
             spec_upload_batch_size=max(0, min(99, int(self.spec_upload_batch_size or 0))),
+            item_retry_limit=max(0, min(5, int(self.item_retry_limit or 0))),
             results_dir=str(results),
         )
 
@@ -299,6 +302,7 @@ def load_settings() -> Settings:
         settings_version=int(data.get("settings_version") or 2),
         limit=int(data.get("limit") or 0),
         spec_upload_batch_size=max(0, int(data.get("spec_upload_batch_size", 2) or 0)),
+        item_retry_limit=max(0, min(5, int(data.get("item_retry_limit", 1) or 0))),
         results_dir=str(data.get("results_dir") or ""),
     ).normalized()
     return settings

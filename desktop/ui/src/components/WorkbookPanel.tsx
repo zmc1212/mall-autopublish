@@ -418,7 +418,7 @@ export default function WorkbookPanel({
         onPageChange={setTablePage}
         onClose={() => setTableOpen(false)}
       >
-        <table className="w-full min-w-[1180px] table-fixed border-collapse text-left text-sm">
+        <table className="w-full min-w-[1320px] table-fixed border-collapse text-left text-sm">
           <colgroup>
             <col className="w-16" />
             <col className="w-56" />
@@ -426,6 +426,7 @@ export default function WorkbookPanel({
             <col className="w-80" />
             <col className="w-28" />
             <col className="w-52" />
+            <col className="w-44" />
             <col className="w-24" />
             <col className="w-28" />
             <col className="w-80" />
@@ -438,6 +439,7 @@ export default function WorkbookPanel({
               <th className="whitespace-nowrap px-4 py-3 font-medium">标题</th>
               <th className="whitespace-nowrap px-4 py-3 font-medium">图片夹</th>
               <th className="whitespace-nowrap px-4 py-3 font-medium">图片</th>
+              <th className="whitespace-nowrap px-4 py-3 font-medium">主视频</th>
               <th className="whitespace-nowrap px-4 py-3 font-medium">校验</th>
               <th className="whitespace-nowrap px-4 py-3 font-medium">执行</th>
               <th className="whitespace-nowrap px-4 py-3 font-medium">原因</th>
@@ -446,7 +448,7 @@ export default function WorkbookPanel({
           <tbody>
             {tableRows.length === 0 ? (
               <tr>
-                <td colSpan={9} className="px-4 py-12 text-center text-slate-400">
+                <td colSpan={10} className="px-4 py-12 text-center text-slate-400">
                   暂无商品明细
                 </td>
               </tr>
@@ -467,6 +469,19 @@ export default function WorkbookPanel({
                       })}>{packOk ? "已找到" : "未找到"}</span>
                     </td>
                     <td className="truncate whitespace-nowrap px-4 py-3 text-slate-500" title={`主图${row.main_count} / 规格${row.sku_count} / 详情${row.detail_count}`}>主图{row.main_count} / 规格{row.sku_count} / 详情{row.detail_count}</td>
+                    <td className="whitespace-nowrap px-4 py-3">
+                      {row.video_name ? (
+                        <span
+                          className={cn("block truncate", {
+                            "text-destructive": row.video_ok === false,
+                            "text-slate-500": row.video_ok !== false,
+                          })}
+                          title={row.video_ok === false ? `${row.video_name}（格式错误，将不上传）` : row.video_name}
+                        >
+                          {row.video_ok === false ? `${row.video_name}（格式错误）` : row.video_name}
+                        </span>
+                      ) : null}
+                    </td>
                     <td className="overflow-hidden whitespace-nowrap px-4 py-3" title={row.validation}>
                       <span className={cn("rounded-full px-2.5 py-1 text-xs", {
                         "bg-emerald-50 text-emerald-700": passed,

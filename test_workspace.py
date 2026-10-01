@@ -181,7 +181,7 @@ class WorkspaceTests(unittest.TestCase):
 
     def test_pack_with_video_reports_video_count(self):
         pack = write_mini_pack(self.root / "火影-001")
-        (pack / "主视频.mp4").write_bytes(b"fake-video")
+        (pack / "主视频.mp4").write_bytes(b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isomiso2avc1mp41" + b"\x00" * 8)
         scan = scan_workspace(self.root)
         self.assertEqual(scan["errors"], [])
         self.assertEqual(len(scan["folders"]), 1)

@@ -250,24 +250,74 @@ class ImagePackAndTemplateTests(unittest.TestCase):
         self.assertEqual(pack['skus'][-1]['name'], '忍道版1弹【经典款】李洛克')
 
     def test_scan_prefers_named_main_video(self):
+        mp4 = b'\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isomiso2avc1mp41'
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             Image.new('RGB', (8, 8)).save(root / '宝贝主图01.jpg')
-            (root / '产品展示.mp4').write_bytes(b'v')
-            (root / '主视频.mp4').write_bytes(b'v')
+            (root / '产品展示.mp4').write_bytes(mp4)
+            (root / '主视频.mp4').write_bytes(mp4)
             pack = seller.scan_image_pack(root)
         self.assertEqual(pack['main_video'].name, '主视频.mp4')
+        self.assertEqual(pack['video_display'], {'name': '主视频.mp4', 'playable': True})
         self.assertEqual(len(pack['main_1_1']), 1)
         self.assertEqual(len(pack['details']), 0)
 
     def test_scan_falls_back_to_sorted_first_video(self):
+        mp4 = b'\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isomiso2avc1mp41'
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             Image.new('RGB', (8, 8)).save(root / '宝贝主图01.jpg')
-            (root / '开箱视频.mov').write_bytes(b'v')
-            (root / '产品展示.MP4').write_bytes(b'v')
+            (root / '开箱视频.mov').write_bytes(mp4)
+            (root / '产品展示.MP4').write_bytes(mp4)
             pack = seller.scan_image_pack(root)
         self.assertEqual(pack['main_video'].name, '产品展示.MP4')
+        self.assertEqual(pack['video_display'], {'name': '产品展示.MP4', 'playable': True})
+
+    def test_scan_skips_fake_video_and_falls_back_to_playable(self):
+        # 主视频.mp4 是伪装成视频的 HTML（线上实测场景）；应跳过它选中有效视频。
+        # 明细展示仍优先显示命名的假文件并标红，提示用户修复。
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            Image.new('RGB', (8, 8)).save(root / '宝贝主图01.jpg')
+            (root / '主视频.mp4').write_bytes(b'\r\n<!DOCTYPE html><html><head></head></html>')
+            (root / '产品展示.mp4').write_bytes(b'\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isomiso2avc1mp41')
+            pack = seller.scan_image_pack(root)
+        self.assertEqual(pack['main_video'].name, '产品展示.mp4')
+        self.assertEqual(pack['video_display'], {'name': '主视频.mp4', 'playable': False})
+
+    def test_scan_all_fake_videos_means_no_main_video(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            Image.new('RGB', (8, 8)).save(root / '宝贝主图01.jpg')
+            (root / '主视频.mp4').write_bytes(b'\r\n<!DOCTYPE html><html><head></head></html>')
+            (root / '产品展示.mp4').write_bytes(b'\x89PNG\r\n\x1a\n' + b'\x00' * 8)
+            pack = seller.scan_image_pack(root)
+        self.assertIsNone(pack['main_video'])
+        self.assertEqual(pack['video_display'], {'name': '主视频.mp4', 'playable': False})
+
+    def test_is_playable_video_checks_container_magic(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            mp4 = root / 'a.mp4'
+            mp4.write_bytes(b'\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isomiso2avc1mp41')
+            self.assertTrue(seller.is_playable_video(mp4))
+            html = root / 'b.mp4'
+            html.write_bytes(b'\r\n<!DOCTYPE html><html><head></head></html>')
+            self.assertFalse(seller.is_playable_video(html))
+            tiny = root / 'c.mp4'
+            tiny.write_bytes(b'\x00\x00')
+            self.assertFalse(seller.is_playable_video(tiny))
+            mkv = root / 'd.mkv'
+            mkv.write_bytes(b'\x1a\x45\xdf\xa3' + b'\x00' * 16)
+            self.assertTrue(seller.is_playable_video(mkv))
+            avi = root / 'e.avi'
+            avi.write_bytes(b'RIFF\x24\x00\x00\x00AVI LIST' + b'\x00' * 8)
+            self.assertTrue(seller.is_playable_video(avi))
+            flv = root / 'f.flv'
+            flv.write_bytes(b'FLV\x01\x05\x00\x00\x00\x09' + b'\x00' * 8)
+            self.assertTrue(seller.is_playable_video(flv))
+            missing = root / 'missing.mp4'
+            self.assertFalse(seller.is_playable_video(missing))
 
     def test_scan_without_video_returns_none_main_video(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -275,14 +325,18 @@ class ImagePackAndTemplateTests(unittest.TestCase):
             Image.new('RGB', (8, 8)).save(root / '宝贝主图01.jpg')
             pack = seller.scan_image_pack(root)
         self.assertIsNone(pack['main_video'])
+        self.assertIsNone(pack['video_display'])
 
     def test_resolve_product_carries_main_video(self):
         pack = {'main_1_1': [], 'main_3_4': [], 'details': [], 'skus': [],
-                'main_video': Path('C:/pack/主视频.mp4')}
+                'main_video': Path('C:/pack/主视频.mp4'),
+                'video_display': {'name': '主视频.mp4', 'playable': False}}
         product = seller.resolve_product({'商品标题*': '标题', '价格*': 1, '库存*': 1}, [], pack)
         self.assertEqual(product['main_video'], Path('C:/pack/主视频.mp4'))
+        self.assertEqual(product['video_display'], {'name': '主视频.mp4', 'playable': False})
         product = seller.resolve_product({'商品标题*': '标题', '价格*': 1, '库存*': 1}, [], {})
         self.assertIsNone(product['main_video'])
+        self.assertIsNone(product['video_display'])
 
     def test_merge_templates_provides_brand_and_model_defaults(self):
         templates = seller.load_templates({'attributes': '中性笔', 'logistics': '48小时', 'sales': '仓库多规格'})

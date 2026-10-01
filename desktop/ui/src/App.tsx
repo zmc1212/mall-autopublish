@@ -27,6 +27,7 @@ const EMPTY_SETTINGS: AppSettings = {
   settings_version: 3,
   limit: 0,
   spec_upload_batch_size: 2,
+  item_retry_limit: 1,
   results_dir: "",
 };
 
@@ -413,6 +414,32 @@ export default function App() {
                   if (picked) setSettingsDraft((current) => ({ ...current, results_dir: picked }));
                 })
               }
+              onExportLogs={() =>
+                runAction("settings.exportLogs", async () => {
+                  const result = await api.exportLogs();
+                  pushToast("success", `日志已导出（${result.files} 个文件），文件夹已打开`);
+                  await nativeOpen(result.folder);
+                })
+              }
+              onToggleDebugBrowser={(checked) => {
+                // 勾选立即保存并显示/隐藏窗口，不等“保存设置”；失败时回滚勾选态
+                setSettingsDraft((current) => ({ ...current, debug_browser: checked }));
+                void runAction("settings.toggleDebugBrowser", async () => {
+                  try {
+                    const saved = await api.saveSettings({ debug_browser: checked });
+                    // 只回写本次变更的字段，避免覆盖草稿中其他未保存的编辑
+                    setSettingsDraft((current) => ({ ...current, debug_browser: saved.debug_browser }));
+                    if (saved.debug_browser_applied === false) {
+                      pushToast("warning", "设置已保存；当前浏览器未连接，将在下次打开浏览器时生效");
+                    } else {
+                      pushToast("success", checked ? "自动化浏览器窗口已显示" : "自动化浏览器窗口已隐藏");
+                    }
+                  } catch (exc) {
+                    setSettingsDraft((current) => ({ ...current, debug_browser: !checked }));
+                    throw exc;
+                  }
+                });
+              }}
               onSave={() =>
                 runAction("settings.save", async () => {
                   const saved = await api.saveSettings(settingsDraft);

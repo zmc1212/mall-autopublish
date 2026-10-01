@@ -66,7 +66,7 @@ export default function DataTableDialog({
             <X className="h-5 w-5" aria-hidden="true" />
           </button>
         </header>
-        <div className="data-table-scroll min-h-0 flex-1 overflow-x-scroll overflow-y-hidden overscroll-x-contain">{children}</div>
+        <div className="data-table-scroll min-h-0 flex-1 overflow-x-scroll overflow-y-auto overscroll-contain">{children}</div>
         <footer className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-t border-border px-5 py-3">
           <span className="text-xs text-slate-500">
             共 {total} 条 · 第 {currentPage} / {totalPages} 页 · 每页 {pageSize} 条

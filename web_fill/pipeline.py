@@ -524,6 +524,7 @@ def _finish_publish(session, payload, confirm_submit, web, steps):
                 "url": session.href(),
                 **links,
             }
+        _audit_spec_rows_before_submit(session, payload, steps)
         submitted = run_script(session, "submit.js", payload, timeout=60)
         steps.append({"step": "submit", "result": submitted})
         _write_progress(steps)
@@ -659,6 +660,14 @@ class UserStopped(RuntimeError):
     pass
 
 
+class SpecRowsMismatch(RuntimeError):
+    """提交前规格行审计失败：页面规格行与输入不一致，禁止建品。
+
+    fill_new_product 捕获该异常时会丢弃 skus/spec_images 断点标记，使条目级
+    重试重新执行 SKU 步骤（导入 open 阶段识别"规格行已齐全"不会重复导入）。
+    """
+
+
 def _check_cancel(session):
     event = getattr(session, "cancel_event", None)
     if event is not None and event.is_set():
@@ -777,6 +786,44 @@ def _save_checkpoint(session, payload, completed):
     # Page-local storage survives restarting the assistant and refreshing this tab;
     # counts in probe_state remain authoritative if the user removes any content.
     return run_script(session, "checkpoint.js", {"key": resume_key(payload), "completed": sorted(completed)}, timeout=15)
+
+
+def _audit_spec_rows_before_submit(session, payload, steps):
+    """提交前审计：页面实际规格行必须与输入一致，防止带着缺失/多余规格建品。
+
+    页面规格表是虚拟滚动表格，可视行数恒约一屏（37 行实测显示 17 行），必须
+    用 sku_import.js 的 audit 阶段逐屏深扫描取全量。不一致时抛
+    SpecRowsMismatch：fill_new_product 会丢弃 skus/spec_images 断点标记，
+    条目级重试重新执行 SKU 步骤。审计本身不可用（脚本失败/页面结构变化）
+    时不阻断提交，仍由建品后核验兜底。
+    2026-10-01 事故：37 行输入建出 17 行规格的商品，提交前无任何校验。
+    """
+    skus = payload.get("skus") or []
+    if not skus:
+        return
+    try:
+        audit = run_script(session, "sku_import.js", {"phase": "audit", "skus": skus}, timeout=120)
+    except Exception as exc:
+        steps.append({"step": "sku_audit", "error": str(exc)[:200]})
+        _write_progress(steps)
+        return
+    steps.append({"step": "sku_audit", "result": audit})
+    _write_progress(steps)
+    if not isinstance(audit, dict) or not audit.get("audit"):
+        return
+    total = int(audit.get("count") or 0)
+    missing = [str(name) for name in (audit.get("missing") or [])]
+    extra = [str(name) for name in (audit.get("extra") or [])]
+    if total == len(skus) and not missing and not extra:
+        return
+    detail = f"页面 {total} 行 / 输入 {len(skus)} 行"
+    if missing:
+        detail += f"；缺失 {'、'.join(missing[:3])}" + ("等" if len(missing) > 3 else "")
+    if extra:
+        detail += f"；多出 {'、'.join(extra[:3])}" + ("等" if len(extra) > 3 else "")
+    raise SpecRowsMismatch(
+        f"PAUSE:提交前页面规格行与输入不符（{detail}）；已重置 SKU 步骤断点，"
+        "重试将重新处理 SKU，不带着缺失规格建品")
 
 
 def _maybe_close_overlays(session):
@@ -1233,6 +1280,40 @@ def gate_error_retryable(exc):
         "File chooser",
     )
     return any(item in blob for item in needles)
+
+
+# 条目级自动重试的黑名单：命中任一标记的失败不重试，直接标记后跳下一条。
+# 只保留真正不该重试的两类：
+# 1. 结果不明确类（上传/提交/保存结果无法确认）——按规则禁止自动重复执行；
+# 2. 安全限制类（操作过于频繁）——立即重试会加重风控惩罚。
+# 登录/验证码/滑块由 hard_pause_reason/pause_reason_code 单独判定。
+# 注意："SKU 模板已上传但结果未核实"（导入 verify 脚本崩溃）不在黑名单——
+# 重试重新执行 SKU 步骤是安全的：导入 open 阶段识别"规格行已齐全"（already）
+# 不会重复导入，提交前还有规格行审计兜底，不会建出错误商品。
+# 数据核对类失败（服务端商品与输入不符、SKU 行数不符、价格库存变化等）
+# 同样允许重试：重试走只读核验/断点续跑路径，不会重复建品。
+ITEM_NO_RETRY_MARKERS = (
+    "残留文件选择器",
+    "结果不明确",
+    "结果待核实",
+    "禁止自动重复",
+    "操作过于频繁",
+)
+
+
+def item_retryable_notice(notice, errors=()):
+    """条目级自动重试的准入判定：明确失败才重试。
+
+    安全验证（登录/验证码/滑块）与结果不明确类一律不可重试，遵守
+    "上传或采纳结果不明确时不得自动重复执行"；其余明确失败（超时、
+    元素未找到、规格未写入等）允许按设置的重试次数自动重试。
+    """
+    blob = " ".join([str(notice or ""), *(str(e) for e in (errors or []) if e)])
+    if not blob.strip():
+        return False
+    if hard_pause_reason(blob) or pause_reason_code(blob):
+        return False
+    return not any(marker in blob for marker in ITEM_NO_RETRY_MARKERS)
 
 
 def _spec_unbound_error(specs, payload, only_rows=None):
@@ -1739,6 +1820,53 @@ def complete_current_product(session, product, confirm_submit=True, web=None):
         _write_progress(steps + [{"step": "end", "execution": execution, "notice": notice}])
 
 
+def _dismiss_import_dialog(session):
+    """关闭残留的批量导入弹窗；skus.js 的 dismissBlockingDialogs 不覆盖该弹窗。"""
+    try:
+        run_script(session, "close_import_dialog.js", {}, timeout=30)
+    except Exception:
+        pass
+
+
+def _reveal_automation_window():
+    """还原最小化/隐藏的自动化窗口；虚拟滚动表格在最小化窗口里停止渲染。"""
+    try:
+        web = _load_web()
+        if hasattr(web, "restore_automation_chrome"):
+            web.reload_paths()
+            web.restore_automation_chrome()
+    except Exception:
+        pass
+
+
+def _topup_missing_sku_rows(session, payload, request, steps, result, path):
+    """核验行数不足时的恢复路径：还原窗口后复核，仍缺再用编辑器逐值补齐。
+
+    SKU 表格是虚拟滚动，DOM 只渲染约一屏的行（37 行恒显示 17 行），
+    verify 已改为滚动累加计数；走到这里说明深度扫描也确认缺行——通常是
+    最小化窗口里表格重建被冻结，还原窗口即可补完，其次才是 skus.js 补值。
+    """
+    try:
+        count = int(result.get("count") or 0)
+        expected = int(result.get("expected") or len(payload.get("skus") or []))
+    except (TypeError, ValueError):
+        return result
+    if result.get("error") or count >= expected:
+        return result
+    steps.append({"step": "sku_import",
+                  "result": {"partial_topup": True, "count": count, "expected": expected}})
+    _write_progress(steps)
+    _dismiss_import_dialog(session)
+    _reveal_automation_window()
+    time.sleep(2)
+    result = run_script(session, "sku_import.js", {**request, "phase": "verify"}, timeout=120)
+    if not result.get("verified") and not result.get("error"):
+        # skus.js 会跳过已存在的规格值并补齐价格/数量，无重复行风险。
+        run_gate(session, "skus.js", {**payload, "skip_thickness": True}, steps, "sku_seed", timeout=600)
+        result = run_script(session, "sku_import.js", {**request, "phase": "verify"}, timeout=120)
+    return result
+
+
 def import_skus_from_template(session, payload, steps):
     """Create the SKU table when needed, then upload and verify the template."""
     template = Path(os.environ.get("QIANNIU_TEMPLATES_DIR") or ROOT / "templates") / "sku_import_50012720.xls"
@@ -1785,6 +1913,10 @@ def import_skus_from_template(session, payload, steps):
     steps.append({"step": "sku_import", "result": {**result, "file": str(path)}})
     _write_progress(steps)
     if not result.get("verified"):
+        result = _topup_missing_sku_rows(session, payload, request, steps, result, path)
+        steps.append({"step": "sku_import", "result": {**result, "file": str(path), "after_topup": True}})
+        _write_progress(steps)
+    if not result.get("verified"):
         if result.get("error"):
             detail = str(result["error"])[:180]
         elif result.get("addedDimensions"):
@@ -1801,6 +1933,21 @@ def import_skus_from_template(session, payload, steps):
 VIDEO_UPLOAD_TIMEOUT = 420
 
 
+def _playable_video_checker():
+    """加载 商品解析.is_playable_video；解析器不可用时返回 None（放行不阻塞）。"""
+    try:
+        import 商品解析 as parser
+    except Exception:
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "qianniu_video_check", Path(__file__).resolve().parents[1] / "商品解析.py")
+            parser = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(parser)
+        except Exception:
+            return None
+    return getattr(parser, "is_playable_video", None)
+
+
 def video_step(session, payload):
     """上传主视频到商品视频区。视频是可选项：失败一律告警跳过，不阻断入库。
 
@@ -1809,6 +1956,10 @@ def video_step(session, payload):
     """
     _check_cancel(session)
     files = [payload["main_video"]]
+    checker = _playable_video_checker()
+    if checker is not None and not checker(files[0]):
+        return {"uploaded": False, "skipped": True,
+                "warning": "主视频文件无法播放（扩展名是视频但内容不是有效视频），已跳过上传"}
     request = {"files": files, "names": [Path(files[0]).name], "phase": "open"}
     result = None
     try:
@@ -1862,6 +2013,24 @@ def video_step(session, payload):
     if detail:
         reason = f"{reason}：{detail}"
     return {"uploaded": False, "warning": f"主视频未上传，已跳过继续：{reason}"}
+
+
+def _close_video_dialog(session):
+    """关闭残留的“选择视频”对话框；失败不阻断入库。
+
+    视频按可选项策略失败跳过后对话框常驻页面，其 videoSelector iframe 与
+    图片空间同域且 URL 形似，会把详情步骤的图片空间定位劫持到视频对话框，
+    导致详情图被当成视频投递（2026-09-30 真实页面复现）。
+    """
+    try:
+        return run_script(session, "close_video_dialog.js", {}, timeout=60)
+    except FileChooserNeeded:
+        _dismiss_filechooser(session)
+        return None
+    except Exception as exc:
+        if _is_user_pause(exc):
+            raise
+        return None
 
 
 def fill_new_product(session, product, confirm_submit=False, web=None, force_new=False, sku_template_import=False, skip_spec_images=False):
@@ -1966,6 +2135,7 @@ def fill_new_product(session, product, confirm_submit=False, web=None, force_new
                 video = video_step(session, payload)
                 steps.append({"step": "video", **video})
                 _write_progress(steps)
+            _close_video_dialog(session)
             completed.add("video")
             _save_checkpoint(session, payload, completed)
 
@@ -1999,7 +2169,13 @@ def fill_new_product(session, product, confirm_submit=False, web=None, force_new
             else:
                 if sku_template_import and sku_import.supports_product(payload):
                     import_skus_from_template(session, payload, steps)
-                    run_gate(session, "sku_category.js", payload, steps, "sku_category", timeout=90)
+                    cats = run_gate(session, "sku_category.js", payload, steps, "sku_category", timeout=150)
+                    # 分类脚本自带逐屏终检（audit）；行不全就在建品前判失败，
+                    # 断点不标记 skus，条目级重试会重新执行整个 SKU 步骤。
+                    if isinstance(cats, dict) and cats.get("audit") and not cats.get("ok"):
+                        raise RuntimeError(
+                            f"SKU 规格分类未写入全部规格行"
+                            f"（页面 {cats.get('total')} 行，未分类 {cats.get('missing')} 行）；将重新处理 SKU 步骤")
                 else:
                     skus = run_gate(session, "skus.js", payload, steps, "skus", timeout=300)
 
@@ -2025,6 +2201,13 @@ def fill_new_product(session, product, confirm_submit=False, web=None, force_new
     except web.SessionLost as exc:
         execution, notice = "暂停", str(exc)
         raise
+    except SpecRowsMismatch as exc:
+        # 规格行与输入不符：丢弃 skus/spec_images 断点标记，finally 重存
+        # checkpoint 时同步生效；条目级重试会重新执行 SKU 步骤。
+        completed.discard("skus")
+        completed.discard("spec_images")
+        execution, notice = "暂停", str(exc).removeprefix("PAUSE:")
+        return {"execution": execution, "notice": notice, "errors": [notice], "url": session.href(), "steps": steps}
     except Exception as exc:
         execution = "暂停" if "PAUSE:" in str(exc) or hard_pause_reason(str(exc)) else "失败"
         notice = short_fail_notice(str(exc)) or str(exc)[:160]
@@ -2084,6 +2267,142 @@ def _spec_stage_callbacks(item, product, on_flow_stage, touch_flow_stage=True):
     return before_submit, after_batch
 
 
+def _parse_tabs_with_current(text):
+    """解析 tab-list 输出为 [(index, url, is_current)]。
+
+    CLI 输出行形如 "- 2: (current) [标题](https://...)"；与 parse_tabs 的
+    区别是额外保留当前页签标记：重开的编辑页 URL 完全相同，靠 URL 分不清
+    哪个是 CLI 正在使用的页，必须用 "(current)" 标记。
+    """
+    tabs = []
+    for line in str(text or "").splitlines():
+        match = re.search(r"(https?://\S+)", line)
+        if not match:
+            continue
+        index_match = re.search(r"^\s*-\s*(\d+):", line) or re.search(r"(\d+)", line)
+        tabs.append((int(index_match.group(1)) if index_match else len(tabs),
+                     match.group(1).rstrip("],)"),
+                     bool(re.search(r"^\s*-\s*\d+:\s*\(current\)", line))))
+    return tabs
+
+
+def _is_item_publish_url(url, item_id):
+    """是否指定商品的编辑页签；忽略站点加载后附加的 fr 等参数。"""
+    from urllib.parse import parse_qs, urlparse
+    try:
+        parsed = urlparse(str(url or ""))
+    except ValueError:
+        return False
+    if (parsed.hostname or "").lower() != "item.upload.taobao.com":
+        return False
+    if not parsed.path.lower().endswith("/publish.htm"):
+        return False
+    return parse_qs(parsed.query).get("itemId") == [str(item_id)]
+
+
+def _is_safe_park_url(url):
+    """可停靠页签：卖家中心/登录页。prune 始终保留它们，切过去不会失效。"""
+    from urllib.parse import urlparse
+    text = str(url or "").strip()
+    if not text.lower().startswith("http"):
+        return False
+    host = (urlparse(text).hostname or "").lower()
+    return (host == "myseller.taobao.com" or host.endswith(".myseller.taobao.com")
+            or "login" in text.lower())
+
+
+def _close_stale_item_tabs(session, item_id, keep_current=True):
+    """按 itemId 关闭商品编辑页签，返回关闭数量。
+
+    逐个关闭且每次关闭前重新拉取页签列表：tab_close 会让后续序号重排，
+    复用旧序号有关错页签的风险。keep_current 时必须解析到 "(current)"
+    标记才动手，解析不到宁可不动，避免把 CLI 正在使用的页签关掉。
+    """
+    closed = 0
+    for _ in range(30):
+        try:
+            rows = _parse_tabs_with_current(session.tab_list())
+        except Exception:
+            break
+        current_index = next((index for index, _url, current in rows if current), None)
+        if keep_current and current_index is None:
+            break
+        victim = next((index for index, url, current in rows
+                       if _is_item_publish_url(url, item_id)
+                       and not (keep_current and index == current_index)), None)
+        if victim is None:
+            break
+        try:
+            session.tab_close(victim)
+            closed += 1
+        except Exception:
+            break
+        time.sleep(0.2)
+    return closed
+
+
+def _open_item_edit_tab(session, item_id):
+    """新开指定商品的编辑页签，并回收同商品的历史编辑页签。
+
+    分批补图每批都会重开编辑页；重开页与历史页 URL 相同，prune 的精确
+    匹配保留规则分不清哪个是"当前页"，同商品页签只会越积越多。这里先
+    新开（新页即当前页），再按 itemId 关掉其余页签，保证同商品至多一个。
+    """
+    url = "https://item.upload.taobao.com/sell/v2/publish.htm?itemId=" + str(item_id)
+    session.tab_new(url)
+    try:
+        _close_stale_item_tabs(session, item_id, keep_current=True)
+    except Exception:
+        pass
+    return url
+
+
+def _recycle_success_tabs(session, item_id):
+    """成功核验的商品回收其全部编辑页签，返回关闭数量。
+
+    成功商品不需要保留现场（断点续跑只依赖商品 ID），但不能让 CLI 的
+    当前页签失效：当前页正是该商品的编辑页时，先切到卖家中心/登录页再
+    关；找不到可停靠页签时退化为只关多余页签、保留当前页。
+    """
+    try:
+        rows = _parse_tabs_with_current(session.tab_list())
+    except Exception:
+        return 0
+    if not any(_is_item_publish_url(url, item_id) for _index, url, _current in rows):
+        return 0
+    current_index = next((index for index, _url, current in rows if current), None)
+    current_is_item = current_index is not None and any(
+        index == current_index and _is_item_publish_url(url, item_id)
+        for index, url, _current in rows)
+    if current_is_item:
+        park = next((index for index, url, _current in rows
+                     if index != current_index and _is_safe_park_url(url)), None)
+        if park is not None:
+            try:
+                session.tab_select(park)
+                time.sleep(0.3)
+            except Exception:
+                pass
+    return _close_stale_item_tabs(session, item_id, keep_current=True)
+
+
+def _finish_product_tabs(session, web, item):
+    """单条商品收尾的页签治理。
+
+    成功核验的商品立即回收其编辑页签；其余状态保留当前页作为断点续跑
+    现场。两种情况都会顺带清掉其他历史页签。
+    """
+    if item.get("run_status") == "completed" and str(item.get("taobao_item_id") or ""):
+        try:
+            _recycle_success_tabs(session, str(item["taobao_item_id"]))
+        except Exception:
+            pass
+    try:
+        _prune_tabs(web, keep_url=session.href())
+    except Exception:
+        pass
+
+
 def _recover_existing_item(session, web, product, item_id):
     """Read a fresh server page before migrating an ID-only legacy record.
 
@@ -2096,7 +2415,7 @@ def _recover_existing_item(session, web, product, item_id):
     if not re.fullmatch(r"\d{8,20}", item_id):
         raise RuntimeError("PAUSE:已有商品 ID 无效；禁止再次建品")
     payload = product_to_payload(product)
-    session.tab_new("https://item.upload.taobao.com/sell/v2/publish.htm?itemId=" + item_id)
+    _open_item_edit_tab(session, item_id)
     state = run_script(session, "probe_state.js", {**payload, "waitForReady": True})
     risk = run_script(session, "upload_status.js", {})
     if (state.get("captchaVisible") or risk.get("securityChallenge")
@@ -2119,8 +2438,22 @@ def _recover_existing_item(session, web, product, item_id):
             + "；禁止再次建品"
         )
     wanted = [sku["name"] for sku in payload.get("skus") or []]
-    if state.get("skuRows") != len(wanted) or state.get("skuNames") != wanted:
-        raise RuntimeError("PAUSE:已有商品的 SKU 与输入不符；禁止再次建品")
+    # 规格表是虚拟滚动表格，probe_state 的 skuNames/skuRows 只含可视区（约一屏
+    # 17 行），对超过一屏的商品必然误报"不符"（2026-10-01 连续三次误报，商品
+    # 实际是完整的 37 行）。改用 sku_import.js 的 audit 阶段逐屏深扫描做全量
+    # 比对；audit 只读，允许在已有商品编辑页执行。
+    audit = run_script(session, "sku_import.js", {"phase": "audit", "skus": payload.get("skus") or []}, timeout=120)
+    if not isinstance(audit, dict) or not audit.get("audit"):
+        raise RuntimeError("PAUSE:已有商品 SKU 深扫描未完成，无法核实规格行；禁止再次建品")
+    if audit.get("count") != len(wanted) or audit.get("missing") or audit.get("extra"):
+        detail = f"页面 {audit.get('count')} 行 / 输入 {len(wanted)} 行"
+        missing = list(audit.get("missing") or [])
+        extra = list(audit.get("extra") or [])
+        if missing:
+            detail += f"；缺失 {'、'.join(map(str, missing[:3]))}" + ("等" if len(missing) > 3 else "")
+        if extra:
+            detail += f"；多出 {'、'.join(map(str, extra[:3]))}" + ("等" if len(extra) > 3 else "")
+        raise RuntimeError(f"PAUSE:已有商品的 SKU 与输入不符（{detail}）；禁止再次建品")
     for field, count in (("main_images", "mainImgs"), ("detail_images", "detailImgs")):
         if state.get(count, 0) != len(payload.get(field) or []):
             raise RuntimeError("PAUSE:已有商品的主图或详情图数量不完整；保留商品，禁止再次建品")
@@ -2158,7 +2491,6 @@ def _repair_existing_spec_images(session, web, product, item_id, confirm_submit,
     """
     from . import material_import
     baseline = _recover_existing_item(session, web, product, item_id)
-    edit_url = "https://item.upload.taobao.com/sell/v2/publish.htm?itemId=" + item_id
     payload = {**product_to_payload(product), "repairItemId": item_id}
     skus = payload.get("skus") or []
     total_with_image = len([sku for sku in skus if sku.get("image")])
@@ -2166,7 +2498,7 @@ def _repair_existing_spec_images(session, web, product, item_id, confirm_submit,
     steps = []
     batch_index = 0
     while True:
-        session.tab_new(edit_url)
+        _open_item_edit_tab(session, item_id)
         state = run_script(session, "probe_state.js", {**payload, "waitForReady": True})
         risk = run_script(session, "upload_status.js", {})
         if (state.get("captchaVisible") or risk.get("securityChallenge")
@@ -2210,7 +2542,7 @@ def _repair_existing_spec_images(session, web, product, item_id, confirm_submit,
     # sources. Do not accept a picker preview or a search-main material receipt.
     rows = _recover_existing_item(session, web, product, item_id)
     material_import.check_rows(rows, product, baseline)
-    session.tab_new(edit_url)
+    _open_item_edit_tab(session, item_id)
     run_script(session, "probe_state.js", {**payload, "waitForReady": True})
     after, missing = _spec_column_state(session, product)
     if missing or any(after.get(i) != src for i, src in before.items() if src):
@@ -2274,12 +2606,16 @@ def _run_search_images(session, web, product, item, on_flow_stage=None, combined
 def run_batch(products, confirm_submit=False, limit=None, session=None, cancel_event=None,
               on_item_start=None, on_item_done=None, force_new=False, sku_template_import=False,
               skip_spec_images=False, sku_image_strategy="", on_flow_stage=None,
-              spec_upload_batch_size=0):
+              spec_upload_batch_size=0, item_retry_limit=0, on_item_retry=None):
     """批量执行上架流程。
 
     spec_upload_batch_size：入库后进编辑页每批补传的规格图行数；0 表示全部
     一次上传。skip_spec_images 为兼容保留的旧参数，建品阶段现在一律不传
     规格图，规格图统一在拿到商品 ID 后按批次补传。
+    item_retry_limit：条目失败后的自动重试次数；重试用尽或遇不可重试失败
+    （安全验证、提交待核实、结果不明确类）时标记该条并继续下一条，整批
+    不再因单条失败中断。on_item_retry(product, item, attempt, limit) 在每次
+    自动重试前回调。
     """
     _write_progress([])
     web = _load_web()
@@ -2307,7 +2643,17 @@ def run_batch(products, confirm_submit=False, limit=None, session=None, cancel_e
         current_account = session.seller_account() if hasattr(session, "seller_account") else ""
     except Exception:
         current_account = ""
-    for product in selected:
+    product_index = 0
+    retry_limit = max(0, int(item_retry_limit or 0))
+    attempt_state = None   # (product_index, attempt)；仅发生过重试时非 None
+    resume_state = None    # (product_index, state)；重试时暂存上一轮推进到的断点状态
+    outcome = ""
+    while product_index < len(selected):
+        product = selected[product_index]
+        if resume_state is not None and resume_state[0] == product_index:
+            product = dict(product)
+            product.update(resume_state[1])
+        attempt = attempt_state[1] if attempt_state is not None and attempt_state[0] == product_index else 1
         if cancel_event is not None and cancel_event.is_set():
             item = dict(product)
             item["execution"] = "已停止"
@@ -2358,6 +2704,7 @@ def run_batch(products, confirm_submit=False, limit=None, session=None, cancel_e
             if on_item_done:
                 on_item_done(product, item)
             need_new_tab = True
+            product_index += 1
             continue
         if (not force_new and not legacy_record and prior_stage == material_import.STAGE_COMPLETE
                 and strategy == material_import.STRATEGY_PUBLISH
@@ -2369,6 +2716,7 @@ def run_batch(products, confirm_submit=False, limit=None, session=None, cancel_e
             if on_item_done:
                 on_item_done(product, item)
             need_new_tab = True
+            product_index += 1
             continue
         if (not force_new and not legacy_record and prior_stage == material_import.STAGE_COMPLETE
                 and strategy == "both" and product.get("flow_version") == BOTH_IMAGE_FLOW_VERSION):
@@ -2379,6 +2727,7 @@ def run_batch(products, confirm_submit=False, limit=None, session=None, cancel_e
             if on_item_done:
                 on_item_done(product, item)
             need_new_tab = True
+            product_index += 1
             continue
         _write_progress([])
         if on_item_start:
@@ -2421,7 +2770,9 @@ def run_batch(products, confirm_submit=False, limit=None, session=None, cancel_e
                     on_item_done(product, item)
                 _emit_flow(item, product, on_flow_stage)
                 _remember_item(product, item)
+                _finish_product_tabs(session, web, item)
                 need_new_tab = True
+                product_index += 1
                 continue
             if prior_id and not force_new and strategy == material_import.STRATEGY_SLIM:
                 if product.get("flow_version") == SPEC_COLUMN_FLOW_VERSION:
@@ -2452,7 +2803,9 @@ def run_batch(products, confirm_submit=False, limit=None, session=None, cancel_e
                     on_item_done(product, item)
                 _emit_flow(item, product, on_flow_stage)
                 _remember_item(product, item)
+                _finish_product_tabs(session, web, item)
                 need_new_tab = True
+                product_index += 1
                 continue
             if (prior_id and not force_new and prior_stage in {
                     material_import.STAGE_FILLED, material_import.STAGE_SUBMIT_PENDING}):
@@ -2504,37 +2857,26 @@ def run_batch(products, confirm_submit=False, limit=None, session=None, cancel_e
                         _emit_flow(item, product, on_flow_stage)
                 elif not confirm_submit and item.get("execution") not in {"失败", "暂停", "提交失败"}:
                     item["flow_stage"] = material_import.STAGE_FILLED
+            outcome = ""
             pause_blob = " ".join([str(item.get("notice") or ""), *(str(e) for e in item.get("errors") or [])])
             if item.get("execution") == "暂停" and (hard_pause_reason(pause_blob) or pause_reason_code(pause_blob)):
+                # 安全验证类硬暂停（登录/验证码/滑块）：重试无法通过，标记后
+                # 跳下一条，全部跑完后由桌面端统一汇总需人工处理的条目。
                 item["run_status"] = "paused"
-                updated.append(item)
-                if on_item_done:
-                    on_item_done(product, item)
-                _remember_item(product, item, status="paused")
-                break
-            if item.get("flow_stage") == material_import.STAGE_SUBMIT_PENDING:
+                outcome = "hard"
+            elif item.get("flow_stage") == material_import.STAGE_SUBMIT_PENDING:
+                # 提交结果不明确：按规则禁止自动重复提交，标记后跳下一条。
                 item["run_status"] = "paused"
-                updated.append(item)
-                if on_item_done:
-                    on_item_done(product, item)
-                _remember_item(product, item, status="paused")
-                break
-            # 建品失败/暂停立即终止该商品的后续动作：不再打开 SKU 管理页，
-            # 也不允许素材阶段的状态覆盖建品阶段留下的失败信息。
-            if item.get("execution") in {"失败", "暂停", "提交失败"}:
+                outcome = "submit_pending"
+            elif item.get("execution") in {"失败", "暂停", "提交失败"}:
+                # 建品失败/暂停立即终止该商品的后续动作：不再打开 SKU 管理页，
+                # 也不允许素材阶段的状态覆盖建品阶段留下的失败信息。
                 item["run_status"] = "paused" if item["execution"] == "暂停" else "error"
-                updated.append(item)
-                if on_item_done:
-                    on_item_done(product, item)
-                _remember_item(
-                    product, item,
-                    status="paused" if item["execution"] == "暂停" else "error",
-                )
-                break
+                outcome = "failed"
             # 入库成功后进入官方素材导入；serial 单商品闭环。
-            if confirm_submit and strategy == material_import.STRATEGY_SLIM and item.get("taobao_item_id"):
+            if confirm_submit and not outcome and strategy == material_import.STRATEGY_SLIM and item.get("taobao_item_id"):
                 _run_search_images(session, web, product, item, on_flow_stage)
-            elif confirm_submit and strategy in {material_import.STRATEGY_PUBLISH, "both"} and item.get("execution") not in {"失败", "暂停", "提交失败", "提交待核实"}:
+            elif confirm_submit and not outcome and strategy in {material_import.STRATEGY_PUBLISH, "both"} and item.get("execution") not in {"失败", "暂停", "提交失败", "提交待核实"}:
                 if any(s.get("image") for s in product.get("skus") or []):
                     # 入库成功后按批次进入编辑页补传规格图并逐批保存；
                     # 每批保存后重开服务器页面复核，避免一次性上传触发滑块。
@@ -2562,15 +2904,12 @@ def run_batch(products, confirm_submit=False, limit=None, session=None, cancel_e
                                     execution="已入库，图片已核验", run_status="completed",
                                     notice="该商品没有 SKU 图片，已核验商品状态")
         except web.SessionLost as exc:
+            # 登录失效：重试无法通过，标记后跳下一条。
             item["execution"] = "暂停"
             item["notice"] = str(exc)
             item["errors"] = [str(exc)]
             item["run_status"] = "paused"
-            updated.append(item)
-            if on_item_done:
-                on_item_done(product, item)
-            _remember_item(product, item, status="paused")
-            break
+            outcome = "hard"
         except Exception as exc:
             pause = "PAUSE:" in str(exc) or hard_pause_reason(str(exc))
             item["execution"] = "暂停" if pause else "失败"
@@ -2585,19 +2924,52 @@ def run_batch(products, confirm_submit=False, limit=None, session=None, cancel_e
                 item["errors"] = [notice]
             item["last_error"] = str(exc)
             item["run_status"] = "paused" if pause else "error"
+            outcome = "failed"
+        # —— 条目级重试 / 跳过决策 ——
+        failure = outcome in {"hard", "submit_pending", "failed"} or item.get("execution") in {
+            "失败", "暂停", "提交失败", "提交待核实"}
+        retryable = (
+            outcome == "failed"
+            and attempt <= retry_limit
+            and not (cancel_event is not None and cancel_event.is_set())
+            and item_retryable_notice(item.get("notice"), item.get("errors"))
+        )
+        if retryable:
+            # 从断点续跑：把本次尝试推进到的状态合并回商品，下一轮尝试按
+            # 既有断点（flow_stage + 页面 checkpoint）接着填，不从头重做。
+            merged = dict(product)
+            for key in ("flow_version", "flow_stage", "spec_image_stage", "taobao_item_id",
+                        "view_url", "edit_url", "url", "seller_account", "sku_image_strategy",
+                        "sku_material_manifest", "material_result", "material_preview",
+                        "material_folder", "last_error"):
+                if item.get(key) not in (None, ""):
+                    merged[key] = item[key]
+            merged["execution"] = item.get("execution") or ""
+            merged["notice"] = item.get("notice") or ""
+            merged["run_status"] = ""
+            if on_item_retry:
+                on_item_retry(merged, item, attempt, retry_limit)
+            for cleanup in (_maybe_close_overlays, _dismiss_import_dialog):
+                try:
+                    cleanup(session)
+                except Exception:
+                    pass
+            attempt_state = (product_index, attempt + 1)
+            resume_state = (product_index, merged)
+            continue
+        # 终局：成功，或重试用尽/不可重试的失败 —— 落库后进入下一条。
         updated.append(item)
+        product_index += 1
         need_new_tab = True
         if on_item_done:
             on_item_done(product, item)
         _emit_flow(item, product, on_flow_stage)
-        _remember_item(product, item, status="error" if item.get("execution") in {"失败", "暂停"} else None)
-        if item.get("execution") in {"失败", "暂停", "提交失败", "已停止", "提交待核实"}:
-            # Keep the incomplete product and its page as the next resume target.
+        _remember_item(product, item, status="paused" if outcome in {"hard", "submit_pending"}
+                       else ("error" if item.get("execution") in {"失败", "暂停", "提交失败"} else None))
+        if not failure:
+            _finish_product_tabs(session, web, item)
+        if cancel_event is not None and cancel_event.is_set():
             break
-        try:
-            _prune_tabs(web, keep_url=session.href())
-        except Exception:
-            pass
     keep_url = ""
     if updated and updated[-1].get("execution") in {"失败", "暂停", "提交失败", "已停止", "已填写未提交", "提交待核实"}:
         try:

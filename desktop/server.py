@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 
 from . import paths
 from .jobs import MANAGER
+from .log_export import export_logs_zip
 
 app = FastAPI(title="千牛自动上架", docs_url=None, redoc_url=None)
 app.add_middleware(
@@ -80,6 +81,7 @@ class SettingsIn(BaseModel):
     settings_version: int | None = None
     limit: int | None = Field(default=None, ge=0)
     spec_upload_batch_size: int | None = Field(default=None, ge=0, le=99)
+    item_retry_limit: int | None = Field(default=None, ge=0, le=5)
     results_dir: str | None = None
 
 
@@ -126,6 +128,7 @@ async def status():
             "settings_version": settings.settings_version,
             "limit": settings.limit,
             "spec_upload_batch_size": settings.spec_upload_batch_size,
+            "item_retry_limit": settings.item_retry_limit,
             "results_dir": settings.results_dir,
         },
     }
@@ -257,15 +260,21 @@ def put_settings(body: SettingsIn):
         current.limit = body.limit
     if body.spec_upload_batch_size is not None:
         current.spec_upload_batch_size = body.spec_upload_batch_size
+    if body.item_retry_limit is not None:
+        current.item_retry_limit = body.item_retry_limit
     if body.results_dir is not None:
         current.results_dir = body.results_dir.strip()
     saved = paths.save_settings(current)
     paths.apply_to_loaded_modules()
+    applied: bool | None = None
     try:
-        MANAGER.apply_debug_browser(saved.debug_browser)
+        applied = MANAGER.apply_debug_browser(saved.debug_browser)
     except Exception:
-        pass
-    return saved.__dict__
+        applied = None
+    result = dict(saved.__dict__)
+    # False 表示浏览器尚未连接：偏好已保存，下次启动浏览器时生效
+    result["debug_browser_applied"] = applied
+    return result
 
 
 @app.get("/api/job")
@@ -294,6 +303,15 @@ def job_start(body: JobStartIn):
 def job_history():
     try:
         return {"items": MANAGER.job_history()}
+    except Exception as exc:
+        _fail(exc)
+
+
+@app.post("/api/logs/export")
+async def export_logs():
+    """把诊断日志打包成 zip，返回路径供前端打开所在文件夹。"""
+    try:
+        return await run_in_threadpool(export_logs_zip)
     except Exception as exc:
         _fail(exc)
 

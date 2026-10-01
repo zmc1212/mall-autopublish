@@ -87,6 +87,8 @@ export const api = {
     }),
   stopJob: () => request<JobState>("/api/job/stop", { method: "POST" }),
   jobHistory: () => request<{ items: JobHistoryEntry[] }>("/api/job/history"),
+  exportLogs: () =>
+    request<LogExportResult>("/api/logs/export", { method: "POST" }, 60000),
   openItem: (row: number, productId: string, action: "view" | "edit") =>
     request<{ ok: boolean; url: string }>("/api/item/open", {
       method: "POST",
@@ -98,13 +100,23 @@ export const api = {
       body: JSON.stringify({ row, product_id: productId }),
     }),
   saveSettings: (body: Partial<AppSettings>) =>
-    request<AppSettings>("/api/settings", {
+    request<SavedSettings>("/api/settings", {
       method: "PUT",
       body: JSON.stringify(body),
     }),
 };
 
 type ChromeLike = AppStatus["chrome"];
+
+export interface LogExportResult {
+  path: string;
+  folder: string;
+  files: number;
+  size: number;
+}
+
+// debug_browser_applied 为 False 时表示浏览器尚未连接，偏好已保存、下次启动浏览器时生效
+export type SavedSettings = AppSettings & { debug_browser_applied?: boolean | null };
 
 export async function nativePick(
   method: "pick_excel" | "pick_chrome" | "pick_folder" | "save_template",

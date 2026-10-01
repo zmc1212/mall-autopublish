@@ -192,6 +192,7 @@ def serialize_row(item):
     portraits = product.get("portrait_images") or []
     details = product.get("detail_images") or []
     skus = product.get("skus") or []
+    video_display = product.get("video_display") or {}
     pack = ""
     if product.get("pack_dir"):
         pack = str(product.get("pack_dir"))
@@ -210,6 +211,8 @@ def serialize_row(item):
         "portrait_count": len(portraits),
         "detail_count": len(details),
         "sku_count": len(skus),
+        "video_name": str(video_display.get("name") or ""),
+        "video_ok": bool(video_display.get("playable")),
         "pack": pack,
         "pack_found": bool(pack and Path(pack).is_dir()),
         "pack_fingerprint": str(item.get("pack_fingerprint") or ""),
@@ -962,6 +965,28 @@ class JobManager:
             except Exception:
                 pass
 
+    def _reveal_chrome_for_attention(self):
+        """非登录的人工介入场景（验证码/滑块/停滞/需人工检查）的窗口策略。
+
+        跟随「显示自动化浏览器」开关：勾选时显示现场，未勾选时保持隐藏；
+        只有登录场景才无条件弹出窗口。
+        """
+        try:
+            web = load_web()
+        except Exception:
+            return
+        if not paths.load_settings().debug_browser:
+            try:
+                web.hide_automation_chrome()
+            except Exception:
+                pass
+            return
+        self._hide_chrome_after_login = False
+        try:
+            web.reveal_automation_chrome()
+        except Exception:
+            pass
+
     def open_chrome(self):
         settings = paths.configure_environ()
         web = load_web()
@@ -1325,8 +1350,11 @@ class JobManager:
                 f"任务已超过 {max(1, threshold // 60)} 分钟无任何进展，"
                 "可能被页面弹窗或验证阻塞"
             )
-        self.log(f"{self.blocker}；已弹出浏览器窗口，请检查现场后选择暂停或继续等待", "error")
-        self._reveal_chrome_for_login()
+        if paths.load_settings().debug_browser:
+            self._reveal_chrome_for_attention()
+            self.log(f"{self.blocker}；已显示自动化浏览器，请检查现场后选择暂停或继续等待", "error")
+        else:
+            self.log(f"{self.blocker}；浏览器保持隐藏，需要查看现场时可在设置中勾选“显示自动化浏览器”", "error")
 
     def _run_job(self, confirm_submit=True, limit=0, force_new=False, retry_failed=False):
         stop = threading.Event()
@@ -1356,7 +1384,8 @@ class JobManager:
             item_started = {}
 
             def on_start(product):
-                item_started[product.get("row")] = time.time()
+                # 重试同一条目时不重置计时，时长覆盖该条的全部尝试
+                item_started.setdefault(product.get("row"), time.time())
                 with self.lock:
                     self.current_row = product.get("row")
                     self.current_id = str(product.get("product_id") or "")
@@ -1375,7 +1404,7 @@ class JobManager:
                 notice = str(item.get("notice") or "").strip()
                 serialized = serialize_row({**product, **item})
                 flow_fields = {key: item.get(key) for key in FLOW_FIELDS if item.get(key) not in (None, "")}
-                reveal_login = execution == "暂停" and bool(pause_reason_code(notice))
+                pause_code = pause_reason_code(notice) if execution == "暂停" else ""
                 with self.lock:
                     self.done = finished["count"]
                     if item.get("duration_seconds"):
@@ -1416,8 +1445,18 @@ class JobManager:
                     self.log(f"{pid} {execution}")
                 with self.lock:
                     self.activity_at = time.time()
-                if reveal_login:
+                if pause_code == "login":
                     self._reveal_chrome_for_login()
+                elif pause_code:
+                    self._reveal_chrome_for_attention()
+
+            def on_retry(product, item, attempt, retry_limit):
+                pid = product.get("product_id") or ""
+                notice = str(item.get("notice") or "").strip()
+                with self.lock:
+                    self.phase = f"自动重试（第 {attempt}/{retry_limit} 次）"
+                    self.activity_at = time.time()
+                self.log(f"{pid} 第 {attempt}/{retry_limit} 次自动重试：{notice[:200]}", "warn")
 
             def on_flow(product, item):
                 fields = {
@@ -1470,12 +1509,14 @@ class JobManager:
                 cancel_event=self.cancel,
                 on_item_start=on_start,
                 on_item_done=on_done,
+                on_item_retry=on_retry,
                 on_flow_stage=on_flow,
                 force_new=force_new,
                 sku_template_import=settings.sku_template_import,
                 skip_spec_images=settings.skip_spec_images,
                 sku_image_strategy=settings.sku_image_strategy,
                 spec_upload_batch_size=settings.spec_upload_batch_size,
+                item_retry_limit=getattr(settings, "item_retry_limit", 0),
             )
             by_row = {item.get("row"): item for item in executed or []}
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
@@ -1486,7 +1527,7 @@ class JobManager:
             journal = results_dir / f"{source_path.stem}.结果-{stamp}.json"
             updated_rows = []
             report_rows = []
-            paused = False
+            attention = []
             with self.lock:
                 for index, bundle in enumerate(self.products):
                     item = dict(bundle["meta"])
@@ -1501,9 +1542,11 @@ class JobManager:
                         for key in FLOW_FIELDS:
                             if web_item.get(key) not in (None, ""):
                                 item[key] = web_item.get(key)
-                        if item["execution"] == "暂停":
-                            paused = True
-                            self.blocker = item["notice"]
+                        if item.get("execution") in {"暂停", "失败", "提交失败", "提交待核实"}:
+                            attention.append(
+                                f"第{item.get('row')}行 {item.get('product_id') or ''} "
+                                f"{item.get('execution')}: {str(item.get('notice') or '')[:80]}"
+                            )
                     serialized = serialize_row(item)
                     updated_rows.append(serialized)
                     report_rows.append(item)
@@ -1541,7 +1584,7 @@ class JobManager:
                 "results": [serialize_row(r) for r in report_rows],
             }
             journal.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-            reveal_login = False
+            pause_code = ""
             with self.lock:
                 self.finished_at = time.time()
                 self.result_xlsx = str(output)
@@ -1549,24 +1592,28 @@ class JobManager:
                 if self.cancel.is_set():
                     self.status = "stopped"
                     self.phase = "已停止"
-                elif paused:
+                elif attention:
+                    # 单条失败不再中断整批；跑完后统一汇总需人工处理的条目。
                     self.status = "paused"
                     self.phase = "需人工处理"
-                    notice = self.blocker or ""
-                    reveal_login = bool(pause_reason_code(notice))
+                    more = f" 等{len(attention)}条" if len(attention) > 3 else ""
+                    self.blocker = f"{len(attention)} 条需人工处理：" + "；".join(attention[:3]) + more
+                    pause_code = pause_reason_code(self.blocker)
                 else:
                     self.status = "done"
                     self.phase = "完成"
-            if reveal_login:
+            if pause_code == "login":
                 self._reveal_chrome_for_login()
+            elif pause_code:
+                self._reveal_chrome_for_attention()
             self.log(f"任务结束，结果已保存: {output.name}")
             self._save_session()
         except Exception as exc:
             text = _plain(exc)
-            login_needed = bool(pause_reason_code(text))
+            pause_code = pause_reason_code(text)
             with self.lock:
                 self.finished_at = time.time()
-                if login_needed:
+                if pause_code:
                     self.status = "paused"
                     self.blocker = text
                     self.phase = "需人工处理"
@@ -1574,8 +1621,10 @@ class JobManager:
                     self.status = "error"
                     self.phase = "失败"
                 self.message = text
-            if login_needed:
+            if pause_code == "login":
                 self._reveal_chrome_for_login()
+            elif pause_code:
+                self._reveal_chrome_for_attention()
             self.log(text, "error")
             self.log(traceback.format_exc(), "error")
             self._save_session()
@@ -1590,14 +1639,16 @@ class JobManager:
         # guarantee in desktop cleanup by closing every publishing tab.
         with self.lock:
             preserve = self.status != "done" or any(
-                row.get("execution") in {"暂停", "失败", "结果待核实"}
+                row.get("execution") in {"暂停", "失败", "结果待核实", "提交失败", "提交待核实"}
                 for row in self.rows
             )
         if preserve:
-            self._reveal_chrome_for_login()
-            # This is also an image/error inspection surface, not just a login
-            # prompt. A successful login poll must not immediately hide it.
-            self._hide_chrome_after_login = False
+            # 需人工检查的现场（图片/错误/待核实）跟随「显示自动化浏览器」
+            # 开关：勾选时显示且登录轮询不收起，未勾选时保持隐藏不弹窗。
+            if paths.load_settings().debug_browser:
+                self._reveal_chrome_for_attention()
+            else:
+                self._hide_chrome_for_fill()
             return
         try:
             load_web().prune_automation_tabs()

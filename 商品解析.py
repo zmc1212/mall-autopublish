@@ -135,14 +135,75 @@ def _main_group(stem):
     return len(MAIN_GROUP_ORDER)
 
 
-def scan_main_video(folder):
-    """在扁平图片包里选主视频：优先文件名含“主视频”，否则取排序第一个视频。"""
+def is_playable_video(path):
+    """按容器魔数判断视频文件是否可播放。
+
+    扩展名是视频但内容不是视频容器的假文件（把网页/图片等改名为 mp4）判为
+    不可播放。只读文件头几十字节，不依赖 ffmpeg；无法识别的容器头一律视为
+    不可播放，宁可不传也不让平台卡死在转码上。
+    """
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(64)
+    except OSError:
+        return False
+    if len(head) < 12:
+        return False
+    ext = Path(path).suffix.lower()
+    if ext in {".mp4", ".m4v", ".mov", ".3gp"}:
+        # ISO BMFF 容器：偏移 4 起是 "ftyp"；个别工具带少量前缀，放宽到前 16 字节。
+        return b"ftyp" in head[:16]
+    if ext in {".mkv", ".webm"}:
+        return head.startswith(b"\x1a\x45\xdf\xa3")
+    if ext == ".avi":
+        return head[:4] == b"RIFF" and head[8:12] == b"AVI "
+    if ext in {".flv", ".f4v"}:
+        return head[:3] == b"FLV"
+    if ext in {".wmv", ".asf"}:
+        return head.startswith(b"\x30\x26\xb2\x75\x8e\x66\xcf\x11")
+    if ext in {".mpg", ".mpeg", ".vob"}:
+        return head[:4] in (b"\x00\x00\x01\xba", b"\x00\x00\x01\xb3")
+    if ext in {".m2t", ".mts"}:
+        return head[:1] == b"\x47"
+    if ext in {".rmvb", ".rm"}:
+        return head[:4] == b"\x2e\x52\x4d\x46"
+    return True
+
+
+def main_video_display(folder):
+    """商品明细展示用的主视频信息；无视频返回 None。
+
+    展示与上传选片的区别：命名“主视频”的文件即使格式错误也优先展示
+    （红标提示用户修复），上传时则会自动落到其他可播放视频。
+    """
     videos = sorted(
         (p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in VIDEO_EXTS),
         key=lambda p: p.name,
     )
+    if not videos:
+        return None
     named = [p for p in videos if "主视频" in p.stem]
-    return (named or videos or [None])[0]
+    if named:
+        return {"name": named[0].name, "playable": is_playable_video(named[0])}
+    playable = [p for p in videos if is_playable_video(p)]
+    if playable:
+        return {"name": playable[0].name, "playable": True}
+    return {"name": videos[0].name, "playable": False}
+
+
+def scan_main_video(folder):
+    """在扁平图片包里选主视频：优先文件名含“主视频”，否则取排序第一个视频。
+
+    无法播放的假视频（扩展名是视频但内容不是视频容器）不参与候选：
+    主视频是假文件时自动落到包内其他可播放视频，全部不可播放则视为无主视频。
+    """
+    videos = sorted(
+        (p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in VIDEO_EXTS),
+        key=lambda p: p.name,
+    )
+    playable = [p for p in videos if is_playable_video(p)]
+    named = [p for p in playable if "主视频" in p.stem]
+    return (named or playable or [None])[0]
 
 
 def scan_image_pack(dir_path):
@@ -199,6 +260,7 @@ def scan_image_pack(dir_path):
         "details": [item[2] for item in details],
         "skus": [{k: v for k, v in item.items() if k != "_n"} for item in skus],
         "main_video": scan_main_video(folder),
+        "video_display": main_video_display(folder),
     }
 
 
@@ -340,5 +402,6 @@ def resolve_product(row, sku_rows=None, pack=None, templates=None, base_dir=None
         "spec_name": spec_name,
         "warehouse": (str(first_present(row, "上架时间") or sales_tpl.get("listing_time") or "放入仓库").strip() == "放入仓库"),
         "main_video": pack.get("main_video"),
+        "video_display": pack.get("video_display"),
         "pack_dir": pack_dir,
     }

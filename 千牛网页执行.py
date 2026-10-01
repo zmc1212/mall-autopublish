@@ -950,6 +950,68 @@ def focus_chrome_windows():
     return reveal_automation_chrome()
 
 
+def restore_automation_chrome(pids=None, root_pid=None, port=None):
+    """还原最小化/隐藏的自动化 Chrome 主窗口。
+
+    reveal_automation_chrome 依赖 _hwnds_for_pids 的 200x150 尺寸过滤，
+    最小化窗口（-32000 异形矩形）会被跳过；虚拟滚动表格在最小化窗口里
+    停止渲染，需要先还原窗口再等表格补完。
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    targets = {int(pid) for pid in (pids or []) if pid}
+    if not targets:
+        targets = automation_chrome_pids(port=port, root_pid=root_pid)
+    if not targets:
+        return False
+    windows = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def callback(hwnd, _lparam):
+        pid = wintypes.DWORD(0)
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value not in targets:
+            return True
+        class_name = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, class_name, 256)
+        if class_name.value != "Chrome_WidgetWin_1":
+            return True
+        length = user32.GetWindowTextLengthW(hwnd)
+        if not length:
+            return True
+        buf = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, buf, length + 1)
+        rect = wintypes.RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(rect))
+        windows.append((int(hwnd), buf.value, (rect.left, rect.top, rect.right, rect.bottom)))
+        return True
+
+    user32.EnumWindows(callback, 0)
+    if not windows:
+        return False
+    keywords = ("卖家中心", "千牛", "淘宝", "Taobao", "tmall", "天猫")
+    windows.sort(key=lambda item: 0 if any(word in (item[1] or "") for word in keywords) else 1)
+    restored = False
+    for index, (hwnd, _title, rect) in enumerate(windows):
+        try:
+            if user32.IsIconic(hwnd):
+                user32.ShowWindow(hwnd, 9)
+                time.sleep(0.15)
+            left, top, right, bottom = _CHROME_PLACEMENTS.get(hwnd) or rect
+            if left <= OFFSCREEN_POS[0] + 100 and top <= OFFSCREEN_POS[1] + 100:
+                left, top = 80, 80
+            width = max(400, (right - left) if right > left else 1200)
+            height = max(300, (bottom - top) if bottom > top else 800)
+            _set_window_rect(hwnd, left, top, width, height, show=9, activate=(index == 0))
+            _CHROME_PLACEMENTS.pop(hwnd, None)
+            restored = True
+        except Exception:
+            continue
+    return restored
+
+
 def reveal_seller_chrome(timeout=4.0):
     try:
         activate_seller_tab()

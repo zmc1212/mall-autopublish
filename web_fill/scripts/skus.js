@@ -277,7 +277,8 @@ async page => {
   const skuCategory = PAYLOAD.sku_category || "单品";
   const thickness = PAYLOAD.thickness || "0.05mm";
   const catLog = await fillRowSelects("sku_category", skuCategory);
-  const thickLog = await fillRowSelects("thickness", thickness);
+  // 模板导入补值时厚度列刻意留空（skip_thickness），不能用默认值污染。
+  const thickLog = PAYLOAD.skip_thickness ? [] : await fillRowSelects("thickness", thickness);
 
   const after = await page.evaluate(() => {
     const t = document.body.innerText || "";

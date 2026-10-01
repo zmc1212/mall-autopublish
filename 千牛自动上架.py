@@ -61,6 +61,7 @@ IMAGE_EXTS = _parser.IMAGE_EXTS
 load_templates = _parser.load_templates
 load_registry = _parser.load_registry
 resolve_product = _parser.resolve_product
+is_playable_video = _parser.is_playable_video
 TEMPLATES_DIR = _parser.TEMPLATES_DIR
 
 

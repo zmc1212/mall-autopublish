@@ -127,6 +127,18 @@ class DesktopPathTests(unittest.TestCase):
         self.assertEqual(paths.Settings(spec_upload_batch_size=200).normalized().spec_upload_batch_size, 99)
         self.assertEqual(paths.Settings(spec_upload_batch_size=-3).normalized().spec_upload_batch_size, 0)
 
+    def test_item_retry_limit_setting_persists_and_clamps(self):
+        from desktop import paths
+
+        # 默认每条失败自动重试 1 次；0 表示不重试直接跳下一条。
+        self.assertEqual(paths.Settings().item_retry_limit, 1)
+        paths.save_settings(paths.Settings(item_retry_limit=3))
+        self.assertEqual(paths.load_settings().item_retry_limit, 3)
+        paths.save_settings(paths.Settings(item_retry_limit=0))
+        self.assertEqual(paths.load_settings().item_retry_limit, 0)
+        self.assertEqual(paths.Settings(item_retry_limit=9).normalized().item_retry_limit, 5)
+        self.assertEqual(paths.Settings(item_retry_limit=-2).normalized().item_retry_limit, 0)
+
     def test_frozen_build_preserves_debug_browser_setting(self):
         from desktop import paths
 
@@ -168,6 +180,55 @@ class DesktopApiTests(unittest.TestCase):
         self.assertIn("chrome", status.json())
         self.assertIn("chrome_found", status.json()["chrome"])
 
+    def test_export_logs_zip(self):
+        import zipfile
+
+        from fastapi.testclient import TestClient
+        from desktop.server import app
+
+        appdata = Path(os.environ["QIANNIU_APPDATA"])
+        logs = appdata / "logs"
+        (logs / "playwright" / "media-upload-cache").mkdir(parents=True)
+        (logs / "desktop.log").write_text("2026-01-01 10:00:00 [error] 测试错误\n", encoding="utf-8")
+        (logs / "playwright" / "web_fill_skus.raw.txt").write_text("### Error: 页面超时\n", encoding="utf-8")
+        (logs / "playwright" / "media-upload-cache" / "qn_big.jpg").write_bytes(b"jpg")
+        (logs / "playwright" / "material_flow" / "product").mkdir(parents=True)
+        (logs / "playwright" / "material_flow" / "product" / "img.jpg").write_bytes(b"jpg")
+        (logs / "playwright" / "material_flow" / "product" / "state.json").write_text("{}", encoding="utf-8")
+        (logs / "huge.bin").write_bytes(b"\0" * (10 * 1024 * 1024 + 1))
+        (appdata / "job_session.json").write_text(
+            json.dumps({"phase": "需人工处理", "blocker": "滑块验证，请人工处理"}), encoding="utf-8"
+        )
+        results = appdata / "results"
+        results.mkdir(exist_ok=True)
+        (results / "清单.结果-20260101-120000-000001.json").write_text(json.dumps({"total": 1}), encoding="utf-8")
+        (results / "清单.结果-20260101-120000-000001.xlsx").write_bytes(b"xlsx")
+
+        client = TestClient(app)
+        response = client.post("/api/logs/export")
+        self.assertEqual(response.status_code, 200, response.text)
+        data = response.json()
+        zip_path = Path(data["path"])
+        self.assertTrue(zip_path.is_file())
+        self.assertEqual(Path(data["folder"]), zip_path.parent)
+        self.assertGreaterEqual(data["files"], 5)
+        self.assertGreater(data["size"], 0)
+        with zipfile.ZipFile(zip_path) as archive:
+            names = set(archive.namelist())
+            self.assertIn("manifest.txt", names)
+            self.assertIn("logs/desktop.log", names)
+            self.assertIn("logs/playwright/web_fill_skus.raw.txt", names)
+            self.assertIn("job_session.json", names)
+            self.assertIn("results/清单.结果-20260101-120000-000001.json", names)
+            self.assertIn("results/清单.结果-20260101-120000-000001.xlsx", names)
+            self.assertNotIn("logs/playwright/media-upload-cache/qn_big.jpg", names)
+            self.assertNotIn("logs/playwright/material_flow/product/img.jpg", names)
+            self.assertIn("logs/playwright/material_flow/product/state.json", names)
+            self.assertNotIn("logs/huge.bin", names)
+            manifest = archive.read("manifest.txt").decode("utf-8")
+            self.assertIn("滑块验证", manifest)
+            self.assertIn("huge.bin（超过 10MB）", manifest)
+
     def test_settings_spec_upload_batch_size_roundtrip(self):
         from fastapi.testclient import TestClient
         from desktop.server import app
@@ -181,6 +242,32 @@ class DesktopApiTests(unittest.TestCase):
         # 越界值被 pydantic 拒绝（ge=0, le=99）
         self.assertEqual(client.put("/api/settings", json={"spec_upload_batch_size": 150}).status_code, 422)
         self.assertEqual(client.put("/api/settings", json={"spec_upload_batch_size": -1}).status_code, 422)
+
+    def test_settings_item_retry_limit_roundtrip(self):
+        from fastapi.testclient import TestClient
+        from desktop.server import app
+
+        client = TestClient(app)
+        response = client.put("/api/settings", json={"item_retry_limit": 2})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["item_retry_limit"], 2)
+        status = client.get("/api/status").json()
+        self.assertEqual(status["settings"]["item_retry_limit"], 2)
+        # 越界值被 pydantic 拒绝（ge=0, le=5）
+        self.assertEqual(client.put("/api/settings", json={"item_retry_limit": 6}).status_code, 422)
+        self.assertEqual(client.put("/api/settings", json={"item_retry_limit": -1}).status_code, 422)
+
+    def test_settings_debug_browser_apply_reported(self):
+        from fastapi.testclient import TestClient
+        from desktop.server import app
+
+        client = TestClient(app)
+        response = client.put("/api/settings", json={"debug_browser": False})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["debug_browser"], False)
+        # 勾选“显示自动化浏览器”立即生效依赖该字段：False 表示浏览器未连接、下次启动生效
+        self.assertIn("debug_browser_applied", response.json())
+        self.assertIsInstance(response.json()["debug_browser_applied"], bool)
 
     def test_pending_products_skip_done_unless_force_new(self):
         from desktop.jobs import JobManager
@@ -362,6 +449,20 @@ class DesktopApiTests(unittest.TestCase):
         self.assertEqual(row["taobao_item_id"], "1086638256748")
         self.assertIn("item.htm?id=1086638256748", row["view_url"])
         self.assertIn("itemId=1086638256748", row["edit_url"])
+
+    def test_serialize_row_carries_video_display(self):
+        from desktop.jobs import serialize_row
+        row = serialize_row({"product": {
+            "video_display": {"name": "主视频.mp4", "playable": False}}})
+        self.assertEqual(row["video_name"], "主视频.mp4")
+        self.assertFalse(row["video_ok"])
+        row = serialize_row({"product": {
+            "video_display": {"name": "主视频.mp4", "playable": True}}})
+        self.assertEqual(row["video_name"], "主视频.mp4")
+        self.assertTrue(row["video_ok"])
+        row = serialize_row({"product": {}})
+        self.assertEqual(row["video_name"], "")
+        self.assertFalse(row["video_ok"])
 
     def test_open_item_opens_view_url(self):
         from desktop.jobs import JobManager
@@ -597,28 +698,38 @@ class DesktopApiTests(unittest.TestCase):
 
     def test_job_cleanup_preserves_failed_paused_and_stopped_browser(self):
         from desktop.jobs import JobManager
-        for status, execution in [("paused", "暂停"), ("error", "失败"),
-                                  ("stopped", ""), ("done", "失败"),
-                                  ("done", "结果待核实"), ("done", "已入库")]:
-            with self.subTest(status=status, execution=execution):
-                manager = JobManager()
-                manager.status = status
-                manager.rows = [{"execution": execution}]
-                manager._hide_chrome_after_login = True
-                web = unittest.mock.Mock()
-                with unittest.mock.patch("desktop.jobs.load_web", return_value=web), \
-                     unittest.mock.patch.object(manager, "_reveal_chrome_for_login") as reveal, \
-                     unittest.mock.patch.object(manager, "_hide_chrome_for_fill") as hide:
-                    manager._finish_browser()
-                if status == "done" and execution == "已入库":
-                    web.prune_automation_tabs.assert_called_once()
-                    hide.assert_called_once()
-                    reveal.assert_not_called()
-                else:
-                    web.prune_automation_tabs.assert_not_called()
-                    hide.assert_not_called()
-                    reveal.assert_called_once()
-                    self.assertFalse(manager._hide_chrome_after_login)
+        for debug_browser in (True, False):
+            for status, execution in [("paused", "暂停"), ("error", "失败"),
+                                      ("stopped", ""), ("done", "失败"),
+                                      ("done", "结果待核实"), ("done", "已入库")]:
+                with self.subTest(debug_browser=debug_browser, status=status, execution=execution):
+                    manager = JobManager()
+                    manager.status = status
+                    manager.rows = [{"execution": execution}]
+                    manager._hide_chrome_after_login = True
+                    web = unittest.mock.Mock()
+                    settings = unittest.mock.Mock(debug_browser=debug_browser)
+                    with unittest.mock.patch("desktop.jobs.load_web", return_value=web), \
+                         unittest.mock.patch("desktop.jobs.paths.load_settings", return_value=settings), \
+                         unittest.mock.patch.object(manager, "_hide_chrome_for_fill") as hide:
+                        manager._finish_browser()
+                    if status == "done" and execution == "已入库":
+                        web.prune_automation_tabs.assert_called_once()
+                        hide.assert_called_once()
+                        web.reveal_automation_chrome.assert_not_called()
+                        web.hide_automation_chrome.assert_not_called()
+                    elif debug_browser:
+                        # 需人工检查的现场跟随开关：勾选时显示且不被登录轮询收起。
+                        web.prune_automation_tabs.assert_not_called()
+                        hide.assert_not_called()
+                        web.reveal_automation_chrome.assert_called_once()
+                        web.hide_automation_chrome.assert_not_called()
+                        self.assertFalse(manager._hide_chrome_after_login)
+                    else:
+                        web.prune_automation_tabs.assert_not_called()
+                        hide.assert_called_once()
+                        web.reveal_automation_chrome.assert_not_called()
+                        web.hide_automation_chrome.assert_not_called()
 
     def test_login_status_requires_stable_seller_url(self):
         from desktop.jobs import JobManager
@@ -995,12 +1106,31 @@ class StallWatchdogTests(unittest.TestCase):
         manager = JobManager()
         manager.status = "running"
         manager.activity_at = time_module.time() - 10 ** 6
-        manager._reveal_chrome_for_login = unittest.mock.Mock()
-        manager._check_stalled()
+        manager._reveal_chrome_for_attention = unittest.mock.Mock()
+        with unittest.mock.patch("desktop.jobs.paths.load_settings",
+                                 return_value=unittest.mock.Mock(debug_browser=True)):
+            manager._check_stalled()
         self.assertTrue(manager.stalled)
         self.assertIn("无任何进展", manager.blocker)
         self.assertTrue(any("无任何进展" in (entry.get("message") or "") for entry in manager.logs))
-        manager._reveal_chrome_for_login.assert_called_once()
+        manager._reveal_chrome_for_attention.assert_called_once()
+        self.assertTrue(any("已显示自动化浏览器" in (entry.get("message") or "") for entry in manager.logs))
+
+    def test_watchdog_stalled_keeps_browser_hidden_by_preference(self):
+        import time as time_module
+
+        from desktop.jobs import JobManager
+
+        manager = JobManager()
+        manager.status = "running"
+        manager.activity_at = time_module.time() - 10 ** 6
+        manager._reveal_chrome_for_attention = unittest.mock.Mock()
+        with unittest.mock.patch("desktop.jobs.paths.load_settings",
+                                 return_value=unittest.mock.Mock(debug_browser=False)):
+            manager._check_stalled()
+        self.assertTrue(manager.stalled)
+        manager._reveal_chrome_for_attention.assert_not_called()
+        self.assertTrue(any("浏览器保持隐藏" in (entry.get("message") or "") for entry in manager.logs))
 
     def test_watchdog_ignores_non_running_task(self):
         import time as time_module

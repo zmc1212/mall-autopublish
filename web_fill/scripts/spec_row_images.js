@@ -10,6 +10,40 @@ async page => {
   const phase = PAYLOAD.phase || 'open';
   if (!Number.isInteger(index) || index < 0 || !image) throw new Error('规格行或图片路径无效');
   const cell = page.locator(`td[id="${index}-custom_-1"]`).first();
+
+  // 虚拟滚动表格只渲染视口附近的行；目标行不在 DOM 时逐屏滚动使其渲染，
+  // 绑定期间保持该行在视口内；修复轮次里目标行可能在上方，需回顶重扫。
+  async function bringRowIntoView(idx) {
+    await page.evaluate(async (rowIndex) => {
+      const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+      const cellId = `${rowIndex}-custom_-1`;
+      const exists = () => !!document.querySelector(`td[id="${cellId}"]`);
+      if (exists()) return;
+      let cont = null;
+      for (const td of [...document.querySelectorAll('td[id$="-custom_-1"]')]) {
+        let el = td.parentElement;
+        while (el && el !== document.body) {
+          const st = getComputedStyle(el);
+          if (/(auto|scroll)/.test(st.overflowY) && el.scrollHeight > el.clientHeight + 50) { cont = el; break; }
+          el = el.parentElement;
+        }
+        if (cont) break;
+      }
+      if (!cont) return;
+      for (let pass = 0; pass < 2 && !exists(); pass++) {
+        if (pass === 1) { cont.scrollTop = 0; await pause(400); }
+        let guard = 0;
+        while (!exists() && guard++ < 80) {
+          const before = cont.scrollTop;
+          cont.scrollTop = Math.min(before + Math.max(200, Math.floor(cont.clientHeight * 0.7)), cont.scrollHeight);
+          await pause(350);
+          if (cont.scrollTop === before) break;
+        }
+      }
+    }, idx);
+  }
+
+  if (!(await cell.count())) await bringRowIntoView(index);
   if (!(await cell.count())) throw new Error(`未找到第 ${index + 1} 个商品规格图片单元格`);
 
   const filled = async () => !!(await cell.locator('.image-item').count());
