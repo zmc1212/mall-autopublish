@@ -26,3 +26,18 @@ testdata/
 # OS generated files
 .DS_Store
 Thumbs.db
+
+# License private keys (never commit; the keygen keeps keys in %USERPROFILE%\.qianniu-license)
+.qianniu-license/
+*.pem
+*.key
+
+# --- 调试/运行产物（2026-10-01 整理）---
+# AI 会话调试产物（验收截图、日志导出、激活码测试样本、临时脚本）
+.zcode/tmp/
+
+# 运行日志（真实运行日志写在 %APPDATA%，根目录 logs/ 为历史遗留）
+logs/
+
+# 千牛导出的模板样本
+SKU模板_*.xls

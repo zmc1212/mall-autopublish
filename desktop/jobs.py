@@ -66,6 +66,7 @@ STEP_LABELS = {
     "sku_category": "设置 SKU 分类",
     "thickness": "设置书写粗细",
     "spec_images": "规格图",
+    "spec_images_resume": "规格图核验续传",
     "main_1_1": "1:1主图",
     "main_3_4": "3:4主图",
     "details": "详情图",

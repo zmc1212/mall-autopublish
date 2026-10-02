@@ -1,8 +1,9 @@
-import { Download, FolderOpen, Loader2, Save, ScrollText } from "lucide-react";
+import { Download, FolderOpen, KeyRound, Loader2, Save, ScrollText } from "lucide-react";
 import { useEffect, useState } from "react";
 
+import { api } from "../api";
 import { Button, InputText } from "../theme";
-import type { AppSettings, ChromeStatus, JobState } from "../types";
+import type { AppSettings, ChromeStatus, JobState, LicenseState } from "../types";
 import cn from "../utils/classnames";
 
 import { PanelFrame } from "./Sidebar";
@@ -42,6 +43,22 @@ export default function SettingsPanel({
 }: SettingsPanelProps) {
   const [logLevel, setLogLevel] = useState<"all" | "warn" | "error">("all");
   const [logQuery, setLogQuery] = useState("");
+  const [license, setLicense] = useState<LicenseState | null>(null);
+  const [deactivating, setDeactivating] = useState(false);
+  useEffect(() => {
+    void api.licenseStatus().then(setLicense).catch(() => {});
+  }, []);
+  const onDeactivate = async () => {
+    if (!window.confirm("取消本机激活后，需要重新输入激活码才能使用。确定继续吗？")) return;
+    setDeactivating(true);
+    try {
+      setLicense(await api.deactivateLicense());
+    } catch {
+      // 失败时保留当前显示，用户可重试
+    } finally {
+      setDeactivating(false);
+    }
+  };
   const allLogs = job?.logs || [];
   const query = logQuery.trim().toLowerCase();
   const filteredLogs = allLogs
@@ -386,6 +403,49 @@ export default function SettingsPanel({
               <p className="mt-3 text-xs text-slate-400">保存后立即用于下一次打开千牛窗口和入库任务。</p>
             ) : null}
           </div>
+        </article>
+
+        <article className="rounded-2xl border border-border bg-white p-5" data-testid="license-info">
+          <h3 className="flex items-center gap-2 text-sm font-semibold">
+            <KeyRound className="h-4 w-4 text-primary" aria-hidden="true" />
+            授权信息
+          </h3>
+          {license ? (
+            <div className="mt-3 space-y-1.5 text-xs leading-5 text-slate-600">
+              <p>
+                状态：
+                <span className={cn("font-medium", license.activated ? "text-emerald-600" : "text-red-600")}>
+                  {license.activated ? "已激活" : "未激活"}
+                </span>
+                {license.activated && license.memo ? `（${license.memo}）` : ""}
+              </p>
+              <p>
+                本机机器码：
+                <code className="rounded bg-slate-100 px-1.5 py-0.5 font-mono font-semibold">
+                  {license.machine_code}
+                </code>
+              </p>
+              <p>
+                有效期：
+                {license.activated
+                  ? license.expires_at
+                    ? `${new Date(license.expires_at * 1000).toLocaleDateString("zh-CN")} 到期（剩余 ${license.days_left ?? 0} 天）`
+                    : "永久有效"
+                  : "未激活"}
+              </p>
+              {license.activated ? (
+                <div className="pt-2">
+                  <Button variant="danger" onClick={() => void onDeactivate()} disabled={deactivating}>
+                    {deactivating ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" /> : null}
+                    取消本机激活
+                  </Button>
+                  <p className="mt-2 text-slate-400">换电脑或重装系统前可先取消激活；取消后需重新输入激活码。</p>
+                </div>
+              ) : null}
+            </div>
+          ) : (
+            <p className="mt-3 text-xs text-slate-400">授权信息读取中…</p>
+          )}
         </article>
       </div>
     </PanelFrame>

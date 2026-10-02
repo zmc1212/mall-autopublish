@@ -189,7 +189,9 @@ class WebFillTests(unittest.TestCase):
         self.assertIn("商品视频", video)
         self.assertIn("上传视频", video)
         self.assertIn("videoSelector", video)
-        self.assertIn("setFilesAnywhere", video)
+        # 视频改为定向投递到对话框自己的 input；全局查找已排除视频 context。
+        self.assertIn("input[type=file]", video)
+        self.assertNotIn("setFilesAnywhere", video)
         self.assertIn("already", video)
         self.assertNotIn(".drop(", video)
         self.assertNotIn("waitForEvent(\"filechooser\"", video)
@@ -385,7 +387,8 @@ class WebFillTests(unittest.TestCase):
         self.assertTrue(close_script.is_file())
         text = close_script.read_text(encoding="utf-8")
         self.assertIn("/*PAYLOAD*/", text)
-        self.assertIn(".wdeDialog .next-dialog-close", text)
+        self.assertIn(".wdeDialog", text)
+        self.assertIn(".next-dialog-close", text)
         self.assertIn("videoSelector", text)
 
     def test_video_step_security_pause_stops_flow(self):
@@ -415,7 +418,11 @@ class WebFillTests(unittest.TestCase):
         with unittest.mock.patch.object(pipeline, "run_script", side_effect=fake_run):
             result = pipeline.video_step(session, {"main_video": str(video)})
         self.assertTrue(result["uploaded"])
-        self.assertEqual(session.uploads, [str(video)])
+        # 代投的是内容寻址 staged 副本（qn_<hash>_原名），与脚本内回执匹配名一致。
+        self.assertEqual(len(session.uploads), 1)
+        staged = Path(session.uploads[0])
+        self.assertTrue(staged.name.startswith("qn_") and staged.name.endswith("_主视频.mp4"))
+        self.assertEqual(staged.read_bytes(), Path(video).read_bytes())
         self.assertEqual(calls, [("main_video.js", "open"), ("main_video.js", "verify")])
 
     def test_video_step_skips_when_chooser_dispatch_fails(self):
@@ -1975,6 +1982,11 @@ class TabRecycleTests(unittest.TestCase):
     def test_is_item_publish_url_scopes_to_item(self):
         self.assertTrue(pipeline._is_item_publish_url(edit_url("123"), "123"))
         self.assertTrue(pipeline._is_item_publish_url(edit_url("123", "&fr=tuwen"), "123"))
+        # 淘宝会把同一商品的 v2 编辑页归一到 item.manager 域名， itemId 不变。
+        self.assertTrue(pipeline._is_item_publish_url(
+            "https://item.manager.taobao.com/sell/v2/publish.htm?itemId=123&fromAIPublish=true", "123"))
+        self.assertFalse(pipeline._is_item_publish_url(
+            "https://item.manager.taobao.com/sell/v2/publish.htm?itemId=124", "123"))
         self.assertFalse(pipeline._is_item_publish_url(edit_url("124"), "123"))
         self.assertFalse(pipeline._is_item_publish_url(
             "https://item.upload.taobao.com/sell/v2/publish.htm?catId=50012720", "123"))

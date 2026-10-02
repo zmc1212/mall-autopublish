@@ -1,5 +1,5 @@
 #define MyAppName "千牛自动上架"
-#define MyAppVersion "1.1.0"
+#define MyAppVersion "1.2.0"
 #define MyAppExeName "千牛自动上架.exe"
 #define MyAppIconFile "..\logo\40c40691-9747-453a-a1d1-f2c94d393f34.ico"
 

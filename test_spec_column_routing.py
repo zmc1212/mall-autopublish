@@ -143,30 +143,62 @@ class SpecColumnRoutingTests(unittest.TestCase):
                                               self.product['taobao_item_id'], True)
         submit.assert_not_called()
 
-    def test_uncertain_previous_spec_save_is_never_resubmitted(self):
+    def test_uncertain_previous_spec_save_resumes_from_server_state(self):
+        """submit_pending 死锁出口：编辑页重开后的服务器读数证明该批未写入
+        时，清除标记并按缺失行继续补传，不再永久停在“已入库，待补图”。"""
         product = {**self.product, 'flow_version': p.SPEC_COLUMN_FLOW_VERSION,
                    'flow_stage': m.STAGE_SUBMIT_PENDING}
-        with patch.object(p, '_recover_existing_item', return_value=[]), \
-             patch.object(p, 'run_script', return_value={}), \
-             patch.object(p, '_spec_column_state', return_value=({1: ''}, [1])), \
-             patch.object(p, 'spec_images_gate') as bind:
-            with self.assertRaisesRegex(RuntimeError, '禁止自动重复提交'):
-                p._repair_existing_spec_images(FakeSession(), self.web, product,
-                                              product['taobao_item_id'], True)
-        bind.assert_not_called()
+        bound = []
 
-    def test_both_uncertain_spec_save_is_never_resubmitted(self):
+        def column_state(session, source):
+            sources = {1: 's1.jpg'} if bound else {}
+            return sources, [] if bound else [1]
+
+        def gate(session, payload, steps, **kwargs):
+            bound.extend(row + 1 for row in kwargs["only_rows"])
+            return {"bind": {"saved": True}}
+
+        with patch.object(p, '_recover_existing_item', return_value=[]), \
+             patch.object(m, 'check_rows'), patch.object(p, 'run_script', return_value={}), \
+             patch.object(p, '_spec_column_state', side_effect=column_state), \
+             patch.object(p, 'spec_images_gate', side_effect=gate), \
+             patch.object(p, '_finish_publish',
+                          return_value={'taobao_item_id': product['taobao_item_id']}), \
+             patch.object(p, '_prune_tabs'), patch.object(p, '_write_progress'):
+            result = p._repair_existing_spec_images(FakeSession(), self.web, product,
+                                                    product['taobao_item_id'], True)
+        self.assertEqual(bound, [1])
+        self.assertEqual(product['flow_stage'], m.STAGE_CREATED)
+        self.assertEqual(product['spec_image_stage'], p.SPEC_STAGE_UPLOADING)
+        self.assertEqual(result['spec_image_stage'], m.STAGE_COMPLETE)
+
+    def test_both_uncertain_spec_save_resumes_from_server_state(self):
         product = {**self.product, 'flow_version': p.BOTH_IMAGE_FLOW_VERSION,
                    'flow_stage': m.STAGE_CREATED,
                    'spec_image_stage': m.STAGE_SUBMIT_PENDING}
+        bound = []
+
+        def column_state(session, source):
+            sources = {1: 's1.jpg'} if bound else {}
+            return sources, [] if bound else [1]
+
+        def gate(session, payload, steps, **kwargs):
+            bound.extend(row + 1 for row in kwargs["only_rows"])
+            return {"bind": {"saved": True}}
+
         with patch.object(p, '_recover_existing_item', return_value=[]), \
-             patch.object(p, 'run_script', return_value={}), \
-             patch.object(p, '_spec_column_state', return_value=({1: ''}, [1])), \
-             patch.object(p, 'spec_images_gate') as bind:
-            with self.assertRaisesRegex(RuntimeError, '禁止自动重复提交'):
-                p._repair_existing_spec_images(FakeSession(), self.web, product,
-                                              product['taobao_item_id'], True)
-        bind.assert_not_called()
+             patch.object(m, 'check_rows'), patch.object(p, 'run_script', return_value={}), \
+             patch.object(p, '_spec_column_state', side_effect=column_state), \
+             patch.object(p, 'spec_images_gate', side_effect=gate), \
+             patch.object(p, '_finish_publish',
+                          return_value={'taobao_item_id': product['taobao_item_id']}), \
+             patch.object(p, '_prune_tabs'), patch.object(p, '_write_progress'):
+            result = p._repair_existing_spec_images(FakeSession(), self.web, product,
+                                                    product['taobao_item_id'], True)
+        self.assertEqual(bound, [1])
+        self.assertEqual(product['spec_image_stage'], p.SPEC_STAGE_UPLOADING)
+        self.assertEqual(product['flow_stage'], m.STAGE_CREATED)
+        self.assertEqual(result['spec_image_stage'], m.STAGE_COMPLETE)
 
 
 class SpecBatchUploadTests(unittest.TestCase):

@@ -49,6 +49,11 @@ async page => {
   const filled = async () => !!(await cell.locator('.image-item').count());
   const imageSrc = async () => await cell.locator('img.image-item').first().getAttribute('src') || '';
   const popup = page.locator('.sell-component-image-v2-media-popup:visible');
+  if (phase === 'cell') {
+    // 只读核验：异常后的“结果不明确”判定用它确认单元格是否已实际写入。
+    return JSON.stringify({ index, filled: await filled(), imageSrc: await imageSrc(),
+      popupOpen: !!(await popup.count()) });
+  }
   if (phase === 'open' && !PAYLOAD.forceReplace && await filled()) {
     return JSON.stringify({ index, already: true, saved: true,
       imageSrc: await imageSrc(), verifiedBy: 'existing-sku-row' });
@@ -105,6 +110,9 @@ async page => {
   if (phase === 'open') return JSON.stringify({ index, ready: true });
 
   async function selectAndConfirm(allowSearch) {
+    // 上一张的上传结果弹窗可能还盖在素材库 footer 上，"确定"会被它挡到
+    // click 稳定性检查超时（2026-10-01 远程日志：第 2 行上传成功后卡在这）。
+    if (await hasUploadResult()) await waitUploadResultClosed(12);
     let selected = await clickSucaiCard(frame, name, true, true);
     let search = 'VISIBLE';
     const confirm = frame.locator('button[class*="Footer_selectOk"]').last();
@@ -129,7 +137,13 @@ async page => {
     const imageKey = src => String(src || '').replace(/^https?:/i, '').split(/[?#]/)[0]
       .replace(/(\.(?:jpg|jpeg|png|webp))_.*$/i, '$1');
     await assertNoSecurityChallenge();
-    await confirm.click({ timeout: 8000 });
+    try {
+      await confirm.click({ timeout: 8000 });
+    } catch (error) {
+      // 低端机/弹窗动画下稳定性检查会持续不通过；按钮已解析且 enabled
+      // （readyToConfirm 确认过），DOM click 不受遮挡与动画检查约束。
+      await confirm.evaluate(el => el.click());
+    }
     for (let i = 0; i < 40; i++) {
       if (await filled() && !(await popup.count())) {
         const actual = await imageSrc();

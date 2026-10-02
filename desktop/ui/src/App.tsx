@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { api, nativeOpen, nativePick } from "./api";
+import { ApiError, api, nativeOpen, nativePick } from "./api";
+import ActivationGate from "./components/ActivationGate";
 import ConnectPanel from "./components/ConnectPanel";
 import RunPanel from "./components/RunPanel";
 import RunNotifications from "./components/RunNotifications";
@@ -10,7 +11,7 @@ import type { NavId } from "./components/Sidebar";
 import StatusBar from "./components/StatusBar";
 import ToastHost from "./components/ToastHost";
 import WorkbookPanel from "./components/WorkbookPanel";
-import type { AppSettings, AppStatus, SyncSummary, WorkbookRow, WorkspaceDefaults } from "./types";
+import type { AppSettings, AppStatus, LicenseState, SyncSummary, WorkbookRow, WorkspaceDefaults } from "./types";
 import { pushToast } from "./utils/toasts";
 
 const LAST_WORKBOOK_KEY = "qianniu.lastWorkbook";
@@ -82,6 +83,7 @@ function syncNotice(snap: { sync?: SyncSummary } | undefined, message: string) {
 export default function App() {
   const [nav, setNav] = useState<NavId>("connect");
   const [status, setStatus] = useState<AppStatus | null>(null);
+  const [license, setLicense] = useState<LicenseState | null>(null);
   const [pending, setPending] = useState<ReadonlySet<string>>(new Set());
   const [pathDraft, setPathDraft] = useState("");
   const [workspaceDraft, setWorkspaceDraft] = useState("");
@@ -100,6 +102,15 @@ export default function App() {
   const pathDraftDirty = useRef(false);
   const workspaceDraftDirty = useRef(false);
   const lastRev = useRef("");
+
+  // 业务请求收到 403（授权被删/过期）时自动回到激活页，由激活页重新查询状态
+  const handleAuthLoss = useCallback((exc: unknown) => {
+    if (exc instanceof ApiError && exc.status === 403) {
+      setLicense(null);
+      return true;
+    }
+    return false;
+  }, []);
 
   const refresh = useCallback(async () => {
     let next = await api.status();
@@ -187,6 +198,7 @@ export default function App() {
           pushToast("success", "与本地服务的连接已恢复");
         }
       } catch (exc) {
+        if (handleAuthLoss(exc)) return; // 未激活/授权失效：静默切回激活页
         const message = exc instanceof Error ? exc.message : String(exc);
         if (!offline.current) {
           offline.current = true;
@@ -206,7 +218,7 @@ export default function App() {
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [refresh]);
+  }, [refresh, handleAuthLoss]);
 
   const runAction = useCallback(
     async (key: string, action: () => Promise<unknown>) => {
@@ -215,6 +227,7 @@ export default function App() {
         await action();
         await refresh();
       } catch (exc) {
+        if (handleAuthLoss(exc)) return;
         pushToast("error", exc instanceof Error ? exc.message : String(exc));
       } finally {
         setPending((current) => {
@@ -225,7 +238,7 @@ export default function App() {
         });
       }
     },
-    [refresh],
+    [refresh, handleAuthLoss],
   );
 
   const familyBusy = (prefix: string) => {
@@ -237,6 +250,12 @@ export default function App() {
 
   const chrome = status?.chrome ?? null;
   const job = status?.job ?? null;
+
+  // 激活门禁：未激活（或授权失效）时只渲染激活页，主界面及其轮询不启动。
+  // setLicense 是稳定引用，ActivationGate 只会加载一次授权状态。
+  if (!license || !license.activated) {
+    return <ActivationGate onActivated={setLicense} />;
+  }
 
   return (
     <div className="flex h-full overflow-hidden bg-background">

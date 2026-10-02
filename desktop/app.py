@@ -101,6 +101,16 @@ def _runtime_preflight(require_bundle: bool = False) -> list[str]:
         problems.append("缺少 Playwright CLI")
     if not (root / "web_fill" / "scripts" / "material_import.js").is_file():
         problems.append("缺少素材导入页面脚本 web_fill/scripts/material_import.js")
+    try:
+        import base64
+
+        from desktop import license as license_module
+
+        license_module.machine_code()
+        if len(base64.b64decode(license_module.PUBLIC_KEY_B64)) != 32:
+            problems.append("内置激活公钥格式异常")
+    except Exception as exc:
+        problems.append(f"激活模块异常：{exc}")
     if require_bundle:
         if not paths.bundled_browser_path():
             problems.append("正式安装包没有内置 Chromium")
@@ -117,6 +127,35 @@ def _write_self_test(problems: list[str]) -> None:
     target.write_text(message, encoding="utf-8")
 
 
+def _log_build_fingerprint() -> None:
+    """把运行时实际加载的页面脚本指纹写进 desktop.log。
+
+    远程排查“更新是否真的装上”以这一行为准：main_video 指纹与打包机
+    dist 不一致，说明更新包未生效（执行了旧包，或装到了另一个目录）。
+    """
+    import hashlib
+    import json as _json
+    from datetime import datetime
+
+    try:
+        scripts = paths.find_resource("web_fill", "scripts")
+        main_video = scripts / "main_video.js"
+        digest = hashlib.md5(main_video.read_bytes()).hexdigest()[:8] if main_video.is_file() else "缺失"
+        generated = ""
+        manifest = paths.find_resource("runtime-manifest.json")
+        if manifest.is_file():
+            try:
+                generated = str(_json.loads(manifest.read_text(encoding="utf-8-sig")).get("generated_at") or "")
+            except (OSError, ValueError):
+                pass
+        line = (f"{datetime.now().strftime('%H:%M:%S')} [info] 构建指纹 "
+                f"main_video={digest} scripts={scripts} 打包时间={generated}\n")
+        with (logs_dir() / "desktop.log").open("a", encoding="utf-8") as stream:
+            stream.write(line)
+    except OSError:
+        pass
+
+
 def main(argv=None) -> int:
     freeze_support()
     try:
@@ -128,6 +167,7 @@ def main(argv=None) -> int:
             return 1 if problems else 0
         if problems:
             raise RuntimeError("运行环境不完整：\n- " + "\n- ".join(problems))
+        _log_build_fingerprint()
         from desktop.server import pick_free_port, run_server
         from urllib.request import urlopen
 

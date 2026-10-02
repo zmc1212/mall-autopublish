@@ -7,7 +7,10 @@ function unsafeUrl(url) {
   if (typeof PAYLOAD !== "undefined" && /^\d{8,20}$/.test(String(PAYLOAD.repairItemId || ""))) {
     try {
       // CLI's isolated runner does not expose the browser URL constructor.
-      const match = u.match(/^https:\/\/item\.upload\.taobao\.com\/sell\/v2\/publish\.htm\?([^#]*)/);
+      // 淘宝会把同一商品的 v2 编辑页落在 item.upload / item.manager 两个域名
+      // （2026-10-01 远程日志：批次中编辑页被归一到 item.manager 被误判
+      // UNSAFE）。两个主机名都接受；仍锚定 repairItemId，不接受其他商品。
+      const match = u.match(/^https:\/\/item\.(?:upload|manager)\.taobao\.com\/sell\/v2\/publish\.htm\?([^#]*)/);
       if (!match) return true;
       const ids = match[1].split('&').map(part => part.split('='))
         .filter(parts => decodeURIComponent(parts[0]) === 'itemId')
@@ -1114,6 +1117,21 @@ async function guardLocalFileChooser(frame, enabled) {
   }, enabled);
 }
 
+async function isVideoSelectorContext(ctx) {
+  // 视频选择器 iframe 加载/内部跳转期间 URL 可能短暂不含 videoSelector，
+  // 只看 URL 会漏判；内容里出现“选择视频”对话框文案同样拒绝，防止把图片
+  // 投进视频上传框（2026-10-01 真实页面复现）。主页面不做内容判定：发布页
+  // 自身可能带“选择视频”字样，会误伤正常上传入口。
+  try {
+    if (/videoSelector/i.test(String(ctx.url() || ""))) return true;
+    if (ctx === page || typeof ctx.parentFrame !== "function") return false;
+    return await ctx.evaluate(() =>
+      /选择视频|视频要求：/.test((document.body && document.body.innerText) || ""));
+  } catch (e) {
+    return false;
+  }
+}
+
 async function fileInputLocator() {
   const selectors = [
     ".batch-fill-sku-image-dialog input[type=file]",
@@ -1127,6 +1145,7 @@ async function fileInputLocator() {
     if (await loc.count()) return loc;
   }
   for (const frame of page.frames()) {
+    if (await isVideoSelectorContext(frame)) continue;
     const loc = frame.locator("input[type=file]").first();
     if (await loc.count()) return loc;
   }
@@ -1191,7 +1210,12 @@ function mergeUploadStatus(parts) {
 async function collectUploadStatus(frame, names) {
   const parts = [];
   for (const ctx of uploadContexts(frame)) {
-    try { parts.push(await readUploadStatus(ctx, names)); } catch (e) {}
+    try {
+      // 视频对话框的“上传中/上传失败”回执不属于图片上传批次，混入会把
+      // 图片状态误判成未确认成功（2026-10-01 死循环根因之一）。
+      if (ctx !== frame && await isVideoSelectorContext(ctx)) continue;
+      parts.push(await readUploadStatus(ctx, names));
+    } catch (e) {}
   }
   return mergeUploadStatus(parts);
 }
@@ -1337,7 +1361,7 @@ async function finishLocalUploadBatch(frame, files, names, policy) {
   if (!frame) frame = await waitFrame(pictureSpaceFrame, 8);
   if (!frame) throw new Error("图片上传失败：素材库未打开，已停止提交文件");
   const frameUrl = typeof frame.url === "function" ? String(frame.url() || "") : "";
-  if (/videoSelector/i.test(frameUrl)) {
+  if (/videoSelector/i.test(frameUrl) || await isVideoSelectorContext(frame)) {
     // 防御：视频选择器与图片空间同域且 URL 形似，图片投进去会被平台当视频拒绝。
     throw new Error("图片上传失败：素材库定位到选择视频对话框，已停止提交文件");
   }
@@ -1493,6 +1517,8 @@ async function clickComplete(frame) {
   for (const ctx of uploadContexts(frame)) {
     try {
       if (!(await uploadContextVisible(ctx))) continue;
+      // 视频选择器对话框也有“完成”按钮，收它的面板不属于图片上传结果确认。
+      if (await isVideoSelectorContext(ctx)) continue;
       if ((await clickIn(ctx)) === "OK") {
         await sleep(1000);
         return "OK";

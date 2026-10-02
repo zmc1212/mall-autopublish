@@ -1,4 +1,4 @@
-import type { AppSettings, AppStatus, JobHistoryEntry, JobState, SyncSummary, WorkspaceDefaults, WorkspaceInfo } from "./types";
+import type { AppSettings, AppStatus, JobHistoryEntry, JobState, LicenseState, SyncSummary, WorkspaceDefaults, WorkspaceInfo } from "./types";
 
 const base = () => window.__QIANNIU_API_BASE__ || "";
 
@@ -104,6 +104,13 @@ export const api = {
       method: "PUT",
       body: JSON.stringify(body),
     }),
+  licenseStatus: () => request<LicenseState>("/api/license/status"),
+  activateLicense: (code: string) =>
+    request<LicenseState>("/api/license/activate", {
+      method: "POST",
+      body: JSON.stringify({ code }),
+    }),
+  deactivateLicense: () => request<LicenseState>("/api/license/deactivate", { method: "POST" }),
 };
 
 type ChromeLike = AppStatus["chrome"];

@@ -52,6 +52,7 @@ class MaterialFlowTests(unittest.TestCase):
 
     def test_id_only_from_submission_result_or_official_success_url(self):
         self.assertEqual(flow.item_id_from_result({"url":"https://item.upload.taobao.com/sell/v2/success.htm?primaryId=1085270103015"}), "1085270103015")
+        self.assertEqual(flow.item_id_from_result({"url":"https://item.manager.taobao.com/sell/v2/success.htm?primaryId=1085270103015"}), "1085270103015")
         self.assertEqual(flow.item_id_from_result({"url":"https://evil.test/success.htm?primaryId=1085270103015"}), "")
         self.assertEqual(flow.item_id_from_result({"execution":"提交失败", "taobao_item_id":"1085270103015"}), "")
 

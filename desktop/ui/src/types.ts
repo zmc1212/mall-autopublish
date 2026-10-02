@@ -189,3 +189,13 @@ export interface AppStatus {
   workspace?: WorkspaceInfo;
   settings: AppSettings;
 }
+
+export interface LicenseState {
+  activated: boolean;
+  machine_code: string;
+  expires_at: number;
+  memo: string;
+  days_left: number | null;
+  /** 未激活且本机存在失效授权时的原因说明（如机器码变化、文件损坏）；正常为空串。 */
+  issue?: string;
+}

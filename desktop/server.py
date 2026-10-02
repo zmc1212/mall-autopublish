@@ -7,12 +7,14 @@ import json
 import os
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from . import license as license_module
 from . import paths
 from .jobs import MANAGER
 from .log_export import export_logs_zip
@@ -25,6 +27,29 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# 未激活时业务接口全部 403：健康检查与激活相关接口保持开放。
+_LICENSE_EXEMPT_PREFIXES = ("/api/health", "/api/license")
+
+
+@app.middleware("http")
+async def license_gate(request: Request, call_next):
+    path = request.url.path
+    if path.startswith("/api/") and not path.startswith(_LICENSE_EXEMPT_PREFIXES):
+        if not license_module.is_activated():
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "软件未激活，请先在激活页输入激活码。"},
+            )
+    return await call_next(request)
+
+
+def _require_activated() -> None:
+    """关键业务入口在中间件之外的独立校验点（多点校验提高篡改成本）。"""
+    try:
+        license_module.require_activated()
+    except license_module.LicenseError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
 
 
 class WorkbookIn(BaseModel):
@@ -89,9 +114,33 @@ def _fail(exc: Exception, code=400):
     raise HTTPException(status_code=code, detail=str(exc)) from exc
 
 
+class ActivateIn(BaseModel):
+    code: str
+
+
 @app.get("/api/health")
 def health():
     return {"ok": True, "app": "千牛自动上架"}
+
+
+@app.get("/api/license/status")
+def license_status():
+    return license_module.state()
+
+
+@app.post("/api/license/activate")
+def license_activate(body: ActivateIn):
+    try:
+        license_module.activate(body.code)
+    except license_module.LicenseError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return license_module.state()
+
+
+@app.post("/api/license/deactivate")
+def license_deactivate():
+    license_module.deactivate()
+    return license_module.state()
 
 
 @app.get("/api/status")
@@ -141,6 +190,7 @@ async def status():
 
 @app.post("/api/chrome/open")
 async def chrome_open():
+    _require_activated()
     try:
         return await run_in_threadpool(MANAGER.open_chrome)
     except Exception as exc:
@@ -150,6 +200,7 @@ async def chrome_open():
 @app.post("/api/chrome/check-login")
 def chrome_check_login():
     """前端加载时触发一次后台登录态检测；每进程只执行一次，重复调用自动忽略。"""
+    _require_activated()
     return {"started": MANAGER.begin_login_check()}
 
 
@@ -286,6 +337,7 @@ def job_state():
 
 @app.post("/api/job/start")
 def job_start(body: JobStartIn):
+    _require_activated()
     settings = paths.load_settings()
     limit = int(body.limit or settings.limit or 0)
     try:

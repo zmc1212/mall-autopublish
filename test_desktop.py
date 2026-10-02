@@ -154,6 +154,10 @@ class DesktopApiTests(unittest.TestCase):
         os.environ["QIANNIU_APPDATA"] = self.temp.name
         from desktop.paths import configure_environ
         configure_environ()
+        # API 测试只验证业务逻辑，统一跳过激活门禁；门禁自身行为在 test_license.py 覆盖。
+        gate = unittest.mock.patch("desktop.license.is_activated", return_value=True)
+        gate.start()
+        self.addCleanup(gate.stop)
 
     def test_import_and_validate_sample_workbook(self):
         from fastapi.testclient import TestClient

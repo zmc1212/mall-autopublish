@@ -28,6 +28,30 @@ def get_output():
     return Path(raw) if raw else ROOT / "output" / "playwright"
 
 
+def get_logs_dir():
+    # 与 desktop.paths.logs_dir() 同目录（QIANNIU_APPDATA/logs），日志导出按
+    # 目录整体打包，这里写的文件会自动进导出包；web_fill 不反向依赖 desktop。
+    raw = os.environ.get("QIANNIU_APPDATA")
+    return (Path(raw) if raw else ROOT) / "logs"
+
+
+def _flow_log(message, level="info"):
+    """追加入库流程诊断日志到 logs/web_fill.log。
+
+    视频勾选这类静默出错曾有教训（2026-10-01 两个商品被绑上同一第三方视频，
+    事后无痕迹可查），关键决策点都要落一条可事后核对的记录；写日志失败
+    不影响流程。
+    """
+    try:
+        directory = get_logs_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        with (directory / "web_fill.log").open("a", encoding="utf-8") as stream:
+            stream.write(f"{stamp} [{level}] {message}\n")
+    except OSError:
+        pass
+
+
 def get_helpers():
     return (get_scripts() / "_helpers.inc.js").read_text(encoding="utf-8")
 
@@ -1400,6 +1424,7 @@ def _spec_row_image_step(session, payload, on_bind_progress=None, only_indexes=N
                 "repairItemId": payload.get("repairItemId")}
         for attempt in range(1, 2):
             _check_cancel(session)
+            upload_confirmed = False
             try:
                 args["forceReplace"] = force_replace or attempt > 1
                 opened = run_script(session, "spec_row_images.js", {**args, "phase": "open"}, timeout=70)
@@ -1414,6 +1439,7 @@ def _spec_row_image_step(session, payload, on_bind_progress=None, only_indexes=N
                         result = run_script(session, "spec_row_images.js", {**args, "phase": "finish"}, timeout=240)
                     if result.get("needsFinish"):
                         result = run_script(session, "spec_row_images.js", {**args, "phase": "finish"}, timeout=240)
+                upload_confirmed = result.get("uploaded") is True
                 if result.get("saved") is not True:
                     raise RuntimeError(f"第 {index + 1} 行规格图未写入SKU表格")
                 if not result.get("imageSrc"):
@@ -1426,6 +1452,21 @@ def _spec_row_image_step(session, payload, on_bind_progress=None, only_indexes=N
                 # the SKU cell before doing anything else.
                 if isinstance(exc, UserStopped) or _is_user_pause(exc):
                     raise
+                # 上传回执已确认、仅收尾（选图/点确定）失败时，先只读核验
+                # SKU 单元格：已实际写入就不算结果不明确，不因一次点击超时
+                # 暂停整条（2026-10-01 远程日志：第 2 行上传成功后
+                # Footer_selectOk 点击超时被误判）。核验是只读操作，不违反
+                # “结果不明确不得自动重复执行”。
+                if upload_confirmed:
+                    try:
+                        probe = run_script(session, "spec_row_images.js", {**args, "phase": "cell"}, timeout=30)
+                        if probe.get("filled") and probe.get("imageSrc"):
+                            expected_sources[index + 1] = probe["imageSrc"]
+                            return {"index": index, "attempt": attempt, **probe,
+                                    "uploaded": True, "saved": True,
+                                    "verifiedBy": "sku-row-after-error"}
+                    except Exception:
+                        pass
                 raise RuntimeError(f"PAUSE:第 {index + 1} 行规格图结果不明确；已保留页面，续跑先核验当前图片：{exc}") from exc
 
     for position, index in enumerate(indexes, 1):
@@ -1956,14 +1997,41 @@ def video_step(session, payload):
     """
     _check_cancel(session)
     files = [payload["main_video"]]
+    title = str(payload.get("title") or "")[:40]
     checker = _playable_video_checker()
     if checker is not None and not checker(files[0]):
+        _flow_log(f"主视频跳过 商品={title} 原因=文件无法播放 文件={Path(files[0]).name}", "warn")
         return {"uploaded": False, "skipped": True,
                 "warning": "主视频文件无法播放（扩展名是视频但内容不是有效视频），已跳过上传"}
+    # 内容寻址名（qn_<hash>_原名）随文件投递：平台列表条目名与之精确对应，
+    # 重试时“上传列表已有本文件/已发布”判定跨次数成立，不会重传同一视频。
+    # 勾选只认按名匹配到的本商品条目：本商品条目未出现在可选列表时报错
+    # 跳过（视频可选项，告警不阻断），绝不兜底勾选列表第一条——素材库是
+    # 账号级共享的，那一条可能是其他商品刚上传的同名“主视频”
+    # （2026-10-01 两个商品被绑上同一段第三方视频的根因）。
+    files = _prepare_media_uploads(files)
     request = {"files": files, "names": [Path(files[0]).name], "phase": "open"}
+
+    def _trace_text(data):
+        if not isinstance(data, dict):
+            return ""
+        return " | ".join(str(item) for item in (data.get("trace") or []))
+
+    def _log_result(stage, data):
+        if isinstance(data, dict):
+            if data.get("uploaded") or data.get("already"):
+                head = f"uploaded={bool(data.get('uploaded'))} already={bool(data.get('already'))} pick={data.get('pick') or ''}"
+            else:
+                head = f"error={short_fail_notice(str(data.get('error') or '未知'))}"
+        else:
+            head = f"bad_result={type(data).__name__}"
+        _flow_log(f"主视频 商品={title} {stage}: {head} trace=[{_trace_text(data)}]")
+
+    _flow_log(f"主视频开始 商品={title} 文件={Path(files[0]).name}")
     result = None
     try:
         result = run_script(session, "main_video.js", request, timeout=VIDEO_UPLOAD_TIMEOUT)
+        _log_result("页面脚本返回", result)
     except FileChooserNeeded:
         # 发布页“上传视频”点内层文字会弹原生文件选择器（与 SKU 模板导入同一
         # 机制）。把视频交给 pending 的选择器后只做复核，不重复投递。
@@ -1977,6 +2045,7 @@ def video_step(session, payload):
                     "warning": f"视频文件选择器不可用，已跳过视频：{short_fail_notice(str(exc))}"}
         try:
             result = run_script(session, "main_video.js", {**request, "phase": "verify"}, timeout=180)
+            _log_result("文件选择器代投复核返回", result)
         except Exception as exc:
             if _is_user_pause(exc):
                 raise
@@ -1986,9 +2055,15 @@ def video_step(session, payload):
             raise
         # 其余运行异常视为视频自身失败：记录后跳过，不阻断入库。
         result = {"error": short_fail_notice(str(exc)) or str(exc)[:160]}
+        _flow_log(f"主视频 商品={title} 脚本异常: {result['error']}", "warn")
     if not isinstance(result, dict):
         return {"uploaded": False, "warning": "视频上传结果未确认，已跳过视频"}
     if result.get("already") or result.get("uploaded"):
+        _flow_log(
+            f"主视频成功 商品={title} pick={result.get('pick') or ''} "
+            f"绑定条目={str(result.get('checkedText') or '')[:80] or '<未读取>'} "
+            f"文件={Path(files[0]).name}"
+        )
         return result
     if result.get("need_cli_upload") and not _upload_dispatched(result):
         # 页面内没有可用上传入口、需要原生文件选择器时，由 CLI 代投一次后复核。
@@ -2002,6 +2077,7 @@ def video_step(session, payload):
                     "warning": f"视频文件选择器不可用，已跳过视频：{short_fail_notice(str(exc))}"}
         try:
             result = run_script(session, "main_video.js", {**request, "phase": "verify"}, timeout=180)
+            _log_result("CLI代投复核返回", result)
         except Exception as exc:
             if _is_user_pause(exc):
                 raise
@@ -2012,6 +2088,7 @@ def video_step(session, payload):
     detail = str(result.get("detail") or "")
     if detail:
         reason = f"{reason}：{detail}"
+    _flow_log(f"主视频跳过 商品={title} 原因={reason}", "warn")
     return {"uploaded": False, "warning": f"主视频未上传，已跳过继续：{reason}"}
 
 
@@ -2135,7 +2212,14 @@ def fill_new_product(session, product, confirm_submit=False, web=None, force_new
                 video = video_step(session, payload)
                 steps.append({"step": "video", **video})
                 _write_progress(steps)
-            _close_video_dialog(session)
+            closed = _close_video_dialog(session)
+            if isinstance(closed, dict) and closed.get("frameGone") is False:
+                # 残留对话框会把详情图吸进视频上传框；把失败暴露到实时步骤，
+                # 不再静默（2026-10-01 死循环根因之一）。
+                steps.append({"step": "video_dialog_close",
+                              "warning": f"选择视频对话框未能自动关闭（{closed.get('clicked') or '未点击'}），"
+                                         "可能干扰后续图片上传；建议手动关闭后继续"})
+                _write_progress(steps)
             completed.add("video")
             _save_checkpoint(session, payload, completed)
 
@@ -2287,13 +2371,19 @@ def _parse_tabs_with_current(text):
 
 
 def _is_item_publish_url(url, item_id):
-    """是否指定商品的编辑页签；忽略站点加载后附加的 fr 等参数。"""
+    """是否指定商品的编辑页签；忽略站点加载后附加的 fr 等参数。
+
+    淘宝会把同一商品的 v2 编辑页落在 item.upload / item.manager 两个域名
+    （2026-10-01 远程日志：编辑页被归一到 item.manager.taobao.com），
+    两个主机名都要认，商品仍由 itemId 锚定。
+    """
     from urllib.parse import parse_qs, urlparse
     try:
         parsed = urlparse(str(url or ""))
     except ValueError:
         return False
-    if (parsed.hostname or "").lower() != "item.upload.taobao.com":
+    if (parsed.hostname or "").lower() not in ("item.upload.taobao.com",
+                                               "item.manager.taobao.com"):
         return False
     if not parsed.path.lower().endswith("/publish.htm"):
         return False
@@ -2424,7 +2514,7 @@ def _recover_existing_item(session, web, product, item_id):
         # 只靠关键词兜底会被误判为可重试错误，导致验证期间被反复尝试。
         raise RuntimeError("PAUSE:captcha:已有商品核验遇到安全验证；未修改或重新提交商品")
     url = urlparse(state.get("href") or "")
-    if (url.hostname != "item.upload.taobao.com"
+    if (url.hostname not in ("item.upload.taobao.com", "item.manager.taobao.com")
             or url.path != "/sell/v2/publish.htm"
             or parse_qs(url.query).get("itemId") != [item_id]):
         raise RuntimeError("PAUSE:未打开指定商品的服务器编辑页；禁止再次建品")
@@ -2507,12 +2597,22 @@ def _repair_existing_spec_images(session, web, product, item_id, confirm_submit,
         before, missing = _spec_column_state(session, product)
         if not missing:
             break
+        if not confirm_submit:
+            raise RuntimeError("PAUSE:已有商品缺少商品规格图；确认提交后可补图，不会重复建品")
         if ((product.get("flow_version") == SPEC_COLUMN_FLOW_VERSION
                 and product.get("flow_stage") == material_import.STAGE_SUBMIT_PENDING)
                 or product.get("spec_image_stage") == material_import.STAGE_SUBMIT_PENDING):
-            raise RuntimeError("PAUSE:上次规格图保存结果不明确；禁止自动重复提交")
-        if not confirm_submit:
-            raise RuntimeError("PAUSE:已有商品缺少商品规格图；确认提交后可补图，不会重复建品")
+            # 上次批次保存结果不明确（保存前落了 submit_pending 标记后被打断）。
+            # 编辑页刚从服务器重开，缺失行读数就是那次保存的核验结果：仍缺失
+            # 说明该批没有写入，已写入的行也不会再进批次；按当前服务器状态
+            # 继续补传不是“自动重复执行”。不清此标记条目会永远停在
+            # “已入库，待补图”（2026-10-01 远程日志：晨光云握手死锁根因）。
+            product["spec_image_stage"] = SPEC_STAGE_UPLOADING
+            if product.get("flow_stage") == material_import.STAGE_SUBMIT_PENDING:
+                product["flow_stage"] = material_import.STAGE_CREATED
+            steps.append({"step": "spec_images_resume", "pendingRows": len(missing),
+                          "note": "上次规格图保存结果经服务器核验未生效，按缺失行继续补传"})
+            _write_progress(steps)
         batch = missing[:batch_size] if batch_size else missing
         batch_index += 1
         steps.append({"step": "spec_images", "batch": batch_index, "rows": list(batch),

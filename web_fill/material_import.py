@@ -191,7 +191,9 @@ def item_id_from_result(result):
     if _ITEM_ID.fullmatch(value):
         return value
     url = urlparse(result.get("url", ""))
-    if url.hostname == "item.upload.taobao.com" and url.path.endswith("/success.htm"):
+    # 成功页与编辑页一样会落在 item.upload / item.manager 两个域名。
+    if (url.hostname in ("item.upload.taobao.com", "item.manager.taobao.com")
+            and url.path.endswith("/success.htm")):
         value = parse_qs(url.query).get("primaryId", [""])[0]
         if _ITEM_ID.fullmatch(value):
             return value
