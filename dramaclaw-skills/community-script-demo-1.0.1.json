@@ -1,0 +1,87 @@
+{
+  "schema_version": "dramaclaw.skill-bundle.v1",
+  "id": "community-script-demo",
+  "name": "社区短场景剧本示例",
+  "version": "1.0.1",
+  "description": "用于演示公网目录发现、安装和升级的声明式短场景写作方法。",
+  "author": "zmc1212",
+  "license": "MIT",
+  "min_dramaclaw_version": "1.0.0",
+  "tags": [
+    "demo",
+    "script",
+    "declarative"
+  ],
+  "legal": {
+    "copyright": "Copyright (c) 2026 zmc1212",
+    "license": {
+      "id": "MIT",
+      "text": "MIT License\n\nCopyright (c) 2026 zmc1212\n\nPermission is hereby granted, free of charge, to any person obtaining a copy\nof this software and associated documentation files (the \"Software\"), to deal\nin the Software without restriction, including without limitation the rights\nto use, copy, modify, merge, publish, distribute, sublicense, and/or sell\ncopies of the Software, and to permit persons to whom the Software is\nfurnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all\ncopies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\nIMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\nFITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE\nAUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\nLIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\nOUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\nSOFTWARE.\n"
+    },
+    "notice": "Original demonstration content. No local project data or media included."
+  },
+  "skill": {
+    "schema_version": "dramaclaw.workflow-skill.v1",
+    "id": "community-script-demo",
+    "version": "1.0.1",
+    "enabled": false,
+    "name": "社区短场景剧本示例",
+    "description": "依据本次提供的内容完成短场景剧本。",
+    "category": "creation",
+    "triggers": {
+      "keywords": [
+        "社区短场景示例"
+      ],
+      "node_scopes": [
+        "textGeneration"
+      ]
+    },
+    "input_parameters": [],
+    "allowed_recipe_ids": [
+      "community-script-demo-recipe"
+    ],
+    "planning": {
+      "planning_notes": "仅执行用户选择的剧本阶段。",
+      "prompt_guide": "依照用户本次明确要求创作。",
+      "conduct_rules": [
+        "保留明确事实，缺失设定标为待确认。"
+      ]
+    },
+    "evaluation": {
+      "rating_bands": [
+        {
+          "score": 1,
+          "description": "结构完整且保留明确事实。"
+        }
+      ],
+      "quality_threshold": 1,
+      "domain_constraints": [
+        "不得虚构用户已确认的事实。"
+      ]
+    }
+  },
+  "recipes": [
+    {
+      "schema_version": "dramaclaw.recipe.v1",
+      "id": "community-script-demo-recipe",
+      "version": "1.0.1",
+      "enabled": false,
+      "name": "社区短场景剧本",
+      "output_kind": "text",
+      "creation_stages": [
+        "script"
+      ],
+      "action_keys": [
+        "creation-script"
+      ],
+      "system_prompt": "仅依据用户提供的公开或获准使用的内容，完成一个可编辑的短场景剧本。直接输出【剧情设定】和【分场剧本】两节；写清场景、人物动作与对白。保留用户明确给定的事实，缺失信息标为待确认。每场明确写出入场状态与结束动作，便于检查前后连续性。",
+      "must_have_items": [
+        "【剧情设定】",
+        "【分场剧本】"
+      ],
+      "planning_prompt": "依据已提供的内容直接完成短场景剧本。",
+      "result_summary": "可编辑的短场景剧本。",
+      "requires_source_media": false
+    }
+  ]
+}
