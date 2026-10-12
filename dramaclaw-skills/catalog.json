@@ -1,0 +1,37 @@
+{
+  "schema_version": "dramaclaw.skill-index.v1",
+  "entries": [
+    {
+      "id": "community-script-demo",
+      "version": "1.0.0",
+      "name": "社区短场景剧本示例",
+      "description": "用于演示公网目录发现、安装和升级的声明式短场景写作方法。",
+      "author": "zmc1212",
+      "license": "MIT",
+      "tags": [
+        "demo",
+        "script",
+        "declarative"
+      ],
+      "category": "creation",
+      "bundle_url": "community-script-demo-1.0.0.json",
+      "sha256": "15efb2244f13d9aa12b06b4c7c2c4509147e0f7ff5d72d7a7270ccf23918df81"
+    },
+    {
+      "id": "community-script-demo",
+      "version": "1.0.1",
+      "name": "社区短场景剧本示例",
+      "description": "用于演示公网目录发现、安装和升级的声明式短场景写作方法。",
+      "author": "zmc1212",
+      "license": "MIT",
+      "tags": [
+        "demo",
+        "script",
+        "declarative"
+      ],
+      "category": "creation",
+      "bundle_url": "community-script-demo-1.0.1.json",
+      "sha256": "4ac646b05bd8b1c577ff3b34175af2d3aa5c1aa856bc20ed965ebd2cb9168537"
+    }
+  ]
+}
