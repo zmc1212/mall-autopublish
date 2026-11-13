@@ -63,10 +63,10 @@ export default function ConfirmDialog({
         </header>
         <div className="px-5 py-4 text-sm leading-6 text-slate-600">{children}</div>
         <footer className="flex justify-end gap-2 border-t border-border px-5 py-4">
-          <Button variant="secondary" onClick={onClose}>
+          <Button autoFocus={destructive} variant="secondary" onClick={onClose}>
             {cancelLabel}
           </Button>
-          <Button autoFocus variant={destructive ? "danger" : "primary"} onClick={onConfirm}>
+          <Button autoFocus={!destructive} variant={destructive ? "danger" : "primary"} onClick={onConfirm}>
             {confirmLabel}
           </Button>
         </footer>

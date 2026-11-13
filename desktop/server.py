@@ -10,14 +10,16 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictInt
 
-from . import license as license_module
+from . import code_watch, license as license_module
+from .image_preview import PreviewUnavailable, preview_cache_token, read_preview
 from . import paths
 from .jobs import MANAGER
 from .log_export import export_logs_zip
+from .updater import UPDATER, confirm_boot, download_url
 
 app = FastAPI(title="千牛自动上架", docs_url=None, redoc_url=None)
 app.add_middleware(
@@ -29,7 +31,7 @@ app.add_middleware(
 )
 
 # 未激活时业务接口全部 403：健康检查与激活相关接口保持开放。
-_LICENSE_EXEMPT_PREFIXES = ("/api/health", "/api/license")
+_LICENSE_EXEMPT_PREFIXES = ("/api/health", "/api/license", "/api/update/boot-ready")
 
 
 @app.middleware("http")
@@ -60,10 +62,19 @@ class TemplateIn(BaseModel):
     path: str
 
 
+class JobRowIn(BaseModel):
+    row: StrictInt = Field(ge=1)
+    product_id: str = Field(min_length=1)
+    pack_fingerprint: str | None = None
+
+
 class JobStartIn(BaseModel):
-    limit: int = Field(0, ge=0)
+    # None/省略沿用设置，显式 0 处理全部，不能使用 truthy 回退。
+    limit: StrictInt | None = Field(None, ge=0)
     force_new: bool = False
     retry_failed: bool = False
+    selected_rows: list[JobRowIn] | None = Field(None, min_length=1, max_length=10000)
+    workbook_path: str | None = None
 
 
 class WorkspaceIn(BaseModel):
@@ -95,6 +106,10 @@ class ItemClearIn(BaseModel):
     product_id: str = ""
 
 
+class ItemClearBatchIn(BaseModel):
+    rows: list[StrictInt] = Field(min_length=1)
+
+
 class SettingsIn(BaseModel):
     chrome_path: str | None = None
     chrome_profile: str | None = None
@@ -105,9 +120,11 @@ class SettingsIn(BaseModel):
     sku_image_strategy: str | None = None
     settings_version: int | None = None
     limit: int | None = Field(default=None, ge=0)
+    concurrency: StrictInt | None = Field(default=None, ge=1, le=8)
     spec_upload_batch_size: int | None = Field(default=None, ge=0, le=99)
     item_retry_limit: int | None = Field(default=None, ge=0, le=5)
     results_dir: str | None = None
+    update_feed_url: str | None = None
 
 
 def _fail(exc: Exception, code=400):
@@ -166,6 +183,9 @@ async def status():
         "chrome": chrome,
         "job": job,
         "workspace": workspace,
+        # 磁盘任务代码比进程内存新：开任务会被拦截，前端据此显示重启提示
+        "stale_code": {"files": code_watch.stale_code_files()},
+        "update": UPDATER.snapshot(),
         "settings": {
             "chrome_path": settings.chrome_path,
             "chrome_profile": settings.chrome_profile,
@@ -176,9 +196,11 @@ async def status():
             "sku_image_strategy": settings.sku_image_strategy,
             "settings_version": settings.settings_version,
             "limit": settings.limit,
+            "concurrency": settings.concurrency,
             "spec_upload_batch_size": settings.spec_upload_batch_size,
             "item_retry_limit": settings.item_retry_limit,
             "results_dir": settings.results_dir,
+            "update_feed_url": settings.update_feed_url,
         },
     }
     # 内容指纹：内容未变时前端跳过 setState，消除空闲时的整树重渲染
@@ -309,14 +331,20 @@ def put_settings(body: SettingsIn):
         current.settings_version = max(1, int(body.settings_version))
     if body.limit is not None:
         current.limit = body.limit
+    if body.concurrency is not None:
+        current.concurrency = body.concurrency
     if body.spec_upload_batch_size is not None:
         current.spec_upload_batch_size = body.spec_upload_batch_size
     if body.item_retry_limit is not None:
         current.item_retry_limit = body.item_retry_limit
     if body.results_dir is not None:
         current.results_dir = body.results_dir.strip()
+    if body.update_feed_url is not None:
+        try:
+            current.update_feed_url = download_url(body.update_feed_url) if body.update_feed_url.strip() else ""
+        except ValueError as exc:
+            _fail(exc)
     saved = paths.save_settings(current)
-    paths.apply_to_loaded_modules()
     applied: bool | None = None
     try:
         applied = MANAGER.apply_debug_browser(saved.debug_browser)
@@ -326,6 +354,67 @@ def put_settings(body: SettingsIn):
     # False 表示浏览器尚未连接：偏好已保存，下次启动浏览器时生效
     result["debug_browser_applied"] = applied
     return result
+
+
+@app.get("/api/update")
+def update_state():
+    return UPDATER.snapshot()
+
+
+@app.post("/api/update/check")
+def update_check():
+    try:
+        return UPDATER.check()
+    except Exception as exc:
+        _fail(exc)
+
+
+@app.post("/api/update/download")
+def update_download():
+    try:
+        return UPDATER.download()
+    except Exception as exc:
+        _fail(exc)
+
+
+@app.post("/api/update/import")
+def update_import(body: WorkbookIn):
+    try:
+        return UPDATER.import_package(body.path)
+    except Exception as exc:
+        _fail(exc)
+
+
+@app.post("/api/update/schedule")
+def update_schedule():
+    try:
+        return UPDATER.schedule()
+    except Exception as exc:
+        _fail(exc)
+
+
+@app.post("/api/update/restart")
+def update_restart():
+    try:
+        return UPDATER.restart_now()
+    except Exception as exc:
+        _fail(exc)
+
+
+@app.post("/api/update/cancel")
+def update_cancel():
+    try:
+        return UPDATER.cancel()
+    except Exception as exc:
+        _fail(exc)
+
+
+@app.post("/api/update/boot-ready")
+def update_boot_ready():
+    try:
+        return confirm_boot()
+    except Exception as exc:
+        _fail(exc)
 
 
 @app.get("/api/job")
@@ -339,13 +428,20 @@ def job_state():
 def job_start(body: JobStartIn):
     _require_activated()
     settings = paths.load_settings()
-    limit = int(body.limit or settings.limit or 0)
+    limit = int(settings.limit or 0) if body.limit is None else body.limit
     try:
+        scope = {}
+        if body.selected_rows is not None:
+            scope["selected_rows"] = [item.model_dump() for item in body.selected_rows]
+        if body.workbook_path is not None:
+            scope["workbook_path"] = body.workbook_path
         return MANAGER.start_job(
             confirm_submit=True,
             limit=limit,
+            concurrency=int(getattr(settings, "concurrency", 2)),
             force_new=bool(body.force_new),
             retry_failed=bool(body.retry_failed),
+            **scope,
         )
     except Exception as exc:
         _fail(exc)
@@ -381,10 +477,42 @@ def item_open(body: ItemOpenIn):
         _fail(exc)
 
 
+@app.get("/api/item/preview")
+def item_preview(row: int, product_id: str = "", v: str = ""):
+    """只读返回当前清单商品的图片包主图，v 仅用于浏览器缓存失效。"""
+    _require_activated()
+    product = MANAGER.preview_product(row, product_id)
+    if product is None:
+        raise HTTPException(status_code=404, detail="商品不存在或已从当前清单移除")
+    expected_version = preview_cache_token(product, product.get("pack_fingerprint"))
+    if v and v != expected_version:
+        raise HTTPException(status_code=409, detail="商品预览已更新，请刷新列表后重试")
+    try:
+        payload = read_preview(product, product.get("pack_fingerprint"))
+    except PreviewUnavailable as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return Response(
+        content=payload.data,
+        media_type=payload.media_type,
+        headers={
+            "Cache-Control": "private, max-age=300",
+            "Content-Disposition": "inline",
+        },
+    )
+
+
 @app.post("/api/item/clear")
 def item_clear(body: ItemClearIn):
     try:
         return MANAGER.clear_row_state(body.row, body.product_id)
+    except Exception as exc:
+        _fail(exc)
+
+
+@app.post("/api/item/clear-batch")
+def item_clear_batch(body: ItemClearBatchIn):
+    try:
+        return MANAGER.clear_rows_state(body.rows)
     except Exception as exc:
         _fail(exc)
 

@@ -6,6 +6,30 @@
 
 日常只改程序代码、前端或模板时，双击 `一键增量打包.bat`，生成 `dist/千牛自动上架-Update.exe`。更新包不含 Chromium、WebView2、Node.js 和 Playwright 运行时，只能安装到已有完整版本的目录；更新器会优先从卸载注册表自动识别已安装目录并直接更新，识别不到时才显示目录选择页。更新器会在开始替换文件前关闭千牛进程树，并在需要时请求管理员权限；如果 Qt DLL 仍被系统进程占用，会登记为重启替换，按提示重启后完成更新。首次安装或升级这些运行时时，仍使用完整安装包。
 
+全量和增量打包共用 `desktop/runtime-baseline.json` 固定运行环境，目前与已安装的 `1.2.0` 客户端一致（Node.js `v24.9.0`、Playwright `1.62.1`、Chromium `151.0.7922.34` / revision `1234`、WebView2 `154.0.4258.37`）。首次准备会从已有构建缓存/完整程序目录中寻找匹配版本，WebView2 只查找系统中该精确版本目录，然后独立复制到 `.work/desktop-runtime-pinned`，记录文件 SHA-256。后续每次打包校验并复用此缓存，不跟随系统自动升级，`-Clean` 也保留它。缺失、不匹配或损坏时在前端构建和删除旧产物之前停止，不会自动下载或改用最新版。
+
+新打包电脑可运行 `一键增量打包.bat -RuntimeSource "D:\千牛自动上架"`，从版本匹配的完整安装目录初始化缓存；已有缓存会优先校验并复用。也可单独运行 `python tools/pin_desktop_runtime.py --source "D:\千牛自动上架"` 准备缓存，不生成安装包。请备份固定缓存；发现损坏时先将旧缓存移走，再从可信完整目录恢复。旧的 `QIANNIU_NODE`、`QIANNIU_BROWSER_DIR` 和 `QIANNIU_WEBVIEW2_DIR` 不再决定打包内置运行时版本。将来确需升级运行时，应显式修改基准、另存旧缓存并重新准备匹配环境，发布完整安装包供旧客户端迁移；不能沿用旧客户端的增量更新通道直接切换环境。直接生成更新 ZIP 的工具同样会检查固定基准，拒绝覆盖发布文件。
+
+支持程序内更新的版本可在「设置与排障 → 程序更新」配置 HTTPS `latest.json` 地址（例如 Cloudflare R2），也可直接导入本地更新 ZIP。检查、下载和校验不会修改运行中的程序；点击「任务结束后重启更新」后，软件会等待当前任务线程完成结果保存和清理，阻止开启新任务，再自动退出并更新。等待期间可取消自动重启。登录态、激活信息、设置及结果继续保存在原 AppData / 用户配置目录，更新只替换程序文件。
+
+独立更新进程从 AppData 的临时副本运行，备份旧程序后再替换文件；新版本的 React 界面正常加载并确认版本才视为成功。替换失败或 90 秒内无法正常加载界面时，自动恢复旧程序并重启；回滚遇到磁盘或权限错误时保留备份并报告路径，备份位于 `%APPDATA%\千牛自动上架\updates\<事务编号>\backup`。程序安装目录需要有写入权限；源码开发模式可检查、导入和校验，禁止自动覆盖源码。运行环境版本不兼容时使用完整安装包。
+
+手动执行增量打包还会生成使用 LZMA 压缩的 `dist/updates/QianniuApp-<版本>.zip`（完整应用更新包，不含浏览器运行时）和 `dist/updates/latest.json`。输出目录中存在运行环境兼容的旧版完整 ZIP 时，自动以最近的旧版本为基线，另外生成只包含新增或变化文件的 `QianniuApp-<新版>-from-<旧版>.delta.zip`；差量包不比完整包小时只发布完整包。保留旧版完整 ZIP，供下次构建计算差量。将所有被 `latest.json` 引用的 ZIP 放在同一下载目录，先上传 ZIP，最后覆盖 `latest.json`。每次构建会生成带 UTC 时间戳的版本号。也可使用 `python tools/build_inapp_update.py --app-dir dist/千牛自动上架 --output dist/updates --notes "本次更新说明"` 从已验证的构建目录生成更新文件；`--base-package <旧版完整ZIP>` 指定基线，`--no-delta` 仅生成完整包。不会自动上传或发布，日常开发不自动打包。
+
+新客户端优先下载与当前版本匹配的差量包，按 SHA-256 校验旧版文件并在暂存目录补齐未变化文件，处理旧文件删除，再交给原有备份、替换和启动失败回滚流程。基线不匹配、差量包缺失或损坏时自动改用完整应用更新包；明确的 HTTP 401/403 访问拒绝会停止并保留错误。跨版本或没有差量时直接使用完整包。`latest.json` 的主地址始终指向完整包，旧客户端忽略可选差量列表，首次升级仍可使用完整包。手动导入差量 ZIP 时必须匹配本机基线；不匹配时提示改用完整 ZIP。
+
+双击根目录 `一键部署更新下载地址.bat` 可部署 Cloudflare Workers 免费下载地址。脚本复用 Wrangler 已有登录；首次缺少授权时打开默认浏览器授权，不需要手动复制 API Key。没有更新 ZIP 时只初始化下载服务，`latest.json` 返回尚未发布的 `0.0.0`；以后手动完成增量打包，再双击同一脚本即可校验并发布新版。脚本只上传 `dist/updates/latest.json` 引用的完整及差量 ZIP，不触发打包、不上传源码或整个工作空间。
+
+下载服务使用 Workers 自带静态存储，每块 24 MiB，客户端下载时仍获得完整 ZIP 并按原 SHA-256 校验。单个更新包限制 960 MiB；保留历史发布缓存以支持已经检查过旧版本的客户端。无需开通 R2 或购买域名，仍受 Workers 免费计划的请求数限制。部署成功后，地址自动写入本机设置，并通过 `.work/cloudflare-updates/deployment.json` 在后续构建时预置；旧客户端首次升级无需再手填地址。显式清空更新地址可以关闭自动检查。不要删除 `.work/cloudflare-updates/assets` 发布缓存。
+
+可选命令：`python tools/deploy_cf_updates.py --setup-only` 只部署/验证服务并保留已发布版本；`--account-id <账户 ID>` 选择多账户中的目标账户；`--no-configure-client` 不修改本机程序设置。脚本需要本机 Python 和带 npm 的 Node.js，Wrangler 固定使用已验证版本并由 npx 自动下载。
+
+本项目更新地址为 `https://updates.gaoronghai.online/latest.json`。首次绑定自有域名可执行 `python tools/deploy_cf_updates.py --domain updates.gaoronghai.online --setup-only`；脚本检查 DNS / Worker 冲突后绑定独立子域名，并保存域名，之后双击部署脚本会继续使用同一地址。域名必须已在当前 Cloudflare 账户托管，脚本拒绝覆盖冲突 DNS 或其他 Worker 的绑定。
+
+部署验收和程序更新共用 `QianniuUpdater` 请求入口，使用程序自己的客户端标识并检查 HTTPS 重定向，避免默认 Python 请求与真实程序行为不一致。每次部署还会通过同一分块下载代码下载 64 KiB 固定测试数据并校验大小与 SHA-256；测试文件不会作为程序更新发布，因此没有新版 ZIP 时也可验证下载链路。
+
+只有公开地址验证通过才写入本机设置或预置到后续构建。若 Cloudflare 返回 `401 / 403 / 429`，脚本立即停止公开验收，保留已创建的云端服务、发布缓存和 `.work/cloudflare-updates/verification-error.json` 错误证据；需先在 Cloudflare 侧解决访问限制，再重试同一脚本。
+
 当前版本完成了 Excel 模板、字段说明、本地校验，以及基于已登录 Chrome 的网页填写。默认 dry-run，不会点击“提交宝贝信息”。
 
 ## 入库与 SKU 图片（正式入口）

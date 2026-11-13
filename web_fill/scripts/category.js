@@ -81,7 +81,9 @@ async page => {
   }
 
   async function brandCombos() {
-    return page.getByRole("combobox", { name: /^请输入$/ });
+    // During form transitions an accessible control may still have no rendered
+    // area. Restrict both the primary and fallback queries to visible inputs.
+    return page.locator('input[role="combobox"][placeholder="请输入"]:visible');
   }
 
   async function waitBrandCombo(tries) {
@@ -92,13 +94,13 @@ async page => {
       }
       const combos = await brandCombos();
       if (await combos.count()) return combos;
-      const plain = page.locator('input[placeholder="请输入"][role="combobox"], input[placeholder="请输入"], input[placeholder*="品牌"]');
+      const plain = page.locator('input[placeholder="请输入"][role="combobox"]:visible, input[placeholder="请输入"]:visible, input[placeholder*="品牌"]:visible');
       if (await plain.count()) return plain;
       const next = page.getByRole("button", { name: "确认，下一步" });
       if (await next.count() && !(await next.isDisabled())) return page.locator(".qianniu-no-brand-combo");
       await sleep(350);
     }
-    return page.locator('input[placeholder="请输入"][role="combobox"], input[placeholder="请输入"], input[placeholder*="品牌"]');
+    return page.locator('input[placeholder="请输入"][role="combobox"]:visible, input[placeholder="请输入"]:visible, input[placeholder*="品牌"]:visible');
   }
 
   async function pickBrandOption(want, input) {
@@ -148,7 +150,12 @@ async page => {
     const attempts = [];
     for (let attempt = 0; attempt < 2; attempt++) {
       for (const query of queries) {
-        await combo.click({ timeout: 5000 });
+        // Wait for the active form control to finish mounting/scrolling.  Do
+        // not force-click here: a security or verification overlay must still
+        // stop the flow and leave the page for review.
+        await combo.waitFor({ state: "visible", timeout: 8000 });
+        await combo.scrollIntoViewIfNeeded({ timeout: 8000 });
+        await combo.click({ timeout: 8000 });
         await sleep(200);
         const customInputs = page.locator('.next-overlay-wrapper .options-search input:not([readonly]):visible');
         const popupInputs = page.locator('.next-overlay-wrapper input:not([readonly]):not([type="checkbox"]):not([type="radio"]):visible, [role="listbox"] input:not([readonly]):visible');
@@ -236,6 +243,93 @@ async page => {
       modelHow = "skip-count-" + count;
     }
     await sleep(400);
+  }
+
+  // 类目页属性面板的必填属性（如潮玩盲盒的品牌/IP/系列名）由模板驱动：
+  // 按 label 文本关联面板输入框。品牌/型号上方已处理；搜索选择型（IP 库）
+  // 输入后点选精确选项，可自填型（系列名）输入即生效；面板没有的属性
+  // （如出售状态）留给发布页 attributes.js 处理。系列名等输入框在上一项
+  // 填好后才渲染，逐轮重查；React 重渲染会丢自定义属性，故用坐标点击 +
+  // 真实键盘输入，不依赖 DOM 标记。
+  const panelLog = [];
+  for (const [label, raw] of Object.entries(PAYLOAD.attributes || {})) {
+    if (["品牌", "型号"].includes(label)) continue;
+    const value = String(Array.isArray(raw) ? (raw[0] || "") : raw || "").trim();
+    if (!value) continue;
+    let stuck = false;
+    for (let attempt = 0; attempt < 2 && !stuck; attempt++) {
+      const hit = await page.evaluate((lab) => {
+        const norm = (el) => (el.innerText || '').replace(/\s+/g, '');
+        const locate = (input) => {
+          input.scrollIntoView({ block: 'center' });
+          const rect = input.getBoundingClientRect();
+          return { x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2) };
+        };
+        const combos = [...document.querySelectorAll('input[role=combobox], [role=combobox] input')]
+          .filter((el) => {
+            const rect = el.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0 && !el.closest('.next-overlay-wrapper');
+          });
+        for (const input of combos) {
+          // 面板属性 item 容器（类目页 sell-catProp-*）的文本以 label 开头；
+          // 属于其他 label 的框直接跳过，避免爬深层祖先后误配。
+          const item = input.closest('.sell-catProp-item-common, .sell-component-item-prop-item, .next-form-item');
+          if (item) {
+            const t = norm(item);
+            if (t.startsWith(lab) && t.length < 120) return locate(input);
+            continue;
+          }
+          let root = input;
+          for (let k = 0; k < 8 && root; k++) {
+            root = root.parentElement;
+            const t = root ? norm(root) : '';
+            if (t.startsWith(lab) && t.length < 120) return locate(input);
+          }
+        }
+        return null;
+      }, label);
+      if (!hit) { panelLog.push(label + "=NO_MATCH"); break; }
+      await page.mouse.click(hit.x, hit.y).catch(() => {});
+      await sleep(300);
+      await page.keyboard.insertText(value).catch(() => {});
+      await sleep(1400);
+      await page.evaluate((val) => {
+        const opts = [...document.querySelectorAll('.options-item, [role=option], .next-menu-item')]
+          .filter((el) => {
+            const t = (el.innerText || '').trim();
+            const rect = el.getBoundingClientRect();
+            return t === val && rect.width > 0;
+          });
+        if (opts.length) opts[0].click();
+      }, value).catch(() => {});
+      await sleep(500);
+      const got = await page.evaluate((lab) => {
+        const norm = (el) => (el.innerText || '').replace(/\s+/g, '');
+        const combos = [...document.querySelectorAll('input[role=combobox], [role=combobox] input')]
+          .filter((el) => {
+            const rect = el.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0 && !el.closest('.next-overlay-wrapper');
+          });
+        for (const input of combos) {
+          const item = input.closest('.sell-catProp-item-common, .sell-component-item-prop-item, .next-form-item');
+          if (item) {
+            const t = norm(item);
+            if (t.startsWith(lab) && t.length < 120) return input.value.trim();
+            continue;
+          }
+          let root = input;
+          for (let k = 0; k < 8 && root; k++) {
+            root = root.parentElement;
+            const t = root ? norm(root) : '';
+            if (t.startsWith(lab) && t.length < 120) return input.value.trim();
+          }
+        }
+        return "";
+      }, label).catch(() => "");
+      if (got === value) stuck = true;
+      else panelLog.push(label + "=lost:" + String(got).slice(0, 20));
+    }
+    if (stuck) panelLog.push(label + "=stuck");
   }
 
   const next = page.getByRole("button", { name: "确认，下一步" });

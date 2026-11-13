@@ -8,6 +8,10 @@ async page => {
   await sleep(250);
   const specs = PAYLOAD.skus || [];
   if (!specs.length) return JSON.stringify({ skipped: true });
+  // 规格维度名按类目取：中性笔=商品规格，潮玩盲盒=款式描述。内联模式
+  // （发布页无“编辑规格”抽屉）用它定位销售属性区的维度容器。
+  const specName = String(PAYLOAD.spec_name || "").trim();
+  let INLINE = false;
 
   async function openDrawer() {
     if (await page.locator(".sku-decouple-drawer").count()) return "already";
@@ -23,6 +27,42 @@ async page => {
     });
     await sleep(800);
     return opened;
+  }
+
+  // 内联模式探测：潮玩盲盒等类目把规格值直接内联在销售属性区
+  // （.props-label 为“款式描述(N)”的维度容器，规格名输入框无统一
+  // placeholder），找不到抽屉按钮时按 spec_name 定位容器并打标记。
+  async function probeInline() {
+    const probe = await page.evaluate((name) => {
+      if (!name) return { ok: false, why: "no-spec-name" };
+      const label = [...document.querySelectorAll(".props-label")]
+        .find((el) => ((el.innerText || "").replace(/\s+/g, "")).startsWith(name));
+      if (!label) return { ok: false, why: "no-label" };
+      const wrap = label.closest(".common-wrap") || label.parentElement;
+      if (!wrap) return { ok: false, why: "no-wrap" };
+      const inputs = [...wrap.querySelectorAll("input")].filter((el) => {
+        const st = getComputedStyle(el);
+        return !el.disabled && el.type !== "checkbox" && el.type !== "radio"
+          && st.display !== "none" && st.visibility !== "hidden";
+      });
+      if (!inputs.length) return { ok: false, why: "no-input" };
+      wrap.setAttribute("data-sku-inline", "1");
+      return { ok: true };
+    }, specName);
+    if (probe.ok) INLINE = true;
+    return probe;
+  }
+
+  // 标记会被 React 重渲染丢失：state 前若发现标记缺失则重新定位。
+  async function ensureInlineMark() {
+    if (!INLINE) return;
+    await page.evaluate((name) => {
+      if (document.querySelector('[data-sku-inline="1"]')) return;
+      const label = [...document.querySelectorAll(".props-label")]
+        .find((el) => ((el.innerText || "").replace(/\s+/g, "")).startsWith(name));
+      const wrap = label && (label.closest(".common-wrap") || label.parentElement);
+      if (wrap) wrap.setAttribute("data-sku-inline", "1");
+    }, specName);
   }
 
   async function switchSpecTab() {
@@ -43,34 +83,48 @@ async page => {
   }
 
   const opened = await openDrawer();
-  if (opened === "NO") throw new Error("PAUSE:未找到编辑规格/创建规格");
-  let switched = await switchSpecTab();
-  await sleep(400);
-  if (switched === "NO_DRAWER" || (switched && switched.inputs === 0) || /书写粗细/.test((switched && switched.label) || "")) {
-    await sleep(500);
-    switched = await switchSpecTab();
-    await sleep(400);
+  if (opened === "NO") {
+    const probe = await probeInline();
+    if (!probe.ok) throw new Error("PAUSE:未找到编辑规格/创建规格");
   }
-  if (switched === "NO_DRAWER") throw new Error("PAUSE:规格抽屉未打开");
-  if (/书写粗细/.test((switched && switched.label) || "")) {
-    throw new Error("PAUSE:规格面板停在书写粗细，请改到商品规格后再试");
+  if (!INLINE) {
+    let switched = await switchSpecTab();
+    await sleep(400);
+    if (switched === "NO_DRAWER" || (switched && switched.inputs === 0) || /书写粗细/.test((switched && switched.label) || "")) {
+      await sleep(500);
+      switched = await switchSpecTab();
+      await sleep(400);
+    }
+    if (switched === "NO_DRAWER") throw new Error("PAUSE:规格抽屉未打开");
+    if (/书写粗细/.test((switched && switched.label) || "")) {
+      throw new Error("PAUSE:规格面板停在书写粗细，请改到商品规格后再试");
+    }
   }
 
   async function state() {
-    return page.evaluate(() => {
-      const drawerEl = document.querySelector(".sku-decouple-drawer");
-      if (!drawerEl) return { open: false, names: [], addDisabled: true, emptyLast: false, count: "" };
-      const names = [...drawerEl.querySelectorAll('input[placeholder="输入规格"]')].map((el) => el.value);
-      const add = drawerEl.querySelector("button.add");
+    await ensureInlineMark();
+    return page.evaluate((inline) => {
+      const scope = inline
+        ? document.querySelector('[data-sku-inline="1"]')
+        : document.querySelector(".sku-decouple-drawer");
+      if (!scope) return { open: false, names: [], addDisabled: true, emptyLast: false, count: "", inputs: 0 };
+      const names = inline
+        ? [...scope.querySelectorAll("input")].filter((el) => {
+            const st = getComputedStyle(el);
+            return !el.disabled && el.type !== "checkbox" && el.type !== "radio"
+              && st.display !== "none" && st.visibility !== "hidden";
+          }).map((el) => el.value)
+        : [...scope.querySelectorAll('input[placeholder="输入规格"]')].map((el) => el.value);
+      const add = scope.querySelector("button.add");
       return {
         open: true,
         names,
         addDisabled: !!(add && add.disabled),
         emptyLast: names.length > 0 && !String(names[names.length - 1] || "").trim(),
-        count: (drawerEl.querySelector(".props-label") && drawerEl.querySelector(".props-label").innerText) || "",
+        count: (scope.querySelector(".props-label") && scope.querySelector(".props-label").innerText) || "",
         inputs: names.length,
       };
-    });
+    }, INLINE);
   }
 
   async function commitRow(want) {
@@ -101,7 +155,9 @@ async page => {
   }
 
   async function typeSpecName(name) {
-    const box = page.locator('.sku-decouple-drawer input[placeholder="输入规格"]').last();
+    const box = page.locator(INLINE
+      ? '[data-sku-inline="1"] input'
+      : '.sku-decouple-drawer input[placeholder="输入规格"]').last();
     if (!(await box.count())) return { ok: false, how: "NO_INPUT", actual: "" };
     await box.click({ force: true, timeout: 2500 }).catch(() => {});
     const want = String(name);
@@ -143,15 +199,17 @@ async page => {
           added = "empty-row";
           break;
         }
-        added = await page.evaluate(() => {
-          const drawerEl = document.querySelector(".sku-decouple-drawer");
+        added = await page.evaluate((inline) => {
+          const drawerEl = inline
+            ? document.querySelector('[data-sku-inline="1"]')
+            : document.querySelector(".sku-decouple-drawer");
           if (!drawerEl) return "no-drawer";
           const btn = drawerEl.querySelector("button.add");
           if (!btn) return "no-btn";
           if (btn.disabled) return "disabled";
           btn.click();
           return "clicked";
-        });
+        }, INLINE);
         if (added === "clicked") break;
         if (added === "no-drawer" || added === "no-btn") break;
         await sleep(350);
@@ -204,29 +262,13 @@ async page => {
   }
   await sleep(400);
 
-  const tableInputs = page.locator("table input");
-  const count = await tableInputs.count();
-  const filled = [];
-  for (let i = 0; i < count; i++) {
-    const meta = await tableInputs.nth(i).evaluate((el) => ({
-      val: el.value,
-      disabled: el.disabled,
-      type: el.type,
-      cell: (el.closest("td") && el.closest("td").innerText) || "",
-      row: (el.closest("tr") && el.closest("tr").innerText) || "",
-    }));
-    if (meta.disabled || meta.type === "checkbox" || meta.type === "radio") continue;
-    const sku = specs.find((item) => meta.row.includes(item.name)) || null;
-    const price = sku ? String(sku.price) : String((specs[0] && specs[0].price) || "");
-    const stock = sku ? String(sku.stock) : String((specs[0] && specs[0].stock) || "");
-    if (/元/.test(meta.cell) && price) {
-      await tableInputs.nth(i).fill(price);
-      filled.push({ i, as: "price", name: sku && sku.name });
-    }
-    if (/件/.test(meta.cell) && stock) {
-      await tableInputs.nth(i).fill(stock);
-      filled.push({ i, as: "qty", name: sku && sku.name });
-    }
+  // 填写、失焦提交、表格重建后的回读统一使用同一套规格定位。
+  const unresolved = await verifySkuTableValues(page, specs);
+  if (unresolved.length) {
+    throw new Error("PAUSE:规格表价格或库存与输入不一致（"
+      + unresolved.map((item) => item.name + ": " + (item.got || "空") + "≠" + item.want
+        + (item.reason || item.error ? " [" + (item.reason || item.error) + "]" : "")).join("；")
+      + "），未继续提交");
   }
 
   async function fillRowSelects(kind, value) {
@@ -278,7 +320,12 @@ async page => {
   const thickness = PAYLOAD.thickness || "0.05mm";
   const catLog = await fillRowSelects("sku_category", skuCategory);
   // 模板导入补值时厚度列刻意留空（skip_thickness），不能用默认值污染。
-  const thickLog = PAYLOAD.skip_thickness ? [] : await fillRowSelects("thickness", thickness);
+  // 其他类目（潮玩盲盒等）表格没有书写粗细列，同样不能按默认值乱填。
+  const hasThicknessCol = await page.evaluate(() => {
+    const header = [...document.querySelectorAll("table th, table thead td")].map((el) => (el.innerText || "").trim());
+    return header.some((t) => t.includes("书写粗细"));
+  });
+  const thickLog = (PAYLOAD.skip_thickness || !hasThicknessCol) ? [] : await fillRowSelects("thickness", thickness);
 
   const after = await page.evaluate(() => {
     const t = document.body.innerText || "";
@@ -292,5 +339,5 @@ async page => {
       }),
     };
   });
-  return JSON.stringify({ opened, confirm, log, filled: filled.length, catLog, thickLog, after }, null, 2);
+  return JSON.stringify({ opened, confirm, log, filled: specs.length * 2, catLog, thickLog, after }, null, 2);
 }

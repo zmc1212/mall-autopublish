@@ -8,27 +8,39 @@ import math
 import os
 import random
 import re
+import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
 from . import sku_import
+from .runtime import CheckpointError, current_runtime
 
 ROOT = Path(__file__).resolve().parent.parent
 CATEGORY_ENTRY = "https://item.upload.taobao.com/sell/ai/category.htm"
 
 
 def get_scripts():
+    runtime = current_runtime()
+    if runtime is not None:
+        return runtime.scripts_dir
     raw = os.environ.get("QIANNIU_SCRIPTS_DIR")
     return Path(raw) if raw else Path(__file__).resolve().parent / "scripts"
 
 
 def get_output():
+    runtime = current_runtime()
+    if runtime is not None:
+        return runtime.output_dir
     raw = os.environ.get("QIANNIU_OUTPUT_DIR")
     return Path(raw) if raw else ROOT / "output" / "playwright"
 
 
 def get_logs_dir():
+    runtime = current_runtime()
+    if runtime is not None:
+        return runtime.logs_dir
     # 与 desktop.paths.logs_dir() 同目录（QIANNIU_APPDATA/logs），日志导出按
     # 目录整体打包，这里写的文件会自动进导出包；web_fill 不反向依赖 desktop。
     raw = os.environ.get("QIANNIU_APPDATA")
@@ -46,8 +58,11 @@ def _flow_log(message, level="info"):
         directory = get_logs_dir()
         directory.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        runtime = current_runtime()
+        identity = (f"[槽 {runtime.worker_id}][商品 {runtime.product_id or runtime.row}] "
+                    if runtime is not None else "")
         with (directory / "web_fill.log").open("a", encoding="utf-8") as stream:
-            stream.write(f"{stamp} [{level}] {message}\n")
+            stream.write(f"{stamp} [{level}] {identity}{message}\n")
     except OSError:
         pass
 
@@ -111,6 +126,9 @@ def _load_web():
 
 
 def _prune_tabs(web=None, **kwargs):
+    # A worker must never close another item's live or quarantined pages.
+    if current_runtime() is not None:
+        return None
     web = web or _load_web()
     fn = getattr(web, "prune_automation_tabs", None)
     if not callable(fn):
@@ -135,6 +153,7 @@ def product_to_payload(product):
         skus.append({
             "slot": str(item.get("slot") or "").strip(),
             "name": name,
+            "specs": item.get("规格") or item.get("specs") or {},
             "image": _abs(image),
             "file": Path(image).name if image else "",
             "price": item.get("price", item.get("价格")),
@@ -153,7 +172,7 @@ def product_to_payload(product):
     attrs = dict(product.get("attributes") or {})
     if not str(attrs.get("IP联名") or "").strip() and "火影" in str(product.get("title") or ""):
         attrs["IP联名"] = "火影忍者"
-    return {
+    payload = {
         "title": str(product.get("title") or "").strip(),
         "guide_title": str(product.get("guide_title") or "").strip(),
         "brand": str(product.get("brand") or "").strip(),
@@ -174,6 +193,11 @@ def product_to_payload(product):
         "detail_images": details,
         "main_video": _abs(product.get("main_video")),
     }
+    # Explicit clears must not adopt a parked browser page or its checkpoint
+    # from the previous execution. Keep legacy payload hashes unchanged.
+    if product.get("execution_reset_id"):
+        payload["execution_reset_id"] = str(product["execution_reset_id"])
+    return payload
 
 
 def render_script(name, payload):
@@ -213,6 +237,21 @@ def _looks_like_filechooser(text):
     return "File chooser" in str(text or "") or "does not handle the modal" in str(text or "")
 
 
+def _is_transient_frame_error(exc):
+    """素材库 iframe 正被页面重建时，持旧引用 evaluate 会抛瞬时错误。
+
+    只认 iframe 局部销毁类错误；浏览器/页面级关闭（SessionLost 场景）不在此列，
+    交由上层恢复流程处理。
+    """
+    text = str(exc or "")
+    if _is_user_pause(exc) or _looks_like_filechooser(text):
+        return False
+    return any(marker in text for marker in (
+        "Frame was detached",
+        "Execution context was destroyed",
+    ))
+
+
 def _is_user_pause(exc):
     text = str(exc or "")
     if _looks_like_filechooser(text):
@@ -241,10 +280,38 @@ def _save_upload_security_diagnostic(text, name):
 def run_script(session, name, payload, timeout=120):
     if name != "checkpoint.js":
         _check_cancel(session)
+        # 最小化/SW_HIDE 的窗口里点击必超时（rAF 暂停），先确保自动化窗口
+        # 处于可作业状态；"移出屏幕但保持可见"的隐藏窗口渲染正常，不会触发
+        # 还原。页签级前台化由脚本内的 ensureFront 负责（进程内零开销）。
+        # 窗口检查是纯 Win32 查询，正常时几乎无成本。
+        try:
+            _ensure_automation_front()
+        except Exception:
+            pass
+    runtime = current_runtime()
+    if runtime is not None:
+        runtime.progress(Path(name).stem)
+        if name == "submit.js" and runtime.checkpoint:
+            runtime.checkpoint()
+        elif (name in {"main_images.js", "details.js", "spec_images.js", "spec_row_images.js",
+                       "upload_files.js", "main_video.js", "sku_import.js", "material_import.js"}
+              and payload.get("phase") not in {"verify", "audit", "slot_count", "status", "probe", "preview", "baseline", "cell"}):
+            # Some upload scripts dispatch setInputFiles during their open
+            # phase. Record intent before entering JavaScript/file chooser;
+            # the existing flow then reads server state on resume.
+            intent = {
+                "script": name, "phase": payload.get("phase") or "execute",
+                "recorded_at": time.time(),
+            }
+            checkpoint = dict(runtime.latest_item.get("resume_checkpoint") or {})
+            checkpoint["media_pending"] = intent
+            runtime.save_checkpoint({"last_browser_write": intent, "resume_checkpoint": checkpoint})
     path = render_script(name, payload)
     try:
         out = session.cmd("run-code", f"--filename={path}", raw=False, timeout=timeout)
-    except RuntimeError as exc:
+    except (RuntimeError, subprocess.TimeoutExpired) as exc:
+        # TimeoutExpired 也要落诊断：verify 整段被冻结页面烧穿时，raw.txt 是
+        # 判断"页签在后台"还是"页面异常"的唯一现场（2026-10-03 必现事故）。
         text = str(exc)
         out = get_output()
         raw_path = out / f"web_fill_{Path(name).stem}.raw.txt"
@@ -272,6 +339,13 @@ def run_script(session, name, payload, timeout=120):
     )
     if isinstance(result, dict) and result.get("error") and str(result["error"]).startswith("PAUSE"):
         raise RuntimeError(result["error"])
+    if runtime is not None and isinstance(result, dict):
+        checkpoint = dict(runtime.latest_item.get("resume_checkpoint") or {})
+        intent = checkpoint.get("media_pending") or {}
+        if (intent.get("script") == name and not result.get("dispatchUncertain")
+                and not (result.get("warning") and _upload_dispatched(result))):
+            checkpoint.pop("media_pending", None)
+            runtime.save_checkpoint({"resume_checkpoint": checkpoint})
     return result
 
 
@@ -298,6 +372,36 @@ def _is_reusable_publish(url, web):
     return "itemid=" not in low and "edit.htm" not in low and "item_num_id=" not in low
 
 
+def _publish_page_has_leaf(session, payload):
+    """残留发布页的类目是否与当前商品一致。
+
+    发布页正文可能带"发布历史/推荐类目"等其他类目名（含本商品未曾选过的
+    类目），全文包含会误判。只认两类强信号：
+    1. URL 的 catId 与商品 category_id 精确相等（模板登记过类目 ID 时）；
+    2. 正文里"叶子类目名 + 类目路径分隔符"同行的面包屑行。
+    读不到页面文本时视为一致，不阻塞原流程；probe/conflict 兜底仍在后面。
+    """
+    leaf = str((payload or {}).get("leaf") or "").strip()
+    if not leaf:
+        return True
+    category_id = str((payload or {}).get("category_id") or "").strip()
+    try:
+        href = (session.href() or "").strip()
+        text = session.body_text(8000)
+    except Exception:
+        return True
+    if category_id:
+        match = re.search(r"catId=(\d+)", str(href))
+        if match:
+            return match.group(1) == category_id
+    normalized = str(text or "").splitlines()
+    for line in normalized:
+        clean = re.sub(r"\s+", "", line)
+        if leaf in clean and (">>" in clean or ">" in clean):
+            return True
+    return False
+
+
 def _select_reusable_publish(session, web):
     try:
         listed = parse_tabs(session.tab_list())
@@ -311,6 +415,8 @@ def _select_reusable_publish(session, web):
         session.tab_select(index)
         time.sleep(0.4)
     except Exception:
+        if getattr(session, "isolated", False):
+            raise  # A cached URL cannot replace a failed ownership check.
         return url
     current = (session.href() or url or "").strip()
     if _is_reusable_publish(current, web):
@@ -330,6 +436,13 @@ def ensure_fill_tab(session, web=None, force_new=False):
     href = (session.href() or "").strip()
     if _is_reusable_publish(href, web):
         return href, "reuse-publish"
+    # ``begin_item`` creates one seller-home lease for a new item.  There is
+    # no resumable publish/category page to discover in that case, so opening
+    # the category page directly avoids a full owned-tab scan before every
+    # worker's first fill.
+    if (getattr(session, "isolated", False)
+            and not getattr(session, "item_had_existing_pages", True)):
+        return ensure_new_category_tab(session, web), "new-category"
     found = _select_reusable_publish(session, web)
     if found:
         return found, "reuse-publish"
@@ -337,18 +450,35 @@ def ensure_fill_tab(session, web=None, force_new=False):
     if _is_category_url(href):
         web.assert_logged_in(href)
         return href, "reuse-category"
-    try:
-        listed = parse_tabs(session.tab_list())
-    except Exception:
-        listed = []
-    for index, url in listed:
-        if _is_category_url(url):
-            session.tab_select(index)
-            time.sleep(0.3)
-            current = (session.href() or url or "").strip()
-            if _is_category_url(current) or _is_category_url(url):
-                web.assert_logged_in(current or url)
-                return current or url, "reuse-category"
+    if getattr(session, "isolated", False):
+        # ``_select_reusable_publish`` has just refreshed and target-checked
+        # this worker's leases.  Reuse that committed cache; selecting a lease
+        # still verifies Target.getTargetInfo, so an index shift cannot select
+        # another worker's page.
+        for lease in session.owned_page_leases(refresh=False):
+            if _is_category_url(lease.url):
+                try:
+                    session.tab_select(lease)
+                    time.sleep(0.3)
+                    current = (session.href() or lease.url or "").strip()
+                except Exception:
+                    continue
+                if _is_category_url(current):
+                    web.assert_logged_in(current)
+                    return current, "reuse-category"
+    else:
+        try:
+            listed = parse_tabs(session.tab_list())
+        except Exception:
+            listed = []
+        for index, url in listed:
+            if _is_category_url(url):
+                session.tab_select(index)
+                time.sleep(0.3)
+                current = (session.href() or url or "").strip()
+                if _is_category_url(current) or _is_category_url(url):
+                    web.assert_logged_in(current or url)
+                    return current or url, "reuse-category"
     return ensure_new_category_tab(session, web), "new-category"
 
 
@@ -357,6 +487,23 @@ def ensure_new_category_tab(session, web=None):
     session.attach()
     # 当前活动标签可能是上一条成功商品残留的编辑页；本函数只新开类目标签、
     # 不在旧页上执行任何操作，因此不做 assert_safe_url（旧页含 itemId 属正常状态）。
+    if getattr(session, "isolated", False):
+        # ``tab_new`` claims the newly-created page by stable target id and
+        # leaves it current.  Poll that owned page directly; tab-list indexes
+        # are mutable and a second daemon may create/close tabs meanwhile.
+        session.tab_new(CATEGORY_ENTRY)
+        for _ in range(15):
+            time.sleep(0.4)
+            current = (session.href() or "").strip()
+            if not _is_category_url(current):
+                continue
+            web.assert_safe_url(current)
+            try:
+                web.assert_logged_in(current, session.body_text(800))
+            except Exception:
+                web.assert_logged_in(current)
+            return current
+        raise RuntimeError("未能打开新的类目页标签，已停止以免覆盖当前发布页")
     before = []
     try:
         before = parse_tabs(session.tab_list())
@@ -397,6 +544,9 @@ def _write_progress(steps):
     (out / "web_fill_progress.json").write_text(
         json.dumps(steps, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    runtime = current_runtime()
+    if runtime is not None and steps:
+        runtime.progress(str(steps[-1].get("step") or "执行中"), steps=steps)
 
 
 def short_fail_notice(text):
@@ -553,6 +703,16 @@ def _finish_publish(session, payload, confirm_submit, web, steps):
         steps.append({"step": "submit", "result": submitted})
         _write_progress(steps)
         execution, notice, links = _submit_outcome(session, submitted)
+        runtime = current_runtime()
+        if (runtime is not None and runtime.pending_creation
+                and submitted.get("hasFail") and not submitted.get("hasSuccess")
+                and not submitted.get("itemId") and _is_reusable_publish(session.href(), web)):
+            # A definite validation rejection is different from a lost submit
+            # response: no new item was created, so Continue may fill again.
+            runtime.pending_creation = False
+            checkpoint = dict(runtime.latest_item.get("resume_checkpoint") or {})
+            checkpoint.update(submit_started=False, last_submit_failed=True)
+            _persist_worker_resume({"resume_checkpoint": checkpoint, "flow_stage": "pending"})
     else:
         execution = web.maybe_submit(session, False, snap)
         notice = "已选择放入仓库"
@@ -590,15 +750,22 @@ def page_looks_in_progress(state, payload):
 
 
 def _remember_item(product, item, status=None):
+    _sync_worker_resume(item)
+    _surface_video_warning(item)
+    runtime = current_runtime()
+    if runtime is not None:
+        runtime.save_checkpoint(item)
     try:
         import job_session
         flow = {
             key: item.get(key)
             for key in (
-                "flow_version", "sku_image_strategy", "flow_stage", "spec_image_stage", "run_status",
-                "sku_material_manifest", "material_result", "material_preview", "material_folder", "last_error",
+                "execution_reset_id",
+                "resume_checkpoint", "last_browser_write",
+                "flow_version", "sku_image_strategy", "seller_account", "flow_stage", "spec_image_stage", "run_status",
+                "sku_material_manifest", "material_result", "material_preview", "material_folder", "last_error", "video_warning", "video_status",
             )
-            if item.get(key) not in (None, "")
+            if item.get(key) not in (None, "") or (key == "video_warning" and key in item)
         }
         job_session.patch_execution(
             item.get("row", product.get("row")),
@@ -614,8 +781,9 @@ def _remember_item(product, item, status=None):
                 **flow,
             },
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        if current_runtime() is not None:
+            raise CheckpointError(f"PAUSE:任务断点保存失败，已停止继续写入: {exc}") from exc
 
 
 def _empty_action_links():
@@ -625,6 +793,13 @@ def _empty_action_links():
 def _submit_outcome(session, submitted):
     submitted = submitted or {}
     raw = submitted.get("notice") or submitted.get("text") or ""
+    if (not submitted.get("hasSuccess") and not submitted.get("hasFail")
+            and _is_item_publish_url(session.href(), submitted.get("itemId"))):
+        return "提交待核实", "保存结果未确认；页面仍停留在商品编辑页，已停止重复提交", {
+            "taobao_item_id": submitted.get("itemId") or "",
+            "view_url": submitted.get("viewUrl") or "",
+            "edit_url": submitted.get("editUrl") or session.href(),
+        }
     if submitted.get("hasSuccess") or not submitted.get("hasFail"):
         execution = "结果待核实"
         notice = short_fail_notice(raw) if submitted.get("hasFail") else (short_fail_notice(raw) or "已提交")
@@ -661,8 +836,8 @@ def resolve_sku_strategy(product, explicit=""):
     return strategy
 
 
-SPEC_COLUMN_FLOW_VERSION = "spec-column-v1"
-BOTH_IMAGE_FLOW_VERSION = "both-images-v1"
+SPEC_COLUMN_FLOW_VERSION = "spec-column-v2"
+BOTH_IMAGE_FLOW_VERSION = "both-images-v2"
 # 规格图分批补传的中间态：批次已保存但还有后续批次；既不是 submit_pending
 # （会触发禁止重提守卫），也不是 complete（流程未结束）。
 SPEC_STAGE_UPLOADING = "uploading"
@@ -695,6 +870,9 @@ class SpecRowsMismatch(RuntimeError):
 def _check_cancel(session):
     event = getattr(session, "cancel_event", None)
     if event is not None and event.is_set():
+        reason = str(getattr(event, "reason", "") or "")
+        if reason:
+            raise UserStopped(f"PAUSE:全局故障，已停止后续操作并保留断点：{reason}")
         raise UserStopped("PAUSE:用户已暂停；保留当前发布页，点击继续可接着填写")
 
 
@@ -809,7 +987,37 @@ def _probe_fill_state(session, payload):
 def _save_checkpoint(session, payload, completed):
     # Page-local storage survives restarting the assistant and refreshing this tab;
     # counts in probe_state remain authoritative if the user removes any content.
-    return run_script(session, "checkpoint.js", {"key": resume_key(payload), "completed": sorted(completed)}, timeout=15)
+    runtime = current_runtime()
+    previous = dict(runtime.latest_item.get("resume_checkpoint") or {}) if runtime else {}
+    request = {**previous, "key": resume_key(payload), "completed": sorted(completed),
+               "submit_started": bool(runtime and runtime.pending_creation) or previous.get("submit_started") is True}
+    result = run_script(session, "checkpoint.js", request, timeout=15)
+    if runtime and isinstance(result, dict) and result.get("key") == request["key"]:
+        _persist_worker_resume({"resume_checkpoint": result})
+    return result
+
+
+def _persist_worker_resume(fields):
+    runtime = current_runtime()
+    if runtime is None:
+        return
+    runtime.save_checkpoint(fields)
+    try:
+        import job_session
+        job_session.patch_flow_state(runtime.row, runtime.product_id, fields)
+    except Exception as exc:
+        raise CheckpointError(f"PAUSE:任务断点保存失败，已停止继续写入: {exc}") from exc
+
+
+def _sync_worker_resume(item):
+    runtime = current_runtime()
+    if runtime is not None:
+        for key in ("resume_checkpoint", "last_browser_write"):
+            if runtime.latest_item.get(key):
+                item[key] = dict(runtime.latest_item[key])
+        for key in ("video_status", "video_warning"):
+            if key in runtime.latest_item:
+                item[key] = runtime.latest_item[key]
 
 
 def _audit_spec_rows_before_submit(session, payload, steps):
@@ -1276,8 +1484,17 @@ def pause_reason_code(text):
     return ""
 
 
+EXISTING_ITEM_DELETED_NOTICE = "历史商品已被删除"
+
+
 def gate_error_retryable(exc):
     text = str(exc or "")
+    # 用户暂停/安全拒绝一律立即停止重试：不清理弹窗、不睡眠，直接向上传播，
+    # 否则暂停要等 gate 重试与 overlay 清理耗尽才生效。
+    if _is_user_pause(text):
+        return False
+    if EXISTING_ITEM_DELETED_NOTICE in text:
+        return False
     if "素材卡片点击后规格行仍为空" in text or "图片空间仍在上传" in text:
         return False
     if hard_pause_reason(text) or pause_reason_code(text):
@@ -1317,11 +1534,16 @@ def gate_error_retryable(exc):
 # 数据核对类失败（服务端商品与输入不符、SKU 行数不符、价格库存变化等）
 # 同样允许重试：重试走只读核验/断点续跑路径，不会重复建品。
 ITEM_NO_RETRY_MARKERS = (
+    EXISTING_ITEM_DELETED_NOTICE,
     "残留文件选择器",
     "结果不明确",
     "结果待核实",
     "禁止自动重复",
     "操作过于频繁",
+    # 用户暂停/CLI 中断不是失败：中断点的操作结果可能已落页，自动重试
+    # 有重复写入风险，留给用户手动"重试未完成项"按断点续跑。
+    "用户已暂停",
+    "已中断当前页面操作",
 )
 
 
@@ -1334,6 +1556,9 @@ def item_retryable_notice(notice, errors=()):
     """
     blob = " ".join([str(notice or ""), *(str(e) for e in (errors or []) if e)])
     if not blob.strip():
+        return False
+    # 用户暂停（含 CLI 中断）不属于失败，禁止条目级自动重试。
+    if _is_user_pause(blob):
         return False
     if hard_pause_reason(blob) or pause_reason_code(blob):
         return False
@@ -1478,7 +1703,7 @@ def _spec_row_image_step(session, payload, on_bind_progress=None, only_indexes=N
     # the whole table and replace mismatched/ambiguous rows, not just empty ones.
     for audit in range(3):
         time.sleep(1.5)
-        state = run_script(session, "spec_row_status.js", {}, timeout=40)
+        state = run_script(session, "spec_row_status.js", {"skus": specs}, timeout=40)
         missing = [int(row) - 1 for row in (state.get("missing") or [])]
         missing = [index for index in missing if index in only_set]
         actual_sources = {int(row["index"]): row.get("src") for row in (state.get("sources") or [])}
@@ -1486,7 +1711,12 @@ def _spec_row_image_step(session, payload, on_bind_progress=None, only_indexes=N
                  if actual_sources.get(index) != src]
         repair = sorted(set(missing + wrong))
         if state.get("total") != total:
-            raise RuntimeError(f"规格图表格行数不符：预期 {total} 行，页面 {state.get('total')} 行")
+            # 逐屏扫描被瞬时渲染状态打断时只会采到起始一屏（2026-10-04 事故：
+            # 预期 37 行读到一屏 17 行）。审计只读，先复核一遍再判失败。
+            time.sleep(1.5)
+            state = run_script(session, "spec_row_status.js", {"skus": specs}, timeout=40)
+            if state.get("total") != total:
+                raise RuntimeError(f"规格图表格行数不符：预期 {total} 行，页面 {state.get('total')} 行")
         source_rows = {}
         for index, src in actual_sources.items():
             if src:
@@ -1558,13 +1788,36 @@ def spec_images_gate(session, payload, steps, attempts=1, only_rows=None,
                 upload_payload["files"] = spec_files
                 if min_filled_count:
                     upload_payload["minFilledCount"] = int(min_filled_count)
-            if len(skus) >= 13:
+            probe = run_script(session, "spec_page_probe.js", {}, timeout=30)
+            if probe.get("salePropImages"):
+                staged = {path: _prepare_media_uploads([path], compact=True)[0]
+                          for path in spec_files if Path(path).is_file()}
+                if staged:
+                    spec_files = [staged.get(path, path) for path in spec_files]
+                    upload_payload["files"] = spec_files
+                    upload_payload["skus"] = [
+                        {**sku, "image": staged[sku["image"]],
+                         "file": Path(staged[sku["image"]]).name}
+                        if sku.get("image") in staged else sku for sku in skus]
+                specs = _image_step(session, "spec_images.js", upload_payload, spec_files,
+                                    on_bind_progress=report_bind_progress)
+            elif len(skus) >= 13:
                 specs = _spec_row_image_step(session, upload_payload,
                                              on_bind_progress=report_bind_progress,
                                              only_indexes=only_rows)
             else:
-                specs = _image_step(session, "spec_images.js", upload_payload, spec_files,
-                                    on_bind_progress=report_bind_progress)
+                # 批量绑定依赖老版“编辑规格”抽屉；新版 v2 页面（潮玩盲盒等类目）
+                # 没有抽屉、规格图列单元格是 -skuPicture，只能逐行绑定。
+                # 误判回退单行也安全：spec_row_images.js 对两种页面版本都兼容。
+                use_row_step = (isinstance(probe, dict)
+                                and not probe.get("drawer") and not probe.get("editSpecBtn"))
+                if use_row_step:
+                    specs = _spec_row_image_step(session, upload_payload,
+                                                 on_bind_progress=report_bind_progress,
+                                                 only_indexes=only_rows)
+                else:
+                    specs = _image_step(session, "spec_images.js", upload_payload, spec_files,
+                                        on_bind_progress=report_bind_progress)
             steps.append({"step": "spec_images", "attempt": attempt, **specs})
             _write_progress(steps)
             bound = specs.get("bind") if isinstance(specs, dict) else None
@@ -1666,6 +1919,24 @@ def _image_step(session, script, payload, files, on_bind_progress=None):
         # the first file here races with setInputFiles and duplicates the image.
         _dismiss_filechooser(session)
         opened = {"via": "filechooser-dismissed", "dispatchUncertain": True}
+    except RuntimeError as exc:
+        # 上一轮失败会保留素材库现场；重试进入时页面可能正在重建该 iframe，
+        # open 阶段持旧引用 evaluate 即抛 Frame was detached（2026-10-02 客户机
+        # 真实复现，条目级重试被误伤）。重跑 open 是安全的：contentAddressedMedia
+        # 时 JS 侧按素材库点名过滤，已入库文件不会重投；finishLocalUploadBatch
+        # 遇到仍在进行的上传也只验证、不并发投递。
+        if (script not in {"main_images.js", "details.js"}
+                or not payload.get("contentAddressedMedia")
+                or not _is_transient_frame_error(exc)):
+            raise
+        _clear_gate_overlays(session)
+        time.sleep(2.5)
+        try:
+            opened = run_script(session, script, {**payload, "phase": "open"}, timeout=open_timeout)
+        except Exception as retry_exc:
+            if _is_user_pause(retry_exc):
+                raise
+            raise exc from None
     else:
         if script == "spec_images.js" and opened.get("missing"):
             pending_files = _files_named(files, opened["missing"]) or files
@@ -1767,7 +2038,25 @@ def _image_step(session, script, payload, files, on_bind_progress=None):
         bound["bindLog"] = bind_log
     else:
         bound = bind_once(bind_payload)
-    _verify_image_binding(script, payload, bound)
+    try:
+        _verify_image_binding(script, payload, bound)
+    except RuntimeError as exc:
+        # 主图位缩略图异步渲染会让核验读到偏少张数，但图其实已写入（重试时
+        # probe 读到足量即可证明）。先清场等一拍，再用只读 slot_count 复核，
+        # 避免把成功的写入误报成失败并触发无意义的整条重试。
+        if (script != "main_images.js" or "写入数量不符" not in str(exc)
+                or not payload.get("contentAddressedMedia")):
+            raise
+        _clear_gate_overlays(session)
+        time.sleep(1.5)
+        try:
+            recheck = run_script(session, script, {**payload, "phase": "slot_count"}, timeout=45)
+        except Exception:
+            raise exc from None
+        imgs = (recheck.get("slot") or {}).get("imgs") if isinstance(recheck, dict) else None
+        if not isinstance(imgs, int) or imgs < len(payload.get("names") or files):
+            raise
+        bound = {**bound, "slot": {**(bound.get("slot") or {}), "imgs": imgs, "rechecked": True}}
     return {"open": opened, "upload": uploaded, "bind": bound}
 
 
@@ -1869,13 +2158,49 @@ def _dismiss_import_dialog(session):
         pass
 
 
-def _reveal_automation_window():
-    """还原最小化/隐藏的自动化窗口；虚拟滚动表格在最小化窗口里停止渲染。"""
+_FRONT_REVEAL_LOCK = threading.Lock()
+
+
+def _ensure_automation_front(session=None):
+    """自动化窗口被最小化/SW_HIDE（渲染冻结）时先还原，再继续页面操作。
+
+    隐藏策略是"移出屏幕但保持可见"（见 hide_automation_chrome），渲染不
+    冻结，无需还原；这里只兜底真正冻结的窗口。最小化窗口里 Chrome 停止
+    渲染动画帧，locator.click 必超时；并发 worker 共用一个窗口，谁发现
+    冻结谁还原即可（非阻塞锁去重，其余 worker 直接放行——还原的是同一个
+    窗口，无需排队）。页签级前台化在脚本内的 ensureFront 里做，这里只管
+    OS 窗口。
+    """
     try:
         web = _load_web()
-        if hasattr(web, "restore_automation_chrome"):
+        if not hasattr(web, "restore_automation_chrome"):
+            return
+        if current_runtime() is None:
             web.reload_paths()
+        hidden = False
+        if hasattr(web, "automation_window_hidden"):
+            hidden = bool(web.automation_window_hidden())
+        if not hidden:
+            return
+        if not _FRONT_REVEAL_LOCK.acquire(False):
+            return
+        try:
             web.restore_automation_chrome()
+        finally:
+            _FRONT_REVEAL_LOCK.release()
+    except Exception:
+        pass
+
+
+def _reveal_automation_window():
+    """仅当自动化窗口被最小化/SW_HIDE 冻结时还原；屏幕外隐藏窗口渲染正常。
+
+    虚拟滚动表格在冻结窗口里停止渲染，需要还原后再复核；但直接 restore
+    会把屏幕外隐藏的窗口拉回前台抢焦点，破坏「显示自动化浏览器」开关的
+    隐藏承诺，所以复用 _ensure_automation_front 的冻结判定。
+    """
+    try:
+        _ensure_automation_front()
     except Exception:
         pass
 
@@ -1910,8 +2235,10 @@ def _topup_missing_sku_rows(session, payload, request, steps, result, path):
 
 def import_skus_from_template(session, payload, steps):
     """Create the SKU table when needed, then upload and verify the template."""
-    template = Path(os.environ.get("QIANNIU_TEMPLATES_DIR") or ROOT / "templates") / "sku_import_50012720.xls"
-    directory = Path(os.environ.get("QIANNIU_RESULTS_DIR") or get_output()) / "sku-import"
+    template = (Path(os.environ.get("QIANNIU_TEMPLATES_DIR") or ROOT / "templates")
+                / sku_import.template_name(payload))
+    directory = (get_output() if current_runtime() is not None
+                 else Path(os.environ.get("QIANNIU_RESULTS_DIR") or get_output())) / "sku-import"
     try:
         path = sku_import.build_import_file(payload, template, directory)
     except (ValueError, FileNotFoundError) as exc:
@@ -1950,7 +2277,25 @@ def import_skus_from_template(session, payload, steps):
     try:
         result = run_script(session, "sku_import.js", {**request, "phase": "verify"}, timeout=120)
     except Exception as exc:
-        raise RuntimeError(f"PAUSE:SKU 模板已上传但结果未核实，请检查当前页面：{short_fail_notice(str(exc))}") from exc
+        if _is_user_pause(exc):
+            raise
+        # verify 烧穿 120s 预算通常是页面冻结（并发下页签被切后台/窗口隐藏
+        # 时点击必超时），不是导入本身失败。重跑安全：确认识别/确认导入按钮
+        # 已消失即跳过，规格行已齐全时立即返回（见 ITEM_NO_RETRY_MARKERS
+        # 注释）；先还原窗口再试一次，仍失败才交人工。
+        steps.append({"step": "sku_import",
+                      "result": {"verify_retry_after_reveal": short_fail_notice(str(exc))}})
+        _write_progress(steps)
+        _ensure_automation_front(session)
+        time.sleep(2)
+        try:
+            result = run_script(session, "sku_import.js", {**request, "phase": "verify"}, timeout=120)
+        except Exception as retry_exc:
+            if _is_user_pause(retry_exc):
+                raise
+            raise RuntimeError(
+                f"PAUSE:SKU 模板已上传但结果未核实，请检查当前页面：{short_fail_notice(str(exc))}"
+            ) from retry_exc
     steps.append({"step": "sku_import", "result": {**result, "file": str(path)}})
     _write_progress(steps)
     if not result.get("verified"):
@@ -1990,6 +2335,40 @@ def _playable_video_checker():
 
 
 def video_step(session, payload):
+    _set_video_status("uploading")
+    try:
+        result = _video_step_impl(session, payload)
+    except Exception as exc:
+        _set_video_status("paused" if _is_user_pause(exc) or isinstance(exc, UserStopped) else "uncertain", str(exc))
+        raise
+    status = _video_result_status(result)
+    warning = str(result.get("warning") or "") if isinstance(result, dict) else "视频上传结果未确认"
+    _set_video_status(status, warning)
+    return {**result, "video_status": status}
+
+
+def _set_video_status(status, warning=""):
+    runtime = current_runtime()
+    if runtime is not None:
+        fields = {"video_status": status, "video_warning": warning}
+        _persist_worker_resume(fields)
+        runtime.progress("video", **fields)
+
+
+def _video_result_status(result):
+    if not isinstance(result, dict):
+        return "uncertain"
+    if result.get("already") or result.get("uploaded"):
+        return "bound"
+    warning = str(result.get("warning") or "")
+    if "无法播放" in warning or "不是有效视频" in warning:
+        return "invalid"
+    if _upload_dispatched(result):
+        return "uncertain"
+    return "failed"
+
+
+def _video_step_impl(session, payload):
     """上传主视频到商品视频区。视频是可选项：失败一律告警跳过，不阻断入库。
 
     只有用户主动暂停和平台安全验证（滑块/验证码，PAUSE 类异常）才会中断流程；
@@ -2010,7 +2389,9 @@ def video_step(session, payload):
     # 账号级共享的，那一条可能是其他商品刚上传的同名“主视频”
     # （2026-10-01 两个商品被绑上同一段第三方视频的根因）。
     files = _prepare_media_uploads(files)
-    request = {"files": files, "names": [Path(files[0]).name], "phase": "open"}
+    request = {"files": files, "names": [Path(files[0]).name], "phase": "open",
+               "resumeOnly": bool(payload.get("videoResumeOnly")),
+               "repairItemId": payload.get("repairItemId")}
 
     def _trace_text(data):
         if not isinstance(data, dict):
@@ -2041,7 +2422,7 @@ def video_step(session, payload):
             if _is_user_pause(exc):
                 raise
             _dismiss_filechooser(session)
-            return {"uploaded": False,
+            return {"uploaded": False, "dispatchUncertain": True,
                     "warning": f"视频文件选择器不可用，已跳过视频：{short_fail_notice(str(exc))}"}
         try:
             result = run_script(session, "main_video.js", {**request, "phase": "verify"}, timeout=180)
@@ -2049,12 +2430,12 @@ def video_step(session, payload):
         except Exception as exc:
             if _is_user_pause(exc):
                 raise
-            result = {"error": short_fail_notice(str(exc)) or str(exc)[:160]}
+            result = {"error": short_fail_notice(str(exc)) or str(exc)[:160], "dispatched": True}
     except Exception as exc:
         if _is_user_pause(exc):
             raise
         # 其余运行异常视为视频自身失败：记录后跳过，不阻断入库。
-        result = {"error": short_fail_notice(str(exc)) or str(exc)[:160]}
+        result = {"error": short_fail_notice(str(exc)) or str(exc)[:160], "dispatchUncertain": True}
         _flow_log(f"主视频 商品={title} 脚本异常: {result['error']}", "warn")
     if not isinstance(result, dict):
         return {"uploaded": False, "warning": "视频上传结果未确认，已跳过视频"}
@@ -2073,7 +2454,7 @@ def video_step(session, payload):
             if _is_user_pause(exc):
                 raise
             _dismiss_filechooser(session)
-            return {"uploaded": False,
+            return {"uploaded": False, "dispatchUncertain": True,
                     "warning": f"视频文件选择器不可用，已跳过视频：{short_fail_notice(str(exc))}"}
         try:
             result = run_script(session, "main_video.js", {**request, "phase": "verify"}, timeout=180)
@@ -2081,7 +2462,7 @@ def video_step(session, payload):
         except Exception as exc:
             if _is_user_pause(exc):
                 raise
-            result = {"error": short_fail_notice(str(exc)) or str(exc)[:160]}
+            result = {"error": short_fail_notice(str(exc)) or str(exc)[:160], "dispatched": True}
         if isinstance(result, dict) and (result.get("already") or result.get("uploaded")):
             return result
     reason = short_fail_notice(str(result.get("error") or "")) or "未确认主视频上传成功"
@@ -2089,7 +2470,32 @@ def video_step(session, payload):
     if detail:
         reason = f"{reason}：{detail}"
     _flow_log(f"主视频跳过 商品={title} 原因={reason}", "warn")
-    return {"uploaded": False, "warning": f"主视频未上传，已跳过继续：{reason}"}
+    return {**result, "uploaded": False, "warning": f"主视频未上传：{reason}"}
+
+
+def _surface_video_warning(item):
+    """Keep an optional-video failure visible after image stages overwrite notices."""
+    video = next((step for step in reversed(item.get("steps") or [])
+                  if step.get("step") == "video"), {})
+    if video:
+        item["video_status"] = video.get("video_status") or (
+            "bound" if video.get("skipped") and not video.get("warning") else _video_result_status(video))
+    if (item.get("video_status") == "bound" and item.get("taobao_item_id")
+            and (str(item.get("execution") or "").startswith("已入库")
+                 or item.get("execution") == "结果待核实")):
+        item["video_status"] = "uploaded"
+    if not video.get("warning") and (video.get("uploaded") or video.get("already")):
+        old_warning = str(item.get("video_warning") or "")
+        if old_warning:
+            item["notice"] = str(item.get("notice") or "").replace(old_warning, "").strip("； ")
+        item["video_warning"] = ""
+        return
+    warning = video.get("warning") or item.get("video_warning") or ""
+    if warning:
+        item["video_warning"] = warning
+        notice = str(item.get("notice") or "")
+        if warning not in notice:
+            item["notice"] = warning + ("；" + notice if notice else "")
 
 
 def _close_video_dialog(session):
@@ -2121,11 +2527,27 @@ def fill_new_product(session, product, confirm_submit=False, web=None, force_new
     _write_progress([])
     try:
         _check_cancel(session)
+        runtime = current_runtime()
+        if runtime is not None:
+            checkpoint = dict(runtime.latest_item.get("resume_checkpoint") or {})
+            if runtime.pending_creation or checkpoint.get("submit_started") is True:
+                raise RuntimeError("PAUSE:上次提交结果不明确；禁止自动重复提交，请核实仓库后继续")
+            _persist_worker_resume({"resume_checkpoint": {
+                **checkpoint, "key": resume_key(payload), "submit_started": False,
+            }})
         href, how = ensure_fill_tab(session, web, force_new=force_new)
         steps.append({"step": "tab", "url": href, "how": how})
         _write_progress(steps)
 
         skips = set()
+        if how == "reuse-publish":
+            # 残留发布页可能是上个类目留下的（如上次会话的中性笔）。在错误类目
+            # 的表单上填写会被平台以必填属性不匹配拒单，先校验叶子类目名。
+            if not _publish_page_has_leaf(session, payload):
+                href = ensure_new_category_tab(session, web)
+                how = "new-category"
+                steps.append({"step": "tab", "url": href, "how": "category-mismatch-new-category"})
+                _write_progress(steps)
         if how == "reuse-publish":
             state = _probe_fill_state(session, payload)
             if not state:
@@ -2209,7 +2631,7 @@ def fill_new_product(session, product, confirm_submit=False, web=None, force_new
                 steps.append({"step": "video", "skipped": True})
                 _write_progress(steps)
             else:
-                video = video_step(session, payload)
+                video = video_step(session, {**payload, "videoResumeOnly": "video_upload_pending" in completed})
                 steps.append({"step": "video", **video})
                 _write_progress(steps)
             closed = _close_video_dialog(session)
@@ -2220,7 +2642,13 @@ def fill_new_product(session, product, confirm_submit=False, web=None, force_new
                               "warning": f"选择视频对话框未能自动关闭（{closed.get('clicked') or '未点击'}），"
                                          "可能干扰后续图片上传；建议手动关闭后继续"})
                 _write_progress(steps)
-            completed.add("video")
+            if "video" in skips or video.get("already") or video.get("uploaded"):
+                completed.add("video")
+                completed.discard("video_upload_pending")
+            else:
+                completed.discard("video")
+                if _upload_dispatched(video):
+                    completed.add("video_upload_pending")
             _save_checkpoint(session, payload, completed)
 
         if payload["detail_images"]:
@@ -2253,13 +2681,14 @@ def fill_new_product(session, product, confirm_submit=False, web=None, force_new
             else:
                 if sku_template_import and sku_import.supports_product(payload):
                     import_skus_from_template(session, payload, steps)
-                    cats = run_gate(session, "sku_category.js", payload, steps, "sku_category", timeout=150)
-                    # 分类脚本自带逐屏终检（audit）；行不全就在建品前判失败，
-                    # 断点不标记 skus，条目级重试会重新执行整个 SKU 步骤。
-                    if isinstance(cats, dict) and cats.get("audit") and not cats.get("ok"):
-                        raise RuntimeError(
-                            f"SKU 规格分类未写入全部规格行"
-                            f"（页面 {cats.get('total')} 行，未分类 {cats.get('missing')} 行）；将重新处理 SKU 步骤")
+                    if sku_import.needs_sku_category(payload):
+                        cats = run_gate(session, "sku_category.js", payload, steps, "sku_category", timeout=150)
+                        # 分类脚本自带逐屏终检（audit）；行不全就在建品前判失败，
+                        # 断点不标记 skus，条目级重试会重新执行整个 SKU 步骤。
+                        if isinstance(cats, dict) and cats.get("audit") and not cats.get("ok"):
+                            raise RuntimeError(
+                                f"SKU 规格分类未写入全部规格行"
+                                f"（页面 {cats.get('total')} 行，未分类 {cats.get('missing')} 行）；将重新处理 SKU 步骤")
                 else:
                     skus = run_gate(session, "skus.js", payload, steps, "skus", timeout=300)
 
@@ -2278,6 +2707,7 @@ def fill_new_product(session, product, confirm_submit=False, web=None, force_new
         result = _finish_publish(session, payload, confirm_submit, web, steps)
         execution = result.get("execution") or execution
         notice = result.get("notice") or notice
+        _surface_video_warning(result)
         return result
     except UserStopped as exc:
         execution, notice = "暂停", str(exc).removeprefix("PAUSE:")
@@ -2293,8 +2723,19 @@ def fill_new_product(session, product, confirm_submit=False, web=None, force_new
         execution, notice = "暂停", str(exc).removeprefix("PAUSE:")
         return {"execution": execution, "notice": notice, "errors": [notice], "url": session.href(), "steps": steps}
     except Exception as exc:
-        execution = "暂停" if "PAUSE:" in str(exc) or hard_pause_reason(str(exc)) else "失败"
-        notice = short_fail_notice(str(exc)) or str(exc)[:160]
+        text = str(exc)
+        if "PAUSE:" in text or hard_pause_reason(text) or _is_user_pause(text):
+            # 用户暂停 / CLI 中断 / 硬暂停：与 UserStopped 同样归档为"暂停"，
+            # 不写入 errors（避免被当成可重试失败），保留当前发布页现场。
+            # CLI 中断后 session 命令快速失败，href 取不到就留空。
+            try:
+                current_url = session.href()
+            except Exception:
+                current_url = ""
+            execution, notice = "暂停", text.removeprefix("PAUSE:")
+            return {"execution": execution, "notice": notice, "errors": [], "url": current_url, "steps": steps}
+        execution = "失败"
+        notice = short_fail_notice(text) or text[:160]
         return {
             "execution": execution,
             "notice": notice,
@@ -2316,11 +2757,19 @@ def fill_new_product(session, product, confirm_submit=False, web=None, force_new
 
 
 def _emit_flow(item, product, on_flow_stage):
+    _sync_worker_resume(item)
+    _surface_video_warning(item)
+    runtime = current_runtime()
+    if runtime is not None:
+        runtime.save_checkpoint(item)
+        if item.get("taobao_item_id"):
+            runtime.pending_creation = False
     if on_flow_stage:
         try:
             on_flow_stage(product, item)
-        except Exception:
-            pass
+        except Exception as exc:
+            if runtime is not None:
+                raise CheckpointError(f"PAUSE:任务断点保存失败，已停止继续写入: {exc}") from exc
 
 
 def _spec_stage_callbacks(item, product, on_flow_stage, touch_flow_stage=True):
@@ -2390,6 +2839,33 @@ def _is_item_publish_url(url, item_id):
     return parse_qs(parsed.query).get("itemId") == [str(item_id)]
 
 
+def _is_item_tab_url(url, item_id):
+    """是否指定商品的自有页签：编辑页或提交后的成功页。
+
+    规格图分批补传每批提交后编辑页会跳转为 success.htm（primaryId 锚定
+    同一商品），旧逻辑只按 publish.htm 回收导致每批泄漏一个成功页签
+    （2026-10-03 registry：同一商品 8 个重复 success 页签）。两个路径
+    都要认，商品仍由 itemId/primaryId 锚定。
+    """
+    from urllib.parse import parse_qs, urlparse
+    try:
+        parsed = urlparse(str(url or ""))
+    except ValueError:
+        return False
+    if (parsed.hostname or "").lower() not in ("item.upload.taobao.com",
+                                               "item.manager.taobao.com"):
+        return False
+    path = parsed.path.lower()
+    wanted = str(item_id or "")
+    if not wanted:
+        return False
+    if path.endswith("/publish.htm"):
+        return parse_qs(parsed.query).get("itemId") == [wanted]
+    if path.endswith("/success.htm"):
+        return parse_qs(parsed.query).get("primaryId") == [wanted]
+    return False
+
+
 def _is_safe_park_url(url):
     """可停靠页签：卖家中心/登录页。prune 始终保留它们，切过去不会失效。"""
     from urllib.parse import urlparse
@@ -2402,7 +2878,7 @@ def _is_safe_park_url(url):
 
 
 def _close_stale_item_tabs(session, item_id, keep_current=True):
-    """按 itemId 关闭商品编辑页签，返回关闭数量。
+    """按 itemId 关闭商品编辑/成功页签，返回关闭数量。
 
     逐个关闭且每次关闭前重新拉取页签列表：tab_close 会让后续序号重排，
     复用旧序号有关错页签的风险。keep_current 时必须解析到 "(current)"
@@ -2418,7 +2894,7 @@ def _close_stale_item_tabs(session, item_id, keep_current=True):
         if keep_current and current_index is None:
             break
         victim = next((index for index, url, current in rows
-                       if _is_item_publish_url(url, item_id)
+                       if _is_item_tab_url(url, item_id)
                        and not (keep_current and index == current_index)), None)
         if victim is None:
             break
@@ -2431,7 +2907,7 @@ def _close_stale_item_tabs(session, item_id, keep_current=True):
     return closed
 
 
-def _open_item_edit_tab(session, item_id):
+def _open_item_edit_tab(session, item_id, *, close_stale=True):
     """新开指定商品的编辑页签，并回收同商品的历史编辑页签。
 
     分批补图每批都会重开编辑页；重开页与历史页 URL 相同，prune 的精确
@@ -2440,6 +2916,8 @@ def _open_item_edit_tab(session, item_id):
     """
     url = "https://item.upload.taobao.com/sell/v2/publish.htm?itemId=" + str(item_id)
     session.tab_new(url)
+    if not close_stale:
+        return url
     try:
         _close_stale_item_tabs(session, item_id, keep_current=True)
     except Exception:
@@ -2448,21 +2926,21 @@ def _open_item_edit_tab(session, item_id):
 
 
 def _recycle_success_tabs(session, item_id):
-    """成功核验的商品回收其全部编辑页签，返回关闭数量。
+    """成功核验的商品回收其全部编辑/成功页签，返回关闭数量。
 
     成功商品不需要保留现场（断点续跑只依赖商品 ID），但不能让 CLI 的
-    当前页签失效：当前页正是该商品的编辑页时，先切到卖家中心/登录页再
-    关；找不到可停靠页签时退化为只关多余页签、保留当前页。
+    当前页签失效：当前页正是该商品的编辑/成功页时，先切到卖家中心/登录
+    页再关；找不到可停靠页签时退化为只关多余页签、保留当前页。
     """
     try:
         rows = _parse_tabs_with_current(session.tab_list())
     except Exception:
         return 0
-    if not any(_is_item_publish_url(url, item_id) for _index, url, _current in rows):
+    if not any(_is_item_tab_url(url, item_id) for _index, url, _current in rows):
         return 0
     current_index = next((index for index, _url, current in rows if current), None)
     current_is_item = current_index is not None and any(
-        index == current_index and _is_item_publish_url(url, item_id)
+        index == current_index and _is_item_tab_url(url, item_id)
         for index, url, _current in rows)
     if current_is_item:
         park = next((index for index, url, _current in rows
@@ -2482,6 +2960,8 @@ def _finish_product_tabs(session, web, item):
     成功核验的商品立即回收其编辑页签；其余状态保留当前页作为断点续跑
     现场。两种情况都会顺带清掉其他历史页签。
     """
+    if current_runtime() is not None:
+        return  # The owning worker retires its pages after durable completion.
     if item.get("run_status") == "completed" and str(item.get("taobao_item_id") or ""):
         try:
             _recycle_success_tabs(session, str(item["taobao_item_id"]))
@@ -2493,11 +2973,34 @@ def _finish_product_tabs(session, web, item):
         pass
 
 
-def _recover_existing_item(session, web, product, item_id):
+def _raise_existing_page_error(state, item_id):
+    """Deleted server items cannot be retried or implicitly replaced."""
+    from urllib.parse import parse_qs, urlparse
+
+    if (state.get("pageError") or {}).get("code") != "item_deleted":
+        return
+    url = urlparse(state.get("href") or "")
+    if (url.hostname not in ("item.upload.taobao.com", "item.manager.taobao.com")
+            or url.path != "/sell/v2/publish.htm"
+            or parse_qs(url.query).get("itemId") != [item_id]):
+        raise RuntimeError("PAUSE:未打开指定商品的服务器编辑页；禁止再次建品")
+    raise RuntimeError(
+        f"PAUSE:{EXISTING_ITEM_DELETED_NOTICE}（ID {item_id}），无法继续编辑；"
+        "请在执行明细中对该商品点击“清除记录”，再点击“继续入库”重新入库"
+    )
+
+
+def _recover_existing_item(session, web, product, item_id, *, inspect_material=True,
+                           preserve_edit_tabs=False):
     """Read a fresh server page before migrating an ID-only legacy record.
 
     Never reuse an unsaved edit tab or submit again to discover whether the
     previous submission succeeded. A failed check leaves the record unchanged.
+    ``inspect_material=False`` is used when the search-main flow already has a
+    durable material checkpoint: the server edit page is still fully checked,
+    but the SKU material drawer is left untouched for its own resume stage.
+    ``preserve_edit_tabs=True`` keeps an uncertain save's original page intact
+    while a separate server page is used only for verification.
     """
     from urllib.parse import parse_qs, urlparse
     from . import material_import
@@ -2505,7 +3008,7 @@ def _recover_existing_item(session, web, product, item_id):
     if not re.fullmatch(r"\d{8,20}", item_id):
         raise RuntimeError("PAUSE:已有商品 ID 无效；禁止再次建品")
     payload = product_to_payload(product)
-    _open_item_edit_tab(session, item_id)
+    _open_item_edit_tab(session, item_id, close_stale=not preserve_edit_tabs)
     state = run_script(session, "probe_state.js", {**payload, "waitForReady": True})
     risk = run_script(session, "upload_status.js", {})
     if (state.get("captchaVisible") or risk.get("securityChallenge")
@@ -2518,6 +3021,7 @@ def _recover_existing_item(session, web, product, item_id):
             or url.path != "/sell/v2/publish.htm"
             or parse_qs(url.query).get("itemId") != [item_id]):
         raise RuntimeError("PAUSE:未打开指定商品的服务器编辑页；禁止再次建品")
+    _raise_existing_page_error(state, item_id)
     expected_title = display_title(payload["title"])
     if state.get("title") != expected_title:
         # 带上页面实际商品标题：ID 被污染时（历史缺陷会把别的商品的 ID 刮进
@@ -2527,6 +3031,10 @@ def _recover_existing_item(session, web, product, item_id):
             + (f"（页面商品：{state.get('title')}）" if state.get("title") else "")
             + "；禁止再次建品"
         )
+    if int(state.get("videos") or 0) > 0:
+        _set_video_status("uploaded")
+    elif payload.get("main_video"):
+        _set_video_status("failed", "主视频未上传：服务器编辑页未检测到主视频")
     wanted = [sku["name"] for sku in payload.get("skus") or []]
     # 规格表是虚拟滚动表格，probe_state 的 skuNames/skuRows 只含可视区（约一屏
     # 17 行），对超过一屏的商品必然误报"不符"（2026-10-01 连续三次误报，商品
@@ -2550,6 +3058,8 @@ def _recover_existing_item(session, web, product, item_id):
     if not any(row.get("checked") and row.get("t") == "放入仓库"
                for row in state.get("warehouse") or []):
         raise RuntimeError("PAUSE:已有商品未确认处于仓库；禁止再次建品")
+    if not inspect_material:
+        return None
     rows = material_import.inspect_target_skus(session, web, item_id, expected_title)
     material_import.check_rows(rows, product)
     return rows
@@ -2557,14 +3067,21 @@ def _recover_existing_item(session, web, product, item_id):
 
 def _spec_column_state(session, product):
     """Read only specification cells; a search-main thumbnail is not evidence."""
-    state = run_script(session, "spec_row_status.js", {}, timeout=40)
+    state = run_script(session, "spec_row_status.js", product_to_payload(product), timeout=40)
     skus = product.get("skus") or []
     # Taobao reloads saved images as protocol-relative URLs. Preserve the full
     # host/path/query identity while ignoring only that transport spelling.
     sources = {int(row["index"]): re.sub(r"^https?:", "", row.get("src") or "")
                for row in state.get("sources") or []}
     if state.get("total") != len(skus):
-        raise RuntimeError("PAUSE:商品规格列行数不符，不能确认规格图片")
+        # 逐屏扫描被瞬时渲染状态（后台页签等）打断时只会采到一屏，复核一遍
+        # 再判失败（2026-10-04 规格图审计同类事故）。
+        time.sleep(1.5)
+        state = run_script(session, "spec_row_status.js", product_to_payload(product), timeout=40)
+        sources = {int(row["index"]): re.sub(r"^https?:", "", row.get("src") or "")
+                   for row in state.get("sources") or []}
+        if state.get("total") != len(skus):
+            raise RuntimeError("PAUSE:商品规格列行数不符，不能确认规格图片")
     missing = [i for i, sku in enumerate(skus, 1) if sku.get("image") and not sources.get(i)]
     return sources, missing
 
@@ -2590,6 +3107,7 @@ def _repair_existing_spec_images(session, web, product, item_id, confirm_submit,
     while True:
         _open_item_edit_tab(session, item_id)
         state = run_script(session, "probe_state.js", {**payload, "waitForReady": True})
+        _raise_existing_page_error(state, item_id)
         risk = run_script(session, "upload_status.js", {})
         if (state.get("captchaVisible") or risk.get("securityChallenge")
                 or (risk.get("status") or {}).get("securityLimit")):
@@ -2632,7 +3150,30 @@ def _repair_existing_spec_images(session, web, product, item_id, confirm_submit,
         if on_before_submit:
             on_before_submit()
         result = _finish_publish(session, payload, True, web, steps)
-        if material_import.item_id_from_result(result) != item_id:
+        if (material_import.item_id_from_result(result) == item_id
+                and result.get("execution") in {"提交待核实", "结果待核实"}):
+            # A closed attribute dialog / delayed redirect is not a save receipt.
+            # Read a new server page, including the unchanged SKU baseline, and
+            # accept only the exact bound sources. Never submit a second time
+            # to find out whether the previous save reached the server.
+            verified_rows = _recover_existing_item(session, web, product, item_id,
+                                                  preserve_edit_tabs=True)
+            material_import.check_rows(verified_rows, product, baseline)
+            _open_item_edit_tab(session, item_id, close_stale=False)
+            saved_state = run_script(session, "probe_state.js", {**payload, "waitForReady": True})
+            _raise_existing_page_error(saved_state, item_id)
+            if saved_state.get("captchaVisible"):
+                raise RuntimeError("PAUSE:captcha:规格图保存核验遇到安全验证；未重复提交")
+            persisted, pending = _spec_column_state(session, product)
+            if (any(row in pending or persisted.get(row) != bound_sources.get(row) for row in batch)
+                    or any(persisted.get(row) != src for row, src in bound_sources.items() if src)):
+                raise RuntimeError("PAUSE:规格图保存结果待核实；服务器未确认本批图片，禁止自动重复提交")
+            steps.append({"step": "spec_images_save_verify", "batch": batch_index,
+                          "rows": list(batch), "verifiedBy": "server-spec-sources"})
+            _write_progress(steps)
+            result = {**result, "execution": "已入库"}
+        if (material_import.item_id_from_result(result) != item_id
+                or result.get("execution") in {"提交待核实", "提交失败", "失败", "暂停"}):
             raise RuntimeError("PAUSE:规格图保存结果待核实；禁止自动重复提交")
         if on_batch_done:
             on_batch_done(batch_index, len(missing) - len(batch), total_with_image)
@@ -2643,7 +3184,8 @@ def _repair_existing_spec_images(session, web, product, item_id, confirm_submit,
     rows = _recover_existing_item(session, web, product, item_id)
     material_import.check_rows(rows, product, baseline)
     _open_item_edit_tab(session, item_id)
-    run_script(session, "probe_state.js", {**payload, "waitForReady": True})
+    state = run_script(session, "probe_state.js", {**payload, "waitForReady": True})
+    _raise_existing_page_error(state, item_id)
     after, missing = _spec_column_state(session, product)
     if missing or any(after.get(i) != src for i, src in before.items() if src):
         raise RuntimeError("PAUSE:刷新后商品规格图缺失或变化，未标记完成")
@@ -2703,7 +3245,63 @@ def _run_search_images(session, web, product, item, on_flow_stage=None, combined
     )
 
 
-def run_batch(products, confirm_submit=False, limit=None, session=None, cancel_event=None,
+def _historical_item_for_product(product, seller_account=""):
+    """Recover a lost local ID from saved results, never guess between item IDs.
+
+    An explicit clear starts a new execution generation. Only results from that
+    generation may restore an ID; older results must not undo the user's reset.
+    Recovered IDs still go through the normal read-only identity/SKU checks.
+    """
+    directories = []
+    if os.environ.get("QIANNIU_RESULTS_DIR"):
+        directories.append(Path(os.environ["QIANNIU_RESULTS_DIR"]))
+    if os.environ.get("QIANNIU_APPDATA"):
+        directories.append(Path(os.environ["QIANNIU_APPDATA"]) / "results")
+    product_id = str(product.get("product_id") or "").strip()
+    title = str(product.get("title") or "").strip()
+    reset_id = str(product.get("execution_reset_id") or "")
+    if not product_id and not title:
+        return None
+    candidates = {}
+    for directory in dict.fromkeys(directories):
+        for path in sorted(directory.glob("*.结果-*.json"), reverse=True):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8-sig"))
+            except (OSError, ValueError):
+                continue
+            rows = data.get("results", data.get("rows", [])) if isinstance(data, dict) else data
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                if reset_id and row.get("execution_reset_id") != reset_id:
+                    continue
+                saved_id = str(row.get("taobao_item_id") or "").strip()
+                if not re.fullmatch(r"\d{8,20}", saved_id):
+                    continue
+                saved_product_id = str(row.get("product_id") or "").strip()
+                if product_id and saved_product_id:
+                    matched = product_id == saved_product_id
+                else:
+                    matched = bool(title and title == str(row.get("title") or "").strip())
+                if not matched:
+                    continue
+                account = str(row.get("seller_account") or "").strip()
+                if seller_account and account and seller_account != account:
+                    continue
+                notice = str(row.get("notice") or "")
+                if "拒绝使用已有商品编辑页" in notice and saved_id in notice:
+                    continue
+                candidates.setdefault(saved_id, row)
+    if len(candidates) > 1:
+        raise RuntimeError("PAUSE:历史结果中同一商品存在多个已创建商品 ID（"
+                           + "、".join(sorted(candidates))
+                           + "）；请核对仓库，已停止以免重复建品")
+    return next(iter(candidates.values()), None)
+
+
+def _run_batch_serial(products, confirm_submit=False, limit=None, session=None, cancel_event=None,
               on_item_start=None, on_item_done=None, force_new=False, sku_template_import=False,
               skip_spec_images=False, sku_image_strategy="", on_flow_stage=None,
               spec_upload_batch_size=0, item_retry_limit=0, on_item_retry=None):
@@ -2743,6 +3341,8 @@ def run_batch(products, confirm_submit=False, limit=None, session=None, cancel_e
         current_account = session.seller_account() if hasattr(session, "seller_account") else ""
     except Exception:
         current_account = ""
+    if current_runtime() is not None:
+        current_account = current_runtime().seller_account or current_account
     product_index = 0
     retry_limit = max(0, int(item_retry_limit or 0))
     attempt_state = None   # (product_index, attempt)；仅发生过重试时非 None
@@ -2771,6 +3371,10 @@ def run_batch(products, confirm_submit=False, limit=None, session=None, cancel_e
         strategy = resolve_sku_strategy(product, sku_image_strategy or snapshot_strategy)
         item["sku_image_strategy"] = strategy
         prior_stage = material_import.normalize_stage(product.get("flow_stage") or "pending")
+        if (not product.get("taobao_item_id")
+                and ((product.get("resume_checkpoint") or {}).get("submit_started") is True
+                     or product.get("execution") in {"提交待核实", "结果待核实"})):
+            prior_stage = material_import.STAGE_SUBMIT_PENDING
         prior_id = str(product.get("taobao_item_id") or "")
         # 历史缺陷清洗：失败记录的 ID 可能来自被拒 URL 的文本刮取（"拒绝使用
         # 已有商品编辑页"文案里带着上一条商品的 itemId），不属于本商品。
@@ -2782,7 +3386,8 @@ def run_batch(products, confirm_submit=False, limit=None, session=None, cancel_e
                 prior_id = ""
                 item["taobao_item_id"] = ""
         saved_account = str(product.get("seller_account") or "").strip()
-        if saved_account and current_account and saved_account != current_account and prior_id:
+        if (saved_account and current_account and saved_account != current_account
+                and (prior_id or product.get("resume_checkpoint"))):
             item["execution"] = "暂停"
             item["notice"] = "当前店铺与上次执行店铺不一致，已停止以免沿用其他店铺的商品 ID"
             item["errors"] = [item["notice"]]
@@ -2796,7 +3401,8 @@ def run_batch(products, confirm_submit=False, limit=None, session=None, cancel_e
             item["seller_account"] = current_account
         legacy_record = not (product.get("flow_version") or product.get("flow_stage"))
         prior = str(product.get("execution") or "")
-        if not force_new and not prior_id and legacy_record and prior in DONE_EXECUTIONS:
+        if (not confirm_submit and not force_new and not prior_id
+                and legacy_record and prior in DONE_EXECUTIONS):
             item["execution"] = prior
             item["notice"] = product.get("notice") or "已填写，跳过"
             item["errors"] = list(product.get("errors") or [])
@@ -2832,15 +3438,34 @@ def run_batch(products, confirm_submit=False, limit=None, session=None, cancel_e
         _write_progress([])
         if on_item_start:
             on_item_start(product)
-        item_force_new = bool(force_new) or need_new_tab
+        fresh_reset = (bool(product.get("execution_reset_id")) and not prior_id
+                       and str(product.get("flow_stage") or "") in {"", "pending"}
+                       and prior in {"", "未执行"})
+        item_force_new = bool(force_new) or need_new_tab or fresh_reset
         # 规格图统一在入库成功后按批次进入编辑页补传（降低一次性上传触发
         # 滑块验证的概率），建品阶段不再上传任何规格图。
         skip_spec = True
         try:
+            if not prior_id and not force_new and prior_stage != material_import.STAGE_SUBMIT_PENDING:
+                history = _historical_item_for_product(product, current_account or saved_account)
+                if history:
+                    prior_id = str(history["taobao_item_id"])
+                    # Treat recovered history as an unverified ID-only record;
+                    # it must pass _recover_existing_item before any writes.
+                    prior_stage = material_import.STAGE_FILLED
+                    recovered = {"taobao_item_id": prior_id, "flow_stage": prior_stage,
+                                 "view_url": history.get("view_url") or "",
+                                 "edit_url": history.get("edit_url") or ""}
+                    if history.get("seller_account") and not product.get("seller_account"):
+                        recovered["seller_account"] = history["seller_account"]
+                    product = {**product, **recovered}
+                    item.update(recovered, notice="已从历史结果恢复商品 ID，核验已有商品后继续，不重新建品")
+                    _emit_flow(item, product, on_flow_stage)
+                    _remember_item(product, item, status="paused")
             if prior_id and not force_new and strategy == "both":
                 # Keep the material checkpoint separate from a pending spec save.
                 search_stage = (prior_stage if product.get("flow_version") in
-                                {material_import.FLOW_VERSION, BOTH_IMAGE_FLOW_VERSION}
+                                {material_import.FLOW_VERSION, BOTH_IMAGE_FLOW_VERSION, "both-images-v1"}
                                 else material_import.STAGE_CREATED)
                 if search_stage == material_import.STAGE_COMPLETE:
                     search_stage = material_import.STAGE_VERIFYING
@@ -2848,11 +3473,42 @@ def run_batch(products, confirm_submit=False, limit=None, session=None, cancel_e
 
                 before_both_spec_submit, after_both_spec_batch = _spec_stage_callbacks(
                     item, product, on_flow_stage, touch_flow_stage=False)
-
-                _repair_existing_spec_images(session, web, product, prior_id,
-                                             confirm_submit, on_before_submit=before_both_spec_submit,
-                                             spec_batch_size=spec_upload_batch_size,
-                                             on_batch_done=after_both_spec_batch)
+                search_resume_stages = {
+                    material_import.STAGE_PREPARED,
+                    material_import.STAGE_UPLOAD_PENDING,
+                    material_import.STAGE_RECOGNIZING,
+                    material_import.STAGE_REVIEWED,
+                    material_import.STAGE_ADOPT_PENDING,
+                    material_import.STAGE_VERIFYING,
+                }
+                spec_already_verified = (
+                    product.get("flow_version") == BOTH_IMAGE_FLOW_VERSION
+                    and
+                    product.get("spec_image_stage") == material_import.STAGE_COMPLETE
+                    and search_stage in search_resume_stages
+                )
+                if spec_already_verified:
+                    # The SKU material flow may have a live recognition/adopt
+                    # drawer.  Re-opening the server edit page is still
+                    # required to prove item identity, SKU rows, warehouse
+                    # state and the saved specification image column, but
+                    # inspect_target_skus would switch to that drawer and can
+                    # mistake a pending attribute-review dialog for a failure.
+                    _recover_existing_item(
+                        session, web, product, prior_id, inspect_material=False
+                    )
+                    _sources, missing_spec = _spec_column_state(session, product)
+                    if missing_spec:
+                        raise RuntimeError(
+                            "PAUSE:已有商品规格图缺失；未重传规格图，禁止自动重复"
+                        )
+                    item["spec_image_stage"] = material_import.STAGE_COMPLETE
+                else:
+                    _repair_existing_spec_images(
+                        session, web, product, prior_id,
+                        confirm_submit, on_before_submit=before_both_spec_submit,
+                        spec_batch_size=spec_upload_batch_size,
+                        on_batch_done=after_both_spec_batch)
                 item["spec_image_stage"] = material_import.STAGE_COMPLETE
                 item["flow_stage"] = search_stage
                 _emit_flow(item, product, on_flow_stage)
@@ -2949,6 +3605,9 @@ def run_batch(products, confirm_submit=False, limit=None, session=None, cancel_e
                     if created:
                         item["taobao_item_id"] = created
                         item["flow_stage"] = material_import.STAGE_CREATED
+                        # ID 已在成功页核实，执行列立即反映入库事实；
+                        # 后续素材阶段会继续覆盖为更细的进度文案。
+                        item["execution"] = "已入库，待补图"
                         _emit_flow(item, product, on_flow_stage)
                     else:
                         item["flow_stage"] = material_import.STAGE_SUBMIT_PENDING
@@ -3011,12 +3670,14 @@ def run_batch(products, confirm_submit=False, limit=None, session=None, cancel_e
             item["run_status"] = "paused"
             outcome = "hard"
         except Exception as exc:
+            if isinstance(exc, CheckpointError):
+                raise
             pause = "PAUSE:" in str(exc) or hard_pause_reason(str(exc))
             item["execution"] = "暂停" if pause else "失败"
             notice = str(exc).replace("PAUSE:", "", 1).strip() if pause else str(exc)
-            # 建品已失败但记录已有商品 ID 的续跑场景：素材阶段错误只记入
-            # last_error，保留建品失败作为用户可见 notice，避免误导。
-            if item.get("taobao_item_id") and item.get("errors"):
+            # 本轮建品失败却返回了 ID 时保留填写失败提示；已有 ID 的续跑
+            # 应显示本次错误，避免旧的暂停原因遮掩当前状态。
+            if not prior_id and item.get("taobao_item_id") and item.get("errors"):
                 item["notice"] = "; ".join(str(e) for e in item.get("errors") if e) or item.get("notice") or notice
                 item["errors"] = list(item.get("errors") or [])
             else:
@@ -3025,6 +3686,14 @@ def run_batch(products, confirm_submit=False, limit=None, session=None, cancel_e
             item["last_error"] = str(exc)
             item["run_status"] = "paused" if pause else "error"
             outcome = "failed"
+        runtime = current_runtime()
+        if runtime is not None and runtime.pending_creation:
+            if item.get("taobao_item_id") and item.get("flow_stage") != "submit_pending":
+                runtime.pending_creation = False
+            else:
+                item.update(flow_stage="submit_pending", execution="提交待核实", run_status="paused")
+                item["notice"] = item.get("notice") or "提交结果不明确；请核对服务器状态，禁止自动重复提交"
+                outcome = "submit_pending"
         # —— 条目级重试 / 跳过决策 ——
         failure = outcome in {"hard", "submit_pending", "failed"} or item.get("execution") in {
             "失败", "暂停", "提交失败", "提交待核实"}
@@ -3049,7 +3718,7 @@ def run_batch(products, confirm_submit=False, limit=None, session=None, cancel_e
             merged["run_status"] = ""
             if on_item_retry:
                 on_item_retry(merged, item, attempt, retry_limit)
-            for cleanup in (_maybe_close_overlays, _dismiss_import_dialog):
+            for cleanup in (_maybe_close_overlays, _dismiss_import_dialog, _ensure_automation_front):
                 try:
                     cleanup(session)
                 except Exception:
@@ -3058,6 +3727,7 @@ def run_batch(products, confirm_submit=False, limit=None, session=None, cancel_e
             resume_state = (product_index, merged)
             continue
         # 终局：成功，或重试用尽/不可重试的失败 —— 落库后进入下一条。
+        _sync_worker_resume(item)
         updated.append(item)
         product_index += 1
         need_new_tab = True
@@ -3086,6 +3756,36 @@ def run_batch(products, confirm_submit=False, limit=None, session=None, cancel_e
     except Exception:
         pass
     return updated
+
+
+def run_batch(products, confirm_submit=False, limit=None, session=None, cancel_event=None,
+              on_item_start=None, on_item_done=None, force_new=False, sku_template_import=False,
+              skip_spec_images=False, sku_image_strategy="", on_flow_stage=None,
+              spec_upload_batch_size=0, item_retry_limit=0, on_item_retry=None,
+              concurrency=1, on_worker_event=None, runtime_settings=None):
+    """Run bounded, isolated workers; standalone calls retain serial defaults."""
+    if type(concurrency) is not int or not 1 <= concurrency <= 8:
+        raise ValueError("concurrency 必须是 1–8 的整数")
+    options = dict(
+        confirm_submit=confirm_submit, on_item_start=on_item_start,
+        on_item_done=on_item_done, force_new=force_new, sku_template_import=sku_template_import,
+        skip_spec_images=skip_spec_images, sku_image_strategy=sku_image_strategy,
+        on_flow_stage=on_flow_stage, spec_upload_batch_size=spec_upload_batch_size,
+        item_retry_limit=item_retry_limit, on_item_retry=on_item_retry,
+    )
+    if concurrency == 1 and on_worker_event is None and runtime_settings is None:
+        return _run_batch_serial(products, limit=limit, session=session,
+                                 cancel_event=cancel_event, **options)
+    if session is not None:
+        raise ValueError("并发任务不能共用外部 CliSession；请由执行槽建立独立会话")
+    from .concurrent_batch import run_concurrent_batch
+
+    selected = list(products or [])
+    if limit:
+        selected = selected[:limit]
+    return run_concurrent_batch(selected, concurrency=concurrency, cancel_event=cancel_event,
+                                on_worker_event=on_worker_event, runtime_settings=runtime_settings,
+                                **options)
 
 
 def resolve_naruto_product():

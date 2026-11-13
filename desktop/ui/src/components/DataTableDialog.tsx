@@ -1,6 +1,6 @@
 import { ChevronLeft, ChevronRight, X } from "lucide-react";
-import type { ReactNode } from "react";
 import { useRef } from "react";
+import type { ReactNode } from "react";
 
 import { useDialogBehavior } from "../utils/dialogFocus";
 import { Button } from "../theme";
@@ -14,6 +14,8 @@ interface DataTableDialogProps {
   pageSize: number;
   onPageChange: (page: number) => void;
   onClose: () => void;
+  /** 可选工具栏（筛选/搜索等），固定在表头与表格之间，不随表格滚动。 */
+  toolbar?: ReactNode;
   children: ReactNode;
 }
 
@@ -26,6 +28,7 @@ export default function DataTableDialog({
   pageSize,
   onPageChange,
   onClose,
+  toolbar,
   children,
 }: DataTableDialogProps) {
   const cardRef = useRef<HTMLElement>(null);
@@ -66,7 +69,8 @@ export default function DataTableDialog({
             <X className="h-5 w-5" aria-hidden="true" />
           </button>
         </header>
-        <div className="data-table-scroll min-h-0 flex-1 overflow-x-scroll overflow-y-auto overscroll-contain">{children}</div>
+        {toolbar ? <div className="shrink-0 border-b border-border px-5 py-3">{toolbar}</div> : null}
+        <div className="data-table-scroll min-h-0 min-w-0 flex-1 overflow-x-auto overflow-y-auto overscroll-contain">{children}</div>
         <footer className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-t border-border px-5 py-3">
           <span className="text-xs text-slate-500">
             共 {total} 条 · 第 {currentPage} / {totalPages} 页 · 每页 {pageSize} 条

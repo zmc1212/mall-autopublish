@@ -2,7 +2,10 @@ const {test} = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
-const helpers = fs.readFileSync(__dirname + '/_helpers.inc.js', 'utf8');
+const helpers = fs.readFileSync(__dirname + '/_helpers.inc.js', 'utf8')
+  // vm.Script 里顶层 await 非法；本文件只测 helper 函数，去掉 ensureFront
+  // 自启动行（其行为由 helpers_front.test.cjs 覆盖）。
+  .replace(/^await ensureFront\(\);\s*$/m, '');
 
 function harness(custom = {}) {
   let now = 100000;
@@ -95,7 +98,7 @@ test('a direct captcha frame records cooldown even before a frequency receipt ap
   const {c, productionAssertNoSecurityChallenge} = harness();
   c.assertNoSecurityChallenge = productionAssertNoSecurityChallenge;
   c.securityChallengeReason = async () => '滑块验证';
-  await assert.rejects(() => c.assertNoSecurityChallenge(), /PAUSE:.*手动完成验证/);
+  await assert.rejects(() => c.assertNoSecurityChallenge(), /PAUSE:.*(手动完成验证|人工处理)/);
   assert.equal((await c.readUploadPacingState()).penalty, 1);
   await assert.rejects(() => c.assertNoSecurityChallenge(), /PAUSE:/);
   assert.equal((await c.readUploadPacingState()).penalty, 1);

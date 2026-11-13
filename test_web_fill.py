@@ -40,7 +40,11 @@ class FakeSession:
         return self._href
 
     def body_text(self, limit=4000):
-        return "商品发布 如夏盛园文具店"
+        # 默认模拟"残留发布页与商品同类目"：正文含叶子类目名，复用校验通过。
+        return "商品发布 文具用品/文化用品/商务用品>>笔类/书写工具>>中性笔 如夏盛园文具店"
+
+    def mismatch_body_text(self, limit=4000):
+        return "商品发布 潮玩模玩/动漫娱乐周边/三坑娃圈>>潮玩盲盒/潮流设计周边>>潮玩盲盒"
 
     def snapshot(self):
         return """
@@ -306,7 +310,7 @@ class WebFillTests(unittest.TestCase):
                 checkpoints.append(payload["completed"])
             if name == "main_video.js":
                 self.assertEqual(payload["phase"], "open")
-                self.assertEqual(payload["files"], [video.resolve().as_posix()])
+                self.assertEqual(Path(payload["files"][0]).read_bytes(), video.read_bytes())
                 return {"uploaded": True, "verifiedBy": "slot", "slot": {"videos": 1}}
             return {"ok": True, "script": name}
 
@@ -346,7 +350,8 @@ class WebFillTests(unittest.TestCase):
         self.assertEqual(result["execution"], "已填写未提交")
         self.assertEqual(names.count("main_video.js"), 1)
         self.assertIn("logistics.js", names)
-        self.assertTrue(any("video" in completed for completed in checkpoints))
+        self.assertFalse(any("video" in completed for completed in checkpoints))
+        self.assertIn("主视频未上传", result["notice"])
 
     def test_close_video_dialog_runs_after_video_step(self):
         # 视频失败跳过后“选择视频”对话框可能残留；其 videoSelector iframe 与
@@ -577,6 +582,8 @@ class WebFillTests(unittest.TestCase):
         def fake_run(session_obj, name, payload, timeout=120):
             if name == "category.js":
                 session_obj._href = "https://item.upload.taobao.com/sell/v2/publish.htm?catId=50012720"
+            if name == "spec_page_probe.js":
+                return {"v2Cells": 0, "legacyCells": 1, "drawer": True, "editSpecBtn": True}
             if name == "spec_images.js" and payload.get("phase") == "open":
                 raise pipeline.FileChooserNeeded("### Modal state\n- [File chooser]: can be handled by upload")
             return {"ok": True, "uploaded": True, "script": name, "phase": payload.get("phase")}
@@ -661,6 +668,8 @@ class WebFillTests(unittest.TestCase):
         def fake_run(session_obj, name, payload, timeout=120):
             if name == "category.js":
                 session_obj._href = "https://item.upload.taobao.com/sell/v2/publish.htm?catId=50012720"
+            if name == "spec_page_probe.js":
+                return {"v2Cells": 0, "legacyCells": 1, "drawer": True, "editSpecBtn": True}
             if name == "spec_images.js" and payload.get("phase") not in {"open", "after_upload"}:
                 return {
                     "bindLog": [{"name": "特别款", "skuClick": "NO_DIALOG", "picClick": {"ok": False}}],
@@ -689,6 +698,8 @@ class WebFillTests(unittest.TestCase):
         def fake_run(session_obj, name, payload, timeout=120):
             if name == "category.js":
                 session_obj._href = "https://item.upload.taobao.com/sell/v2/publish.htm?catId=50012720"
+            if name == "spec_page_probe.js":
+                return {"v2Cells": 0, "legacyCells": 1, "drawer": True, "editSpecBtn": True}
             if name == "spec_images.js" and payload.get("phase") not in {"open", "after_upload"}:
                 attempts.append(1)
                 if len(attempts) < 3:
@@ -716,6 +727,8 @@ class WebFillTests(unittest.TestCase):
         def fake_run(session_obj, name, payload, timeout=120):
             if name == "category.js":
                 session_obj._href = "https://item.upload.taobao.com/sell/v2/publish.htm?catId=50012720"
+            if name == "spec_page_probe.js":
+                return {"v2Cells": 0, "legacyCells": 1, "drawer": True, "editSpecBtn": True}
             if name == "spec_images.js" and payload.get("phase") not in {"open", "after_upload"}:
                 attempts.append(1)
                 return {"bindLog": [{"name": "特别款", "picClick": {"ok": False}}], "filledCount": 0}
@@ -1100,6 +1113,72 @@ class WebFillTests(unittest.TestCase):
         self.assertIn("spec_row_images.js", names)
         self.assertNotIn("close_overlays.js", names)
 
+    def test_fill_rejects_publish_tab_of_other_category(self):
+        # 残留发布页是别的类目（如中性笔会话留下的潮玩盲盒页反向同理）：
+        # 复用校验发现正文不含本商品叶子类目，必须新开类目页签重新选择。
+        publish = "https://item.upload.taobao.com/sell/v2/publish.htm?catId=50012720"
+        session = FakeSession(href=publish, tabs=[publish])
+        session.body_text = lambda limit=4000: (
+            "商品发布 潮玩模玩/动漫娱乐周边/三坑娃圈>>潮玩盲盒/潮流设计周边>>潮玩盲盒"
+        )
+        names = []
+
+        def fake_run(session_obj, name, payload, timeout=120):
+            names.append(name)
+            if name == "category.js":
+                session_obj._href = "https://item.upload.taobao.com/sell/v2/publish.htm?catId=6109"
+            return {"ok": True, "script": name}
+
+        product = {
+            "title": "卡游",
+            "brand": "卡游",
+            "category": "中性笔",
+            "skus": [],
+            "main_images": [],
+            "detail_images": [],
+        }
+        with unittest.mock.patch.object(pipeline, "run_script", side_effect=fake_run), \
+             unittest.mock.patch.object(pipeline.time, "sleep"):
+            result = pipeline.fill_new_product(session, product, confirm_submit=False)
+        self.assertTrue(any(call[0] == "tab-new" for call in session.calls))
+        self.assertIn("category.js", names)
+        self.assertEqual(result["execution"], "已填写未提交")
+
+    def test_publish_page_has_leaf_strict_signals(self):
+        # 复用校验只认强信号：URL catId 精确匹配，或"叶子类目名+路径分隔符"
+        # 同行的面包屑。"发布历史"等模块里的孤立类目名不算（真实踩坑：
+        # 类目页/发布页的发布历史里带"潮玩盲盒"字样导致误复用中性笔页）。
+        class TextSession:
+            def __init__(self, href, text):
+                self._href = href
+                self._text = text
+
+            def href(self):
+                return self._href
+
+            def body_text(self, limit=4000):
+                return self._text
+
+        publish_url = "https://item.upload.taobao.com/sell/v2/publish.htm?catId=50012720"
+        payload = {"leaf": "潮玩盲盒", "category_id": "50012720"}
+        # URL catId 与商品一致 → 可复用（即使正文没有面包屑）。
+        self.assertTrue(pipeline._publish_page_has_leaf(
+            TextSession(publish_url, "商品发布\n发布历史: 中性笔 潮玩盲盒"), payload))
+        # URL catId 不一致 → 拒绝复用（正文面包屑说得再像也不行）。
+        mismatch_url = "https://item.upload.taobao.com/sell/v2/publish.htm?catId=999"
+        self.assertFalse(pipeline._publish_page_has_leaf(
+            TextSession(mismatch_url, "潮玩盲盒/潮流设计周边>>潮玩盲盒 切换类目"), payload))
+        # 无 category_id 时回退面包屑行：含分隔符才认。
+        breadcrumb_only = {"leaf": "潮玩盲盒", "category_id": ""}
+        self.assertTrue(pipeline._publish_page_has_leaf(
+            TextSession("https://item.upload.taobao.com/sell/v2/publish.htm?catId=6109",
+                        "商品发布\n潮玩模玩/动漫娱乐周边/三坑娃圈>>潮玩盲盒/潮流设计周边>>潮玩盲盒 切换类目"),
+            breadcrumb_only))
+        # 发布历史里的孤立"潮玩盲盒"（无路径分隔符）不能证明类目匹配。
+        self.assertFalse(pipeline._publish_page_has_leaf(
+            TextSession("https://item.upload.taobao.com/sell/v2/publish.htm?catId=50012720",
+                        "商品发布\n发布历史: 中性笔 书包 修正带 潮玩盲盒 跳绳"), breadcrumb_only))
+
     def test_fill_skips_completed_steps_on_resume(self):
         session = FakeSession()
         names = []
@@ -1460,6 +1539,23 @@ class WebFillTests(unittest.TestCase):
             "图片上传失败：批量上传未确认成功，已停止后续图片",
         )
         self.assertNotIn("列表未找到目标商品", updated[0]["notice"])
+
+    def test_resumed_material_error_replaces_stale_pause_notice(self):
+        product = {
+            "product_id": "A", "title": "测试商品", "execution": "暂停",
+            "taobao_item_id": "1087608952245", "flow_version": material_import.FLOW_VERSION,
+            "flow_stage": material_import.STAGE_RECOGNIZING,
+            "sku_image_strategy": material_import.STRATEGY_SLIM,
+            "notice": "旧的属性提示", "errors": ["旧的属性提示"],
+            "skus": [{"name": "黑色", "image": "spec.jpg", "price": 6.9, "stock": 10}],
+        }
+        with unittest.mock.patch.object(material_import, "run_material_flow",
+                side_effect=RuntimeError("PAUSE:当前预览尚未就绪")), \
+             unittest.mock.patch.object(pipeline, "fill_new_product") as fill:
+            result = pipeline.run_batch([product], session=FakeSession(), confirm_submit=True)[0]
+        fill.assert_not_called()
+        self.assertEqual(result["notice"], "当前预览尚未就绪")
+        self.assertEqual(result["errors"], ["当前预览尚未就绪"])
 
     def test_run_batch_resume_created_imports_search_main_without_spec_upload(self):
         session = FakeSession()
@@ -1896,6 +1992,100 @@ class WebFillTests(unittest.TestCase):
                 "after": {"imgs": 7, "dialog": False},
             })
 
+    def test_main_slot_recheck_recovers_slow_render(self):
+        # 主图位缩略图渲染慢：bind 核验读到 4 张，slot_count 复核读到 5 张 → 放行。
+        files = [rf"C:\tmp\qn_{'a' * 24}_主图{i:02}.jpg" for i in range(1, 6)]
+        names = [Path(path).name for path in files]
+
+        def fake_run(_session, name, payload, timeout=120):
+            self.assertEqual(name, "main_images.js")
+            if payload.get("phase") == "open":
+                return {"uploaded": True, "verifiedBy": "library-search"}
+            if payload.get("phase") == "select":
+                return {"selected": [{"name": n, "pic": {"ok": True}} for n in names],
+                        "slot": {"imgs": 4, "empty": 1}}
+            if payload.get("phase") == "slot_count":
+                return {"slot": {"imgs": 5, "empty": 0}, "names": names}
+            self.fail("unexpected phase " + str(payload.get("phase")))
+
+        with unittest.mock.patch.object(pipeline, "run_script", side_effect=fake_run), \
+             unittest.mock.patch.object(pipeline, "_prepare_media_uploads", side_effect=lambda files: files):
+            with unittest.mock.patch.object(pipeline.time, "sleep"):
+                result = pipeline._image_step(FakeSession(), "main_images.js", {
+                    "files": files, "names": names, "contentAddressedMedia": True,
+                }, files)
+        self.assertEqual(result["bind"]["slot"]["imgs"], 5)
+        self.assertTrue(result["bind"]["slot"]["rechecked"])
+
+    def test_main_slot_recheck_failure_keeps_original_error(self):
+        # 复核仍不足时保留原“写入数量不符”错误，不得放行。
+        files = [rf"C:\tmp\qn_{'a' * 24}_主图{i:02}.jpg" for i in range(1, 6)]
+        names = [Path(path).name for path in files]
+
+        def fake_run(_session, name, payload, timeout=120):
+            if payload.get("phase") == "open":
+                return {"uploaded": True, "verifiedBy": "library-search"}
+            if payload.get("phase") == "select":
+                return {"selected": [{"name": n, "pic": {"ok": True}} for n in names],
+                        "slot": {"imgs": 4, "empty": 1}}
+            if payload.get("phase") == "slot_count":
+                return {"slot": {"imgs": 4, "empty": 1}, "names": names}
+            return {}
+
+        with unittest.mock.patch.object(pipeline, "run_script", side_effect=fake_run), \
+             unittest.mock.patch.object(pipeline, "_prepare_media_uploads", side_effect=lambda files: files):
+            with unittest.mock.patch.object(pipeline.time, "sleep"):
+                with self.assertRaisesRegex(RuntimeError, "图片包 5 张，页面 4 张"):
+                    pipeline._image_step(FakeSession(), "main_images.js", {
+                        "files": files, "names": names, "contentAddressedMedia": True,
+                    }, files)
+
+    def test_main_open_frame_detach_is_retried_once(self):
+        # 重试进入时素材库 iframe 正被重建：open 首跑抛 Frame was detached，
+        # 重跑 open（missing 过滤保证不重复投递）后走正常绑定。
+        files = [rf"C:\tmp\qn_{'a' * 24}_主图{i:02}.jpg" for i in range(1, 6)]
+        names = [Path(path).name for path in files]
+        opens = []
+
+        def fake_run(_session, name, payload, timeout=120):
+            phase = payload.get("phase") or name
+            if name == "close_overlays.js":
+                return {}
+            if name == "main_images.js" and phase == "open":
+                opens.append(1)
+                if len(opens) == 1:
+                    raise RuntimeError("frame.evaluate: Frame was detached")
+                return {"uploaded": True, "verifiedBy": "library-search"}
+            if name == "main_images.js" and phase == "select":
+                return {"selected": [{"name": n, "pic": {"ok": True}} for n in names],
+                        "slot": {"imgs": len(names), "empty": 0}}
+            self.fail("unexpected script " + name)
+
+        with unittest.mock.patch.object(pipeline, "run_script", side_effect=fake_run), \
+             unittest.mock.patch.object(pipeline, "_prepare_media_uploads", side_effect=lambda files: files):
+            with unittest.mock.patch.object(pipeline.time, "sleep"):
+                result = pipeline._image_step(FakeSession(), "main_images.js", {
+                    "files": files, "names": names, "contentAddressedMedia": True,
+                }, files)
+        self.assertEqual(result["open"]["verifiedBy"], "library-search")
+        self.assertEqual(len(opens), 2)
+
+    def test_main_open_frame_detach_without_content_addressing_is_not_retried(self):
+        # 非 contentAddressedMedia 路径无法用素材库点名防重投，保持原样直接抛。
+        files = [r"C:\tmp\宝贝主图01.jpg", r"C:\tmp\宝贝主图02.jpg"]
+
+        def fake_run(_session, name, payload, timeout=120):
+            if name == "main_images.js" and payload.get("phase") == "open":
+                raise RuntimeError("frame.evaluate: Frame was detached")
+            self.fail("open must not be retried without contentAddressedMedia")
+
+        with unittest.mock.patch.object(pipeline, "run_script", side_effect=fake_run):
+            with unittest.mock.patch.object(pipeline.time, "sleep"):
+                with self.assertRaisesRegex(RuntimeError, "Frame was detached"):
+                    pipeline._image_step(FakeSession(), "main_images.js", {
+                        "files": files, "names": [Path(p).name for p in files],
+                    }, files)
+
 
 def sellertab_url():
     return "https://myseller.taobao.com/home.htm/qnworkbenchhome"
@@ -2066,6 +2256,79 @@ class TabRecycleTests(unittest.TestCase):
         session = TabListSession([(edit_url("123"), True)])
         pipeline._finish_product_tabs(session, None, {"run_status": "paused"})
         self.prune_mock.assert_called_with(None, keep_url=edit_url("123"))
+
+
+class RunScriptForegroundTests(unittest.TestCase):
+    """并发入库冻结页面修复：TimeoutExpired 落诊断 + 重试前还原窗口。"""
+
+    def test_all_scripts_render_to_valid_js(self):
+        """渲染冒烟：所有脚本注入 PAYLOAD/HELPERS 后必须仍是合法 JS。
+
+        material_import.js 曾因注释里出现注入标记字面量，render_script 把
+        helpers 整段替换进注释中间，真实运行才爆 SyntaxError（2026-10-04
+        并发验收续跑三连败）。此测试用 node --check 在提交前拦截。
+        """
+        import os
+        import subprocess
+        import tempfile
+
+        scripts = sorted(p.name for p in pipeline.SCRIPTS.glob("*.js"))
+        self.assertTrue(scripts)
+        with tempfile.TemporaryDirectory() as directory:
+            original = os.environ.get("QIANNIU_OUTPUT_DIR")
+            os.environ["QIANNIU_OUTPUT_DIR"] = directory
+            try:
+                for name in scripts:
+                    with self.subTest(script=name):
+                        path = pipeline.render_script(name, {})
+                        check = subprocess.run(["node", "--check", path],
+                                               capture_output=True, text=True)
+                        self.assertEqual(check.returncode, 0,
+                                         f"{name} 渲染后非法: {check.stderr[:200]}")
+            finally:
+                if original is None:
+                    os.environ.pop("QIANNIU_OUTPUT_DIR", None)
+                else:
+                    os.environ["QIANNIU_OUTPUT_DIR"] = original
+
+    def test_timeout_expired_writes_raw_and_raises_runtime(self):
+        """TimeoutExpired 原样穿透会绕过 raw.txt 诊断与文本分类，必须归一。"""
+        import os
+        import subprocess
+
+        session = FakeSession()
+
+        def raise_timeout(*args, **kwargs):
+            raise subprocess.TimeoutExpired(cmd="playwright-cli run-code", timeout=120)
+
+        with tempfile.TemporaryDirectory() as directory, \
+             unittest.mock.patch.object(pipeline, "_ensure_automation_front"), \
+             unittest.mock.patch.dict(os.environ, {"QIANNIU_OUTPUT_DIR": directory}), \
+             unittest.mock.patch.object(session, "cmd", side_effect=raise_timeout):
+            with self.assertRaisesRegex(RuntimeError, "timed out after 120 seconds"):
+                pipeline.run_script(session, "sku_import.js", {"phase": "verify"}, timeout=120)
+            raw = (Path(directory) / "web_fill_sku_import.raw.txt").read_text(encoding="utf-8")
+        self.assertIn("timed out after 120 seconds", raw)
+
+    def test_item_retry_cleanup_reveals_automation_window(self):
+        """条目级重试前必须还原自动化窗口，否则重试会再次进入冻结页面。"""
+        session = FakeSession()
+        calls = []
+
+        def fake_fill(session_obj, product, **kwargs):
+            return {"execution": "失败", "notice": "页面操作超时，请重试",
+                    "errors": ["页面操作超时，请重试"], "steps": []}
+
+        products = [
+            {"product_id": "A", "title": "卡游A", "execution": "未执行",
+             "skus": [], "main_images": [], "detail_images": []},
+        ]
+        with unittest.mock.patch.object(pipeline, "fill_new_product", side_effect=fake_fill), \
+             unittest.mock.patch.object(pipeline, "_ensure_automation_front",
+                                        side_effect=lambda *args: calls.append(args)):
+            pipeline.run_batch(products, session=session, item_retry_limit=1)
+        # run_script 内部调用无参数；重试清理传入 session，二者都应出现。
+        self.assertIn((session,), calls)
 
 
 if __name__ == "__main__":

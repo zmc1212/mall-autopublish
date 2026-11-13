@@ -79,15 +79,15 @@ class ResumeTests(unittest.TestCase):
             p.run_script(s, 'main_images.js', {})
         self.assertEqual(s.calls, [])
 
-    def test_failed_batch_keeps_page_and_does_not_start_next_product(self):
+    def test_failed_batch_keeps_page_and_continues_to_next_product(self):
         s = FakeSession()
         web = p._load_web()
         with patch.object(p, '_prune_tabs') as prune, patch.object(web, 'assert_logged_in'), \
              patch.object(p, '_remember_item'), patch.object(p, '_write_progress'), \
              patch.object(p, 'fill_new_product', return_value={'execution':'失败','notice':'主图超时'}) as fill:
             result = p.run_batch([self.product, self.product], session=s)
-        self.assertEqual(len(result), 1)
-        self.assertEqual(fill.call_count, 1)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(fill.call_count, 2)
         self.assertEqual(prune.call_args.kwargs['keep_url'], s.href())
 
 

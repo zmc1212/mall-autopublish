@@ -17,6 +17,7 @@ if str(ROOT) not in sys.path:
 
 from desktop import paths  # noqa: E402
 from desktop.paths import configure_environ, logs_dir  # noqa: E402
+from desktop.single_instance import acquire, activate_existing_window  # noqa: E402
 
 
 class JsBridge:
@@ -25,6 +26,9 @@ class JsBridge:
 
     def pick_chrome(self):
         return self._dialog("open", ("Chrome (chrome.exe)", "可执行文件 (*.exe)"))
+
+    def pick_update(self):
+        return self._dialog("open", ("程序内更新包 (*.zip)",))
 
     def pick_folder(self):
         return self._dialog("folder")
@@ -83,7 +87,13 @@ def _cleanup_automation_chrome() -> None:
 
         load_web().close_automation_chrome()
     except Exception:
-        # 退出清理不能覆盖主程序原始异常，也不能阻止进程退出。
+        pass
+    try:
+        from desktop.detail_browser import close_detail_browser
+
+        close_detail_browser()
+    except Exception:
+        # 详情浏览器与入库浏览器隔离，只回收本模块持有的进程。
         pass
 
 
@@ -158,8 +168,17 @@ def _log_build_fingerprint() -> None:
 
 def main(argv=None) -> int:
     freeze_support()
+    runtime_started = False
+    instance_lock = None
     try:
         argv = list(sys.argv[1:] if argv is None else argv)
+        # The installer and packer run --self-test without opening a desktop window.
+        # The update worker is dispatched by run_desktop.py before this function.
+        if "--self-test" not in argv:
+            instance_lock = acquire()
+            if instance_lock is None:
+                activate_existing_window()
+                return 0
         configure_environ()
         problems = _runtime_preflight(require_bundle=paths.is_frozen())
         _write_self_test(problems)
@@ -168,7 +187,7 @@ def main(argv=None) -> int:
         if problems:
             raise RuntimeError("运行环境不完整：\n- " + "\n- ".join(problems))
         _log_build_fingerprint()
-        from desktop.server import pick_free_port, run_server
+        from desktop.server import MANAGER, UPDATER, pick_free_port, run_server
         from urllib.request import urlopen
 
         port = pick_free_port()
@@ -181,6 +200,7 @@ def main(argv=None) -> int:
 
         thread = threading.Thread(target=_run_api, daemon=True, name="qianniu-api")
         thread.start()
+        runtime_started = True
         url = f"http://127.0.0.1:{port}/"
         for _ in range(80):
             try:
@@ -205,7 +225,7 @@ def main(argv=None) -> int:
         window_icon = paths.find_resource(
             "logo", "40c40691-9747-453a-a1d1-f2c94d393f34.ico"
         )
-        webview.create_window(
+        window = webview.create_window(
             "千牛自动上架",
             target,
             js_api=JsBridge(),
@@ -214,16 +234,14 @@ def main(argv=None) -> int:
             min_size=(1180, 760),
             background_color="#F8FAFC",
         )
-        try:
-            webview.start(
-                gui="edgechromium",
-                icon=str(window_icon),
-                debug=debug,
-                private_mode=False,
-                storage_path=str(paths.appdata_dir() / "webview-profile"),
-            )
-        finally:
-            _cleanup_automation_chrome()
+        UPDATER.configure(MANAGER, window.destroy)
+        webview.start(
+            gui="edgechromium",
+            icon=str(window_icon),
+            debug=debug,
+            private_mode=False,
+            storage_path=str(paths.appdata_dir() / "webview-profile"),
+        )
         return 0
     except Exception as exc:
         _write_crash(exc)
@@ -234,6 +252,15 @@ def main(argv=None) -> int:
         except Exception:
             print(exc)
         return 1
+    finally:
+        try:
+            # Keep the lock while closing our browser, so the next instance
+            # cannot attach to a browser that is still shutting down.
+            if runtime_started:
+                _cleanup_automation_chrome()
+        finally:
+            if instance_lock is not None:
+                instance_lock.close()
 
 
 if __name__ == "__main__":

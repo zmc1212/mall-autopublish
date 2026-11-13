@@ -122,11 +122,47 @@ class ExecutionHistoryTests(unittest.TestCase):
         job_session.remember_workbook("清单.xlsx", items)
         job_session.forget_execution(row=2, product_id="火影-001")
         session = job_session.load_session()
-        self.assertNotIn("火影-001", session.get("execution_history") or {})
+        reset = session["execution_history"]["火影-001"]
+        self.assertFalse(reset["taobao_item_id"])
+        self.assertTrue(reset["execution_reset_id"])
         merged = job_session.merge_execution(
             [self._item(2, "火影-001", "fp1")], "清单.xlsx"
         )
         self.assertEqual(merged[0]["execution"], "未执行")
+        self.assertEqual(merged[0]["execution_reset_id"], reset["execution_reset_id"])
+
+    def test_forget_executions_batch_prevents_relink(self):
+        items = [
+            self._item(2, "火影-001", "fp1", execution="已上架", taobao_item_id="123"),
+            self._item(3, "火影-002", "fp2", execution="已上架", taobao_item_id="456"),
+        ]
+        job_session.remember_workbook("清单.xlsx", items)
+        job_session.forget_executions(rows=[2, 3])
+        session = job_session.load_session()
+        history = session["execution_history"]
+        self.assertFalse(history["火影-001"]["taobao_item_id"])
+        self.assertFalse(history["火影-002"]["taobao_item_id"])
+        self.assertNotEqual(history["火影-001"]["execution_reset_id"], history["火影-002"]["execution_reset_id"])
+        merged = job_session.merge_execution(
+            [self._item(2, "火影-001", "fp1"), self._item(3, "火影-002", "fp2")], "清单.xlsx"
+        )
+        self.assertEqual(merged[0]["execution"], "未执行")
+        self.assertEqual(merged[1]["execution"], "未执行")
+
+    def test_reset_survives_revalidation_and_folder_disappearance(self):
+        job_session.remember_workbook("清单.xlsx", [
+            self._item(2, "火影-001", "fp1", execution="已上架", taobao_item_id="123")])
+        job_session.forget_execution(row=2, product_id="火影-001")
+        reset_id = job_session.load_session()["rows"][0]["execution_reset_id"]
+        # Revalidating an empty workspace must retain the reset decision by product.
+        job_session.remember_workbook("清单.xlsx", [])
+        merged = job_session.merge_execution([self._item(4, "火影-001", "fp1")], "清单.xlsx")
+        job_session.remember_workbook("清单.xlsx", merged)
+        session = job_session.load_session()
+        self.assertEqual(session["rows"][0]["execution_reset_id"], reset_id)
+        self.assertFalse(session["rows"][0]["taobao_item_id"])
+        job_session.forget_execution(row=4, product_id="火影-001")
+        self.assertNotEqual(job_session.load_session()["rows"][0]["execution_reset_id"], reset_id)
 
     def test_patch_execution_archives_state(self):
         items = [self._item(2, "火影-001", "fp1")]
@@ -145,6 +181,57 @@ class ExecutionHistoryTests(unittest.TestCase):
         history = job_session.load_session().get("execution_history") or {}
         self.assertEqual(history["火影-001"]["flow_stage"], "complete")
         self.assertEqual(history["火影-001"]["pack_fingerprint"], "fp1")
+
+    def test_confirmed_video_warning_clear_survives_restart_and_history_restore(self):
+        warning = "主视频未上传：索引未确认"
+        for patch_kind in ("execution", "flow"):
+            with self.subTest(patch_kind=patch_kind):
+                item = self._item(2, "火影-001", "fp1", execution="已入库",
+                                  taobao_item_id="123", video_warning=warning)
+                item["product"]["video_warning"] = warning
+                job_session.remember_workbook("清单.xlsx", [item])
+                if patch_kind == "execution":
+                    job_session.patch_execution(2, "火影-001", "已入库", extra={"video_warning": ""})
+                else:
+                    job_session.patch_flow_state(2, "火影-001", {"video_warning": ""})
+                session = job_session.load_session()
+                self.assertEqual(session["rows"][0]["video_warning"], "")
+                self.assertEqual(session["products"][0]["meta"]["video_warning"], "")
+                self.assertEqual(session["products"][0]["product"]["video_warning"], "")
+                self.assertEqual(session["execution_history"]["火影-001"]["video_warning"], "")
+                restored = job_session.merge_execution([
+                    self._item(2, "火影-001", "fp1", video_warning=warning)], "清单.xlsx")
+                self.assertEqual(restored[0]["video_warning"], "")
+
+    def test_publish_checkpoint_and_write_intent_survive_restart(self):
+        item = self._item(2, '火影-001', 'fp1', execution='暂停')
+        job_session.remember_workbook('清单.xlsx', [item])
+        before = {'key': 'same-product', 'href': 'https://item.upload.taobao.com/sell/v2/publish.htm?catId=123',
+                  'submit_started': False}
+        intent = {'script': 'sku_import.js', 'phase': 'open'}
+        job_session.patch_flow_state(2, '火影-001', {'resume_checkpoint': before, 'last_browser_write': intent})
+        pending = {**before, 'submit_started': True}
+        job_session.patch_execution(2, '火影-001', '提交待核实', extra={'resume_checkpoint': pending})
+        session = job_session.load_session()
+        self.assertEqual(session['rows'][0]['resume_checkpoint'], pending)
+        self.assertEqual(session['products'][0]['meta']['resume_checkpoint'], pending)
+        self.assertEqual(session['products'][0]['product']['resume_checkpoint'], pending)
+        restored = job_session.merge_execution([self._item(2, '火影-001', 'fp1')], '清单.xlsx')
+        self.assertEqual(restored[0]['resume_checkpoint'], pending)
+        self.assertEqual(restored[0]['last_browser_write'], intent)
+
+    def test_video_status_survives_restart_and_replaces_previous_failure(self):
+        item = self._item(2, '火影-001', 'fp1', execution='已入库', taobao_item_id='123456789',
+                          video_status='failed', video_warning='主视频未上传')
+        item['product']['video_status'] = 'failed'
+        job_session.remember_workbook('清单.xlsx', [item])
+        job_session.patch_flow_state(2, '火影-001', {'video_status': 'uploaded', 'video_warning': ''})
+        state = job_session.load_session()
+        self.assertEqual(state['rows'][0]['video_status'], 'uploaded')
+        self.assertEqual(state['products'][0]['product']['video_status'], 'uploaded')
+        restored = job_session.merge_execution([self._item(2, '火影-001', 'fp1')], '清单.xlsx')
+        self.assertEqual(restored[0]['video_status'], 'uploaded')
+        self.assertEqual(restored[0]['video_warning'], '')
 
     def test_unfinished_rows_are_not_archived(self):
         items = [self._item(2, "火影-001", "fp1")]

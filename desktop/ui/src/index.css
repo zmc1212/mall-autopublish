@@ -1,18 +1,20 @@
 @import "tailwindcss";
+@import "./workbench.css";
 
 @theme {
-  --color-primary: #ea580c;
+  --color-primary: #18856b;
+  --color-primary-hover: #116d57;
   --color-on-primary: #ffffff;
-  --color-sidebar: #0b1220;
-  --color-sidebar-muted: #94a3b8;
-  --color-background: #f8fafc;
-  --color-foreground: #0f172a;
-  --color-muted: #f1f5f9;
-  --color-border: #e2e8f0;
+  --color-sidebar: #f5f9f6;
+  --color-sidebar-muted: #607069;
+  --color-background: #f3f6f4;
+  --color-foreground: #163e35;
+  --color-muted: #edf3f0;
+  --color-border: #dfe7e2;
   --color-success: #059669;
   --color-warning: #d97706;
   --color-destructive: #dc2626;
-  --font-sans: "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+  --font-sans: "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", "PingFang SC", sans-serif;
 }
 
 html,
@@ -40,7 +42,7 @@ summary {
 }
 
 :focus-visible {
-  outline: 2px solid #ea580c;
+  outline: 2px solid #18856b;
   outline-offset: 2px;
 }
 

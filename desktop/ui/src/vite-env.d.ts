@@ -3,6 +3,7 @@
 interface PyWebviewApi {
   pick_excel: () => Promise<string>;
   pick_chrome: () => Promise<string>;
+  pick_update: () => Promise<string>;
   pick_folder: () => Promise<string>;
   save_template: () => Promise<string>;
   open_path: (path: string) => Promise<boolean>;

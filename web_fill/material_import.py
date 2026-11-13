@@ -65,6 +65,12 @@ _UNSAFE_NAME = re.compile(r'[<>:"/\|?*\x00-\x1f]')
 _DEVICE_NAME = re.compile(r"^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:.|$)", re.I)
 _ITEM_ID = re.compile(r"\d{8,20}")
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+# The confirmation preview occasionally renders an attribute column as a
+# placeholder even though the server baseline contains the value.  This is a
+# narrow, read-only preview exception: an actual value changing to an empty
+# placeholder is recorded as evidence and deferred to the post-adoption server
+# verification.  Any other attribute change remains a hard pause.
+_PREVIEW_ATTRIBUTE_PLACEHOLDERS = frozenset({"-"})
 
 
 def normalize_stage(value):
@@ -157,8 +163,36 @@ def build_material_folder(product, item_id, directory, product_key=""):
     return folder.resolve()
 
 
-def check_rows(rows, product, baseline=None, images=False):
-    """核对后台/确认页 SKU 行与输入商品：行数、名称、ID、价格库存、搜索标题与图片。"""
+def _known_preview_attribute_difference(source, row):
+    """Return evidence for the one safe preview-only attribute mismatch.
+
+    The material confirmation view has been observed to lose the
+    ``attributes_text`` value and render ``-`` (for example, ``书写粗细:
+    0.05mm`` becomes ``-``).  This does not prove that the server value was
+    changed, so it may pass only before adoption.  Missing fields, arbitrary
+    replacements, and the reverse direction are still rejected.
+    """
+    if "attributes_text" not in source or "attributes_text" not in row:
+        return None
+    baseline = str(source.get("attributes_text") or "").strip()
+    preview = str(row.get("attributes_text") or "").strip()
+    if baseline == preview or not baseline or preview not in _PREVIEW_ATTRIBUTE_PLACEHOLDERS:
+        return None
+    return {
+        "field": "attributes_text",
+        "baseline": source.get("attributes_text"),
+        "preview": row.get("attributes_text"),
+        "reason": "preview_placeholder",
+    }
+
+
+def check_rows(rows, product, baseline=None, images=False, allow_preview_attributes=False):
+    """核对后台/确认页 SKU 行与输入商品。
+
+    ``allow_preview_attributes`` 只供素材识别/采纳前的确认页使用；它
+    允许已知的 attributes_text 占位差异并把双方值写回该行作为证据。
+    采纳后的服务器核验必须保持默认的严格模式。
+    """
     expected = {sku["name"]: sku for sku in product["skus"]}
     if len(rows) != len(expected) or {r["name"] for r in rows} != set(expected):
         raise RuntimeError("PAUSE:SKU 行数或名称与输入不一致")
@@ -178,6 +212,11 @@ def check_rows(rows, product, baseline=None, images=False):
             raise RuntimeError("PAUSE:素材识别还改变了搜索标题，需人工核对")
         for field in ("attributes_text", "merchant_code"):
             if previous and field in source and row.get(field) != source[field]:
+                if field == "attributes_text" and allow_preview_attributes:
+                    diff = _known_preview_attribute_difference(source, row)
+                    if diff:
+                        row["preview_attribute_diff"] = diff
+                        continue
                 raise RuntimeError("PAUSE:素材识别改变了属性或商家编码，需人工核对")
 
 
@@ -220,6 +259,100 @@ def ensure_sku_tab(session):
         session.tab_select(found)
 
 
+def _current_tab_index(session):
+    """Return the current tab index when the CLI exposes its marker.
+
+    The isolated ``CliSession`` also has stable leases, but the fallback keeps
+    this read-only recovery path compatible with the older non-isolated CLI
+    and the small test doubles used by the material flow tests.
+    """
+    try:
+        parser = getattr(pipeline, "_parse_tabs_with_current", None)
+        if callable(parser):
+            rows = parser(session.tab_list())
+            current = [index for index, _url, marked in rows if marked]
+            if len(current) == 1:
+                return current[0]
+        else:
+            text = str(session.tab_list() or "")
+            for line in text.splitlines():
+                if re.search(r"^\s*-\s*(\d+):\s*\(current\)", line):
+                    return int(re.search(r"^\s*-\s*(\d+):", line).group(1))
+    except Exception:
+        pass
+    return None
+
+
+def _server_verify_on_owned_tab(session, web, item_id, title, product, baseline, preview):
+    """Refresh and verify on a separate owned SKU page.
+
+    Adoption can be accepted while its drawer remains mounted, and a resume
+    after ``inspect_material=False`` may leave the worker on an edit page.
+    First select/reuse this worker's own SKU page and guard it; then always
+    open a second page belonging to the same worker/item for the server read.
+    This keeps any uncertain drawer parked for review and never navigates it.
+    The temporary page is closed only after successful verification.
+    """
+    tab_new = getattr(session, "tab_new", None)
+    if not callable(tab_new):
+        # Legacy/non-session test doubles have no page lifecycle API.  Keep
+        # their original behavior while real CliSession always takes the
+        # isolated branch below.
+        ensure_sku_tab(session)
+        return _script(session, web, item_id, title, "verify", baseline=baseline, preview=preview)
+
+    # A resume after server-item inspection can leave the worker on an edit
+    # page.  Select the owned SKU page before the URL/security guard; a fresh
+    # tab must never be a way to evade a login/captcha/security pause.
+    ensure_sku_tab(session)
+    _script(session, web, item_id, title, "guard")
+
+    original_lease = getattr(session, "active_lease", None)
+    original_index = _current_tab_index(session)
+    tab_new(SKU_URL)
+    verification_lease = getattr(session, "active_lease", None)
+    verification_index = _current_tab_index(session)
+    verified = False
+    try:
+        result = _script(
+            session, web, item_id, title, "verify",
+            baseline=baseline, preview=preview, fresh=True,
+        )
+        verified = True
+        return result
+    finally:
+        # Always return the worker to the original drawer page.  If the
+        # server read paused, leave the fresh page owned as evidence; the
+        # worker's normal preserve path will park both pages.
+        if verified:
+            try:
+                if verification_lease is not None:
+                    session.tab_close(verification_lease)
+                elif (verification_index is not None
+                      and verification_index != original_index
+                      and callable(getattr(session, "tab_close", None))):
+                    session.tab_close(verification_index)
+                elif (verification_index is None
+                      and callable(getattr(session, "tab_close", None))):
+                    # Older non-isolated CLI output may omit the current
+                    # marker.  tab-close without an argument still targets
+                    # the just-opened current page in that mode.
+                    session.tab_close()
+            except Exception:
+                # A close failure must not turn a verified server result into
+                # an item failure; finish_item() will still retire owned tabs.
+                pass
+        try:
+            if original_lease is not None:
+                session.tab_select(original_lease)
+            elif original_index is not None:
+                session.tab_select(original_index)
+        except Exception:
+            # The original page may have disappeared independently.  The
+            # registry/finish path remains the authority for owned pages.
+            pass
+
+
 def inspect_target_skus(session, web, item_id, title):
     """按商品 ID 定位并读取后台 SKU ID、名称、顺序与基线字段。"""
     ensure_sku_tab(session)
@@ -233,7 +366,7 @@ def upload_materials(session, web, item_id, title, folder, baseline):
 
 
 def await_recognition(session, web, item_id, title, product, baseline, timeout=180):
-    """有限等待素材识别；识别完成前轮询确认页，返回核对后的预览行。"""
+    """有限等待素材识别；返回带预览差异证据的确认页行。"""
     ensure_sku_tab(session)
     deadline = time.monotonic() + timeout
     while True:
@@ -241,26 +374,98 @@ def await_recognition(session, web, item_id, title, product, baseline, timeout=1
         preview = _script(session, web, item_id, title, "preview", baseline=baseline)
         if preview.get("ready"):
             rows = preview.get("rows") or []
-            check_rows(rows, product, baseline, images=True)
+            # The preview may render a known attributes_text placeholder.  The
+            # row is annotated by check_rows so the evidence survives in the
+            # persisted material_preview state before adoption.
+            check_rows(rows, product, baseline, images=True, allow_preview_attributes=True)
             return rows
         if time.monotonic() >= deadline:
             raise RuntimeError("PAUSE:素材识别未完成；保留页面和进度，继续任务可接着等待")
         time.sleep(3)
 
 
+def _without_preview_evidence(rows):
+    """Canonicalize rows for a fresh preview comparison.
+
+    ``preview_attribute_diff`` is local evidence added by the client; it is
+    intentionally ignored when comparing a fresh page to the persisted
+    preview payload.  All business fields remain part of the comparison.
+    """
+    return [
+        {key: value for key, value in row.items() if key != "preview_attribute_diff"}
+        for row in rows or []
+    ]
+
+
+def _preview_attribute_notice(rows):
+    differences = [row for row in rows or [] if row.get("preview_attribute_diff")]
+    if not differences:
+        return ""
+    examples = "、".join(str(row.get("name") or row.get("sku_id") or "")
+                         for row in differences[:3])
+    suffix = "等" if len(differences) > 3 else ""
+    return (
+        f"素材预览有 {len(differences)} 个 SKU 的属性暂显示为“-”"
+        f"（{examples}{suffix}），已记录原值；自动采纳后核对服务器属性"
+    )
+
+
+def _save_material_adopt_receipt(item_id, title, result):
+    """Persist the one-shot Adopt return before any later verify artifact.
+
+    ``run_script`` uses a shared material-import JSON name, so the subsequent
+    verify call can replace the useful click diagnostic.  The concurrent
+    runtime maps ``pipeline.get_output()`` to this worker/item artifact
+    directory; the standalone flow has the same output root and remains
+    serial.  A diagnostic write must not change the existing flow/retry
+    semantics if the filesystem is unavailable.
+    """
+    payload = {
+        "item_id": str(item_id),
+        "title": str(title or ""),
+        "recorded_at": time.time(),
+        "recorded_at_iso": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "result": result,
+    }
+    try:
+        output = Path(pipeline.get_output())
+        output.mkdir(parents=True, exist_ok=True)
+        target = output / "web_fill_material_adopt_receipt.json"
+        temporary = target.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+        temporary.replace(target)
+    except (OSError, TypeError, ValueError) as exc:
+        # This is evidence only; preserve the established stage and retry
+        # decisions when a diagnostic directory cannot be written.
+        try:
+            pipeline._flow_log(f"素材采纳回执写入失败：{exc}", "warn")
+        except Exception:
+            pass
+
+
 def review_materials(session, web, item_id, title, baseline, preview):
     """采纳前再次核对确认页并执行采纳。"""
     ensure_sku_tab(session)
     current = _script(session, web, item_id, title, "preview", baseline=baseline)
-    if not current.get("ready") or (current.get("rows") or []) != preview:
+    current_rows = current.get("rows") or []
+    if not current.get("ready") or _without_preview_evidence(current_rows) != _without_preview_evidence(preview):
         raise RuntimeError("PAUSE:素材确认页面已变化，请核对")
-    _script(session, web, item_id, title, "adopt", baseline=baseline, preview=preview)
+    # The script returns an explicit uncertain result after it has attempted
+    # the click but cannot prove that the drawer closed.  Let the caller move
+    # to server verification; resuming there must never click Adopt again.
+    result = _script(session, web, item_id, title, "adopt", baseline=baseline, preview=preview)
+    _save_material_adopt_receipt(item_id, title, result)
+    return result
 
 
 def verify_materials(session, web, item_id, title, product, baseline, preview):
     """采纳后刷新并按 SKU ID 逐行核验图片持久化。"""
-    ensure_sku_tab(session)
-    verified = _script(session, web, item_id, title, "verify", baseline=baseline, preview=preview)
+    verified = _server_verify_on_owned_tab(
+        session, web, item_id, title, product, baseline, preview,
+    )
     rows = verified.get("rows") or []
     check_rows(rows, product, baseline, images=True)
     return rows
@@ -311,7 +516,8 @@ def run_material_flow(session, web, product, item_id, state, on_stage=None, reco
         if stage in {STAGE_UPLOAD_PENDING, STAGE_RECOGNIZING}:
             move(STAGE_RECOGNIZING)
             preview = await_recognition(session, web, item_id, title, product, baseline, recognize_timeout)
-            move(STAGE_REVIEWED, preview=preview)
+            notice = _preview_attribute_notice(preview)
+            move(STAGE_REVIEWED, preview=preview, **({"notice": notice} if notice else {}))
 
         if stage == STAGE_REVIEWED:
             move(STAGE_ADOPT_PENDING)

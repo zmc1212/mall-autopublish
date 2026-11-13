@@ -1,0 +1,8 @@
+{
+  "architecture": "windows-x64",
+  "node": "v24.9.0",
+  "playwright": "1.62.1",
+  "chromium": "151.0.7922.34",
+  "chromium_revision": "1234",
+  "webview2": "154.0.4258.37"
+}

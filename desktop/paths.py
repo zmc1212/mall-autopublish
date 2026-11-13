@@ -249,11 +249,14 @@ class Settings:
     sku_image_strategy: str = "slim_material"
     settings_version: int = 3
     limit: int = 0
+    # 同时处理的商品数量；1 表示保持顺序执行，最多允许 8 个执行槽。
+    concurrency: int = 2
     # 入库后进编辑页每批补传的规格图行数；0 表示全部一次上传。
     spec_upload_batch_size: int = 2
     # 条目失败后的自动重试次数；0 表示失败不重试直接跳下一条。
     item_retry_limit: int = 1
     results_dir: str = ""
+    update_feed_url: str = ""
 
     def normalized(self) -> "Settings":
         # Keep an explicit override in settings; an empty value means bundled browser.
@@ -272,10 +275,32 @@ class Settings:
             sku_image_strategy=self.sku_image_strategy if self.sku_image_strategy in {"slim_material", "publish_page", "both"} else "slim_material",
             settings_version=max(3, int(self.settings_version or 3)),
             limit=max(0, int(self.limit or 0)),
+            concurrency=max(1, min(8, int(self.concurrency or 2))),
             spec_upload_batch_size=max(0, min(99, int(self.spec_upload_batch_size or 0))),
             item_retry_limit=max(0, min(5, int(self.item_retry_limit or 0))),
             results_dir=str(results),
+            update_feed_url=str(self.update_feed_url or "").strip(),
         )
+
+
+def default_update_feed_url() -> str:
+    """首次升级旧客户端时，使用构建中写入的已部署更新地址。"""
+    manifest = find_resource("runtime-manifest.json")
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8-sig"))
+        return str(data.get("update_feed_url") or "")
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
+def default_license_server_url() -> str:
+    """构建时写入的授权服务地址；为空表示该构建未启用联网激活（开发/测试）。"""
+    manifest = find_resource("runtime-manifest.json")
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8-sig"))
+        return str(data.get("license_server_url") or "").rstrip("/")
+    except (OSError, ValueError, AttributeError):
+        return ""
 
 
 def load_settings() -> Settings:
@@ -301,19 +326,29 @@ def load_settings() -> Settings:
         sku_image_strategy=strategy,
         settings_version=int(data.get("settings_version") or 2),
         limit=int(data.get("limit") or 0),
+        concurrency=max(1, min(8, int(data.get("concurrency", 2) or 2))),
         spec_upload_batch_size=max(0, int(data.get("spec_upload_batch_size", 2) or 0)),
         item_retry_limit=max(0, min(5, int(data.get("item_retry_limit", 1) or 0))),
         results_dir=str(data.get("results_dir") or ""),
+        update_feed_url=str((data["update_feed_url"] if "update_feed_url" in data else default_update_feed_url()) or ""),
     ).normalized()
     return settings
 
 
 def save_settings(settings: Settings) -> Settings:
+    """Persist settings without changing the active runtime configuration.
+
+    A running batch owns a snapshot of its settings.  Reconfiguring imported
+    modules here would make a later item in that batch observe a different
+    browser/profile/output configuration than the first item.  Runtime setup
+    is performed at application startup or when a new browser/job is opened.
+    The debug-browser endpoint separately applies only window visibility to an
+    already connected browser.
+    """
     current = settings.normalized()
     path = settings_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(asdict(current), ensure_ascii=False, indent=2), encoding="utf-8")
-    configure_environ(current)
     return current
 
 

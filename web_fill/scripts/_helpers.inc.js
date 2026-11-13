@@ -1,5 +1,46 @@
 const sleep = (ms) => page.waitForTimeout(ms);
 
+// Some categories attach specification photos to sales-property values above
+// the SKU table. The table's -skuPicture cell is a separate search-main image.
+async function readSalesSpecImages(skus = []) {
+  return page.evaluate((expected) => {
+    const controls = [...document.querySelectorAll('#sell-field-saleProp .sell-color-option-image-upload')];
+    if (!controls.length) return null;
+    const values = controls.map(box => {
+      const option = box.closest('li');
+      const group = box.closest('.common-wrap');
+      const label = (group?.querySelector('.props-label')?.textContent || '').replace(/\s*\(\d+\)\s*$/, '').trim();
+      const name = option?.querySelector('input')?.value?.trim() || '';
+      const src = box.querySelector('img[src]')?.getAttribute('src') || '';
+      return {label, name, src};
+    }).filter(value => value.name);
+    const rows = expected.length ? expected.map((sku, index) => {
+      const matches = values.filter(value => (sku.specs?.[value.label] || sku.name) === value.name);
+      return {index: index + 1, name: sku.name, value: matches[0]?.name || '',
+        src: matches.length === 1 ? matches[0].src : '', matched: matches.length === 1};
+    }) : values.map((value, index) => ({index: index + 1, ...value, matched: true}));
+    return {target: 'sale-property', total: rows.filter(row => row.matched).length,
+      filled: rows.filter(row => row.src).length, missing: rows.filter(row => !row.src).map(row => row.index),
+      sources: rows, controls: values.length};
+  }, skus);
+}
+
+// 后台页签/隐藏窗口里 Chrome 暂停 rAF，locator.click 的"元素稳定"前置检查
+// 必超时（并发多 worker 共用一个窗口、页签互切后台时必现）。交互脚本执行前
+// 先确保本页签可见：bringToFront 只切页签，窗口级隐藏要靠 Python 侧的
+// restore_automation_chrome 还原。waitForFunction 必须用 polling 轮询——
+// 默认 rAF 轮询在隐藏页里永远不会触发。
+async function ensureFront() {
+  try {
+    if (await page.evaluate(() => document.visibilityState) !== "visible") {
+      await page.bringToFront().catch(() => {});
+      await page.waitForFunction(() => document.visibilityState === "visible", null,
+        { polling: 100, timeout: 3000 }).catch(() => {});
+    }
+  } catch (_) {}
+}
+await ensureFront();
+
 function unsafeUrl(url) {
   const u = String(url || "");
   // Narrow authorization for a read-only-verified existing-item repair.
@@ -235,9 +276,9 @@ async function listSucaiPics(frame) {
   });
 }
 
-async function clickSucaiCard(frame, file, preferInner, single) {
+async function clickSucaiCard(frame, file, preferInner, single, releaseSelected = false) {
   const exact = String(file || "").split(/[\\/]/).pop();
-  return frame.evaluate(([fileName, inner, onlyOne]) => {
+  return frame.evaluate(([fileName, inner, onlyOne, release]) => {
     // The material library stores '+' in uploaded filenames as a space.
     const normalize = value => String(value || "").replace(/\+/g, " ").replace(/\s+/g, " ").trim();
     const want = normalize(fileName);
@@ -263,6 +304,13 @@ async function clickSucaiCard(frame, file, preferInner, single) {
     if (!card) return { ok: false, n: cards.length, names: cards.slice(0, 8).map((el) => (el.innerText || "").replace(/\s+/g, " ").slice(0, 40)) };
     const checkbox = card.querySelector("input[type='checkbox']");
     const src = card.querySelector('img')?.getAttribute('src') || '';
+    if (release) {
+      // Only the batch specification picker may release a retained selection,
+      // after reading that the newly focused target row is still empty.
+      if (!checkbox || checkbox.disabled || !checkbox.checked) return {ok: false, reason: 'NO_RETAINED_SELECTION', src};
+      checkbox.click();
+      return {ok: !checkbox.checked, released: !checkbox.checked, src};
+    }
     if (onlyOne) {
       if (checkbox && checkbox.disabled) return {ok: false, reason: 'NO_SELECTABLE_CHECKBOX'};
       // A reused picker can retain the previous row's selection. A ready
@@ -287,7 +335,7 @@ async function clickSucaiCard(frame, file, preferInner, single) {
     }
     return { ok: true, src, t: (card.innerText || "").replace(/\s+/g, " ").slice(0, 80), n: hits.length,
       target: target === card ? "card" : String(target.className || target.tagName || "inner").slice(0, 80) };
-  }, [exact, !!preferInner, !!single]);
+  }, [exact, !!preferInner, !!single, !!releaseSelected]);
 }
 
 async function confirmCrop() {
@@ -732,6 +780,155 @@ async function pickPictureSpaceCards(frame, names) {
   return out;
 }
 
+async function releasePictureSpaceCards(frame, targets) {
+  // 取消目标素材卡片的勾选，用于清理上传完成后的迟到预选。卡片解析规则
+  // 与 pickPictureSpaceCards 的 inspect 一致（material:ID 优先，否则按
+  // labels JSON 匹配），返回是否全部确认取消。
+  if (!frame) return false;
+  const release = ({target}) => {
+    const visible = el => {
+      for (let node = el; node; node = node.parentElement) {
+        const style = getComputedStyle(node);
+        if (style.display === 'none' || style.visibility === 'hidden') return false;
+      }
+      return true;
+    };
+    const raw = [...document.querySelectorAll(".item.pic, [class*='PicturesShow']")]
+      .filter(el => visible(el) && el.querySelector('img'));
+    const normalize = value => String(value || '').replace(/\+/g, ' ').replace(/\s+/g, ' ').trim();
+    const labels = el => [el.innerText, el.getAttribute('title'), el.getAttribute('data-file-name'),
+      ...[...el.querySelectorAll('[title], [data-file-name]')].map(node => node.getAttribute('title') || node.getAttribute('data-file-name'))]
+      .filter(Boolean).map(normalize);
+    const cards = raw.filter(el => el.querySelectorAll("input[type='checkbox']").length === 1);
+    const card = cards.find(el => {
+      const value = el.querySelector("input[type='checkbox']")?.getAttribute('value');
+      const key = value && value !== 'on' ? 'material:' + value : JSON.stringify(labels(el));
+      return key === target;
+    });
+    if (!card) return {found: false};
+    const checkbox = card.querySelector("input[type='checkbox']");
+    if (!checkbox.checked) return {found: true, cleared: true};
+    checkbox.click();
+    return {found: true, cleared: false};
+  };
+  for (const target of targets || []) {
+    let cleared = false;
+    for (let attempt = 0; attempt < 10 && !cleared; attempt++) {
+      const state = await frame.evaluate(release, {target}).catch(() => null);
+      if (!state || !state.found) return false;
+      if (state.cleared) { cleared = true; break; }
+      await sleep(200);
+    }
+    if (!cleared) return false;
+  }
+  return true;
+}
+
+async function verifySkuTableValues(page, specs, attempts) {
+  // 受控输入框要失焦提交；隐藏副本不能当库存框，重建表格后不能沿用旧索引。
+  // 空字符串与库存 0 必须区分。逐屏处理虚拟表格，再连续两轮回读确认稳定。
+  const expected = (specs || []).flatMap(sku => ['price', 'stock']
+    .filter(field => sku[field] !== undefined && sku[field] !== null && String(sku[field]).trim() !== '')
+    .map(field => ({name: String(sku.name), field, want: String(sku[field])})));
+  if (!expected.length) return [];
+  const key = value => JSON.stringify([value.name, value.field]);
+  const same = value => value.got !== '' && (Number.isFinite(Number(value.got)) && Number.isFinite(Number(value.want))
+    ? Number(value.got) === Number(value.want) : value.got === value.want);
+  const snapshot = () => page.evaluate(wanted => {
+    const normalize = text => String(text || '').replace(/\s+/g, ' ').trim();
+    const names = [...new Set(wanted.map(x => x.name))].sort((a, b) => b.length - a.length);
+    const result = [];
+    const inputs = [...document.querySelectorAll('table input')];
+    inputs.forEach((el, index) => {
+      const rect = el.getBoundingClientRect();
+      const style = getComputedStyle(el);
+      if (el.disabled || el.readOnly || /^(hidden|checkbox|radio|file|button|submit)$/.test(el.type)
+          || !rect.width || !rect.height || style.visibility === 'hidden' || style.display === 'none') return;
+      const cell = el.closest('td');
+      const row = el.closest('tr');
+      if (!cell || !row) return;
+      const text = normalize(row.innerText);
+      const values = [...row.querySelectorAll('input, textarea')].map(x => normalize(x.value));
+      const name = names.find(n => values.includes(normalize(n))) || names.find(n => text.includes(normalize(n)));
+      if (!name) return;
+      const label = (cell.id || '') + ' ' + (el.getAttribute('aria-label') || '');
+      const unit = normalize(cell.innerText);
+      const header = row.closest('table')?.querySelector('thead tr')?.children[cell.cellIndex]?.innerText || '';
+      const field = /price|价格|售价/i.test(label) ? 'price' : /stock|quantity|库存|数量/i.test(label) ? 'stock'
+        : /元/.test(unit) && !/件/.test(unit) ? 'price' : /件/.test(unit) && !/元/.test(unit) ? 'stock'
+        : /价格|售价/.test(header) ? 'price' : /库存/.test(header) ? 'stock' : '';
+      const want = wanted.find(x => x.name === name && x.field === field);
+      if (want) result.push({...want, index, got: String(el.value || '').trim(), cellId: cell.id || ''});
+    });
+    return result;
+  }, expected);
+  const viewport = top => page.evaluate(position => {
+    for (const input of document.querySelectorAll('table input')) {
+      if (!/元|件/.test(input.closest('tr')?.innerText || '')) continue;
+      let el = input.parentElement;
+      while (el && el !== document.body) {
+        if (/(auto|scroll)/.test(getComputedStyle(el).overflowY) && el.scrollHeight > el.clientHeight + 50) {
+          if (position !== null) el.scrollTop = position;
+          return {top: el.scrollTop, height: el.clientHeight, max: el.scrollHeight - el.clientHeight};
+        }
+        el = el.parentElement;
+      }
+    }
+    return null;
+  }, top);
+  const original = await viewport(null);
+  let bad = expected.map(x => ({...x, got: '', reason: '未找到可编辑单元格'}));
+  let cleanPasses = 0;
+  const fillErrors = new Map();
+  try {
+    for (let round = 0; round < Math.max(2, attempts || 5); round++) {
+      await ensureFront();
+      if (original) { await viewport(0); await sleep(400); }
+      const seen = new Map();
+      for (let screen = 0; screen < 80; screen++) {
+        const current = await snapshot();
+        for (const target of current.filter(x => !same(x))) {
+          // Re-resolve before every write: blur can replace/reorder all rows.
+          const matches = (await snapshot()).filter(x => key(x) === key(target));
+          if (matches.length !== 1) continue;
+          const input = await page.locator('table input').nth(matches[0].index).elementHandle();
+          if (!input) continue;
+          try {
+            if (round) {
+              await input.fill('', {timeout: 3000});
+              await input.type(target.want, {delay: 30, timeout: 3000});
+            } else await input.fill(target.want, {timeout: 3000});
+            await input.press('Tab', {timeout: 2000});
+            fillErrors.delete(key(target));
+          } catch (error) {
+            fillErrors.set(key(target), String(error.message || error).slice(0, 180));
+          } finally { await input.dispose(); }
+        }
+        await sleep(650);
+        const readback = await snapshot();
+        for (const target of readback) {
+          const duplicates = readback.filter(x => key(x) === key(target));
+          seen.set(key(target), duplicates.length === 1 ? target
+            : {...target, got: '', reason: '同一规格存在多个可编辑单元格，未写入'});
+        }
+        const view = await viewport(null);
+        if (!view || view.top >= view.max - 2) break;
+        await ensureFront();
+        await viewport(Math.min(view.max, view.top + Math.max(200, Math.floor(view.height * 0.7))));
+        await sleep(400);
+      }
+      bad = expected.map(x => seen.get(key(x)) || {...x, got: '', reason: '未找到可编辑单元格'})
+        .filter(x => x.reason || !same(x))
+        .map(x => fillErrors.has(key(x)) ? {...x, error: fillErrors.get(key(x))} : x);
+      cleanPasses = bad.length ? 0 : cleanPasses + 1;
+      if (cleanPasses >= 2) return [];
+    }
+    return bad;
+  } finally {
+    if (original) await viewport(original.top).catch(() => {});
+  }
+}
+
 async function confirmPictureSpace(frame) {
   const pageOk = await page.evaluate(() => {
     const visible = (el) => {
@@ -841,13 +1038,52 @@ async function securityChallengeReason() {
   return "";
 }
 
+async function closeSecurityChallenge() {
+  // 自动关闭滑块/验证弹窗：优先点容器内关闭按钮，找不到就整层隐藏。
+  // 实测（2026-10-04）：一次性风控弹窗关掉后重试原操作即可通过，无需人工。
+  const SCAN_SRC = () => {
+    const clickable = (el) => el && el.getBoundingClientRect().width > 0;
+    const dismiss = (scope) => {
+      if (!scope) return false;
+      const btn = [...scope.querySelectorAll("button, a, [role=button], i, span, div")].find((b) => {
+        const sig = String(b.className || "") + " " + (b.getAttribute("aria-label") || "") + " " + (b.innerText || "");
+        return /(?:^|[\s_-])(?:close|×|x)(?:$|[\s_-])|关闭/i.test(sig.slice(0, 120)) && clickable(b);
+      });
+      if (btn) { btn.click(); return true; }
+      scope.style.setProperty("display", "none", "important");
+      return true;
+    };
+    let touched = 0;
+    const seen = new Set();
+    for (const el of document.querySelectorAll(
+      ".J_MIDDLEWARE_FRAME_WIDGET, [class*='baxia'], [id*='baxia'], [class*='punish'], [id*='punish'], [class*='captcha'], [class*='Captcha']"
+    )) {
+      if (!clickable(el) || seen.has(el)) continue;
+      seen.add(el);
+      const dialog = el.closest("[class*='dialog'], [class*='Dialog'], [class*='modal'], [class*='Modal'], [class*='overlay'], [class*='dialog-wrapper']") || el;
+      if (dismiss(dialog)) touched++;
+    }
+    return touched;
+  };
+  let touched = 0;
+  if (typeof page.evaluate === "function") touched = await page.evaluate(SCAN_SRC);
+  for (const f of (typeof page.frames === "function" ? page.frames() : [])) {
+    if (f === page) continue;
+    try { touched += await f.evaluate(SCAN_SRC); } catch (e) {}
+  }
+  return touched;
+}
+
 async function assertNoSecurityChallenge() {
   const reason = await securityChallengeReason();
-  if (reason) {
+  if (!reason) return;
+  // 新策略（2026-10-04）：先自动关闭验证弹窗并复核；关不掉才暂停留人工。
+  await closeSecurityChallenge();
+  await sleep(900);
+  const still = await securityChallengeReason();
+  if (still) {
     await recordUploadPacingResult(false, undefined, "platform-verification");
-    // Keep the challenge visible for the user. Dismissing it is not proof
-    // that the platform has authorized further uploads.
-    throw new Error("PAUSE:淘宝触发“" + reason + "”，请在浏览器手动完成验证后继续；已保留现场，未自动重试");
+    throw new Error("PAUSE:淘宝触发“" + reason + "”，自动关闭验证弹窗未生效，请人工处理后继续；已保留现场，未自动重试");
   }
 }
 
@@ -1568,6 +1804,8 @@ async function closeDialogsOnly() {
     const roots = [...document.querySelectorAll(".next-dialog, .next-overlay-wrapper.opened .next-dialog, .batch-fill-sku-image-dialog")];
     let n = 0;
     for (const root of roots) {
+      // This confirmation belongs to submission, not to dialog cleanup.
+      if ((root.innerText || "").includes("商品属性信息更新确定")) continue;
       const close = root.querySelector(".next-dialog-close, [aria-label='关闭']");
       if (close) {
         try { close.click(); n += 1; } catch (e) {}
@@ -1575,6 +1813,51 @@ async function closeDialogsOnly() {
     }
     return n;
   });
+}
+
+async function confirmProductAttributeUpdate(policy = {}) {
+  const title = "商品属性信息更新确定";
+  const dialog = page.locator('.next-dialog:visible, [role="dialog"]:visible, [role="alertdialog"]:visible')
+    .filter({ has: page.getByText(title, { exact: true }) });
+  const count = await dialog.count();
+  if (!count) return null;
+  if (count !== 1) throw new Error("PAUSE:商品属性更新弹窗不唯一，未自动确认");
+  if (await dialog.getAttribute("data-qn-attribute-confirm-sent")) {
+    throw new Error("PAUSE:商品属性更新确认结果待核实，未重复点击");
+  }
+  const button = dialog.getByRole("button", { name: "确定", exact: true });
+  if (await button.count() !== 1) throw new Error("PAUSE:商品属性更新弹窗未找到唯一确定按钮");
+  if (policy.preserveExisting) {
+      const options = dialog.getByRole('radio', {name: '不采纳', exact: true});
+      const count = await options.count();
+      if (!count) throw new Error('PAUSE:补图片时无法保留原商品属性，未确认属性推荐');
+      for (let index = 0; index < count; index++) await options.nth(index).check({timeout: 3000});
+      // React may commit the controlled choices after the input DOM changes.
+      // Confirming in the same evaluate turn can send the old adoption values.
+      await sleep(300);
+      for (let index = 0; index < count; index++) {
+        if (!(await options.nth(index).isChecked())) {
+          throw new Error('PAUSE:补图片时无法保留原商品属性，未确认属性推荐');
+        }
+      }
+  }
+  const evidence = await dialog.evaluate(el => ({
+    text: (el.innerText || "").trim().slice(0, 1800),
+    choices: [...el.querySelectorAll('input[type="radio"]')].map(input => ({
+      value: input.value, checked: input.checked,
+      label: (input.closest('label, .next-radio-wrapper')?.innerText || "").trim(),
+    })),
+  }));
+  // Preserve the existing 采纳/不采纳 choices. Mark before the click so an
+  // uncertain result cannot make the same DOM dialog receive another click.
+  await dialog.evaluate(el => el.setAttribute("data-qn-attribute-confirm-sent", "1"));
+  try {
+    await button.click({ timeout: 5000 });
+    await dialog.waitFor({ state: "hidden", timeout: 8000 });
+  } catch (error) {
+    throw new Error("PAUSE:商品属性更新确认结果待核实，未重复点击：" + String(error).slice(0, 200));
+  }
+  return { title, confirmed: true, ...evidence };
 }
 
 async function warehouseState() {
@@ -1645,4 +1928,31 @@ async function selectWarehouseRadio() {
   }).catch(() => "ERR");
   await sleep(400);
   return warehouseState();
+}
+
+// 属性模板驱动：把 PAYLOAD.attributes 收成 [label, value] 对。
+// 数组值表示多选属性，逐值展开；模板属性全为空时回退 defaults（老清单兜底）。
+function qnAttrPairs(attrs, defaults) {
+  const pairs = [];
+  const push = (label, value) => {
+    if (!label) return;
+    const text = value === null || value === undefined ? "" : String(value).trim();
+    if (text) pairs.push([String(label), text]);
+  };
+  const source = attrs && typeof attrs === "object" && !Array.isArray(attrs) ? attrs : {};
+  for (const [label, value] of Object.entries(source)) {
+    if (Array.isArray(value)) {
+      for (const one of value) push(label, one);
+    } else {
+      push(label, value);
+    }
+  }
+  if (!pairs.length && defaults && defaults.length) {
+    for (const [label, value] of defaults) {
+      const own = Object.prototype.hasOwnProperty.call(source, label) ? source[label] : undefined;
+      const text = own === null || own === undefined ? "" : String(own).trim();
+      push(label, text || value);
+    }
+  }
+  return pairs;
 }

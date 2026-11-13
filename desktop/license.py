@@ -11,12 +11,20 @@ import base64
 import hashlib
 import json
 import os
+import re
+import secrets
 import threading
 import time
+import urllib.error
+import urllib.request
+import uuid
 from pathlib import Path
 
 # 程序内置的 Ed25519 公钥（32 字节，Base64）。私钥绝不放入本仓库或安装包。
 PUBLIC_KEY_B64 = "diDdNVZi5+v/9ZCvEqYAq8eOLDEPS2doYwBiSHY7vJU="
+
+# 授权服务响应签名公钥（与发码私钥无关）：客户端只认服务端签名，防止伪造“已授权”。
+LICENSE_SERVER_PUBLIC_KEY_B64 = "GObbwzb1FTcREe3nHzkMyKG3bYCM7s5vR1EcR4rvx4U="
 
 # 机器码派生盐：更换盐会使所有已签发激活码失效，发布后不可改动。
 _MACHINE_SALT = "qianniu-license-v1"
@@ -24,10 +32,17 @@ _PAYLOAD_VERSION = 1
 # 限期码防系统时间回拨的容忍窗口；永久码不做任何时间检查。
 _CLOCK_ROLLBACK_TOLERANCE = 24 * 3600
 _LAST_SEEN_UPDATE_INTERVAL = 3600
+# 联网确认间隔与请求超时：每 6 小时心跳一次，吊销会在一个周期内生效。
+_HEARTBEAT_INTERVAL = 6 * 3600
+_SERVER_TIMEOUT = 6.0
 
 
 class LicenseError(Exception):
     """激活失败，message 面向最终用户展示。"""
+
+
+class LicenseServerUnreachable(LicenseError):
+    """暂时连不上授权服务：已有租约时可继续离线使用，但不能算激活成功。"""
 
 
 # ---------------------------------------------------------------------------
@@ -304,12 +319,151 @@ def verify_code(code: str, public_key: bytes | None = None) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 授权服务：设备标识、签名响应校验与联网确认
+# ---------------------------------------------------------------------------
+def server_url() -> str:
+    """授权服务地址：环境变量优先，其次构建时写入的 runtime-manifest.json。"""
+    override = str(os.environ.get("QIANNIU_LICENSE_SERVER") or "").strip()
+    if override:
+        return override.rstrip("/")
+    try:
+        from . import paths
+
+        return paths.default_license_server_url().rstrip("/")
+    except Exception:
+        return ""
+
+
+def device_id() -> str:
+    """本机安装标识（首次生成后固定），服务端据此限制同时使用的设备数。"""
+    from . import paths
+
+    path = paths.appdata_dir() / "device.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        value = str(data.get("id") or "")
+    except (OSError, ValueError, AttributeError):
+        value = ""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,64}", value):
+        value = uuid.uuid4().hex
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"id": value}, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+    return value
+
+
+def _post(path: str, payload: dict, timeout: float = _SERVER_TIMEOUT) -> dict:
+    """POST 授权服务；服务端明确拒绝抛 LicenseError，网络问题抛 LicenseServerUnreachable。"""
+    base = server_url()
+    if not base:
+        raise LicenseServerUnreachable("本版本未配置授权服务，无法联网激活。")
+    request = urllib.request.Request(
+        base + path,
+        data=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+        headers={"Content-Type": "application/json", "User-Agent": "QianniuLicense/1"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read(4096).decode("utf-8", "replace").strip()
+        try:
+            message = str(json.loads(detail).get("error") or detail)
+        except ValueError:
+            message = detail
+        raise LicenseError(message or f"授权服务返回 HTTP {exc.code}") from exc
+    except (urllib.error.URLError, OSError) as exc:
+        raise LicenseServerUnreachable(f"无法连接授权服务器（{exc}）") from exc
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except ValueError as exc:
+        raise LicenseServerUnreachable("授权服务返回内容异常") from exc
+    if not isinstance(data, dict):
+        raise LicenseServerUnreachable("授权服务返回内容异常")
+    return data
+
+
+def _open_envelope(envelope) -> dict:
+    """校验服务端签名并返回 payload；验签失败一律按“未确认”处理，不当作激活成功。"""
+    if not isinstance(envelope, dict):
+        raise LicenseServerUnreachable("授权服务响应格式异常")
+    try:
+        body = base64.b64decode(str(envelope.get("body") or ""))
+        signature = base64.b64decode(str(envelope.get("sig") or ""))
+    except (ValueError, TypeError) as exc:
+        raise LicenseServerUnreachable("授权服务响应格式异常") from exc
+    public = base64.b64decode(LICENSE_SERVER_PUBLIC_KEY_B64)
+    if not ed25519_verify(public, body, signature):
+        raise LicenseServerUnreachable("授权服务响应验签失败，已按未确认处理")
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except ValueError as exc:
+        raise LicenseServerUnreachable("授权服务响应内容异常") from exc
+    if not isinstance(payload, dict):
+        raise LicenseServerUnreachable("授权服务响应内容异常")
+    return payload
+
+
+def _status_message(status: str) -> str:
+    return {
+        "revoked": "该授权已被停用（订单已退款或违规使用），如需恢复请联系卖家。",
+        "device_mismatch": "该激活码已绑定其他设备，请联系卖家换绑后再激活。",
+        "expired": "激活码已过期，请联系卖家续期。",
+        "unknown": "授权服务没有该激活码记录，请联系卖家重新发码。",
+    }.get(status, "授权状态无法确认，请联系卖家。")
+
+
+def _request_activation(code: str, device: str, payload: dict) -> dict:
+    """首次激活/租约失效后的联网确认；返回服务端签名凭据。"""
+    envelope = _post("/v1/activate", {
+        "code": normalize_code(code),
+        "device_id": device,
+        "machine_code": machine_code(),
+        "exp": int(payload.get("exp") or 0),
+        "memo": str(payload.get("memo") or ""),
+    })
+    confirmation = _open_envelope(envelope)
+    status = str(confirmation.get("status") or "")
+    if status != "active":
+        raise LicenseError(_status_message(status))
+    if str(confirmation.get("device_id") or "") != device:
+        raise LicenseServerUnreachable("授权服务返回的设备标识不一致，请重试")
+    return {"confirmation": confirmation, "envelope": envelope}
+
+
+def _lease_status(lease, device: str) -> tuple[dict | None, str]:
+    """校验本地租约；返回 (确认信息, 失效原因)。"""
+    if not isinstance(lease, dict) or not lease:
+        return None, "首次激活需要联网确认，请连网后重新打开软件。"
+    try:
+        confirmation = _open_envelope(lease)
+    except LicenseServerUnreachable:
+        return None, "本机授权凭据异常，请联网后重新打开软件确认。"
+    if str(confirmation.get("device_id") or "") != device:
+        return None, "本机授权凭据与设备不匹配，请联网后重新激活。"
+    status = str(confirmation.get("status") or "")
+    if status != "active":
+        return None, _status_message(status)
+    not_after = int(confirmation.get("not_after") or 0)
+    if not_after and time.time() > not_after:
+        return None, "离线已超过宽限期，请联网后重新打开软件确认授权。"
+    return confirmation, ""
+
+
+# ---------------------------------------------------------------------------
 # 授权状态：license.json 只存激活码原文，每次启动重新验签，篡改无效
 # ---------------------------------------------------------------------------
 _license_lock = threading.Lock()
 _cached_payload: dict | None = None
+_cached_confirmation: dict | None = None
 _last_issue = ""
 _loaded = False
+_heartbeat_lock = threading.Lock()
+_heartbeat_running = False
+_heartbeat_stop = threading.Event()
 
 
 def _log_event(message: str) -> None:
@@ -349,12 +503,16 @@ def license_path() -> Path:
 
 
 def _write_file(code: str, last_seen: float) -> None:
+    _save_state({"code": code, "last_seen": last_seen})
+
+
+def _save_state(data: dict) -> None:
+    """原子写入 license.json，避免进程中断留下半截文件。"""
     path = license_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps({"code": code, "last_seen": last_seen}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    temp = path.with_suffix(".tmp")
+    temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temp, path)
 
 
 def _verify_saved(data: dict) -> dict | None:
@@ -395,10 +553,40 @@ def _verify_saved(data: dict) -> dict | None:
         return None
     if expires_at and now - last_seen > _LAST_SEEN_UPDATE_INTERVAL:
         try:
-            _write_file(code, now)
+            _save_state({**data, "code": code, "last_seen": now})
         except OSError:
             pass
-    global _last_issue
+
+    base = server_url()
+    confirmation = None
+    if base:
+        device = device_id()
+        confirmation, reason = _lease_status(data.get("lease"), device)
+        if confirmation is None:
+            # 首次激活、老版本升级或租约过期：再联网确认一次，成功后继续离线使用。
+            try:
+                result = _request_activation(code, device, payload)
+            except LicenseServerUnreachable as exc:
+                _record_issue(reason or str(exc))
+                return None
+            except LicenseError as exc:
+                _record_issue(str(exc))
+                return None
+            except Exception as exc:
+                _record_issue(f"联网确认授权异常（{exc.__class__.__name__}），请检查网络后重新打开软件。")
+                return None
+            confirmation = result["confirmation"]
+            now = time.time()
+            data = {**data, "code": code, "lease": result["envelope"],
+                    "device": device, "last_heartbeat": now}
+            try:
+                _save_state(data)
+            except OSError:
+                pass
+        _ensure_heartbeat(code, device)
+
+    global _last_issue, _cached_confirmation
+    _cached_confirmation = confirmation
     _last_issue = ""
     memo = str(payload.get("memo") or "")
     licensed_fp = _fingerprint(str(payload.get("fp") or ""))
@@ -411,11 +599,12 @@ def _verify_saved(data: dict) -> dict | None:
 
 
 def _ensure_loaded() -> None:
-    global _loaded, _cached_payload, _last_issue
+    global _loaded, _cached_payload, _cached_confirmation, _last_issue
     if _loaded:
         return
     _last_issue = ""
     _loaded = True
+    _cached_confirmation = None
     path = license_path()
     if not path.is_file():
         _cached_payload = None
@@ -438,29 +627,50 @@ def _ensure_loaded() -> None:
 
 
 def _reset_cache() -> None:
-    global _loaded, _cached_payload, _last_issue
+    global _loaded, _cached_payload, _cached_confirmation, _last_issue
     _loaded = False
     _cached_payload = None
+    _cached_confirmation = None
     _last_issue = ""
 
 
+def _lease_expired() -> bool:
+    """联网确认的离线宽限期是否已过（未启用联网确认时永远为 False）。"""
+    not_after = int((_cached_confirmation or {}).get("not_after") or 0)
+    return bool(not_after and time.time() > not_after)
+
+
 def is_activated() -> bool:
+    global _last_issue
     with _license_lock:
         _ensure_loaded()
-        return _cached_payload is not None
+        if _cached_payload is None:
+            return False
+        # 长时间挂着软件也要执行离线宽限期：租约到期即要求联网确认。
+        if _lease_expired():
+            _last_issue = "离线已超过宽限期，请联网后重新打开软件确认授权。"
+            return False
+        return True
 
 
 def _state_unlocked() -> dict:
     """持锁状态下组装授权状态（activate 与 state 共用）。"""
     payload = _cached_payload
+    expired = payload is not None and _lease_expired()
+    activated = payload is not None and not expired
+    issue = ""
+    if not activated:
+        issue = _last_issue or ("离线已超过宽限期，请联网后重新打开软件确认授权。" if expired else "")
     result = {
-        "activated": payload is not None,
+        "activated": activated,
         "machine_code": machine_code(),
         "expires_at": 0,
         "memo": "",
         "days_left": None,
+        # 已联网确认过时，本次离线可用的截止时间；0 表示未启用联网确认。
+        "offline_until": 0,
         # 未激活且本机存在失效授权时，向激活页解释原因；正常未激活为空串。
-        "issue": "" if payload is not None else _last_issue,
+        "issue": issue,
     }
     if payload:
         expires_at = int(payload.get("exp") or 0)
@@ -468,6 +678,8 @@ def _state_unlocked() -> dict:
         result["memo"] = str(payload.get("memo") or "")
         if expires_at:
             result["days_left"] = max(0, int((expires_at - time.time()) // 86400) + 1)
+        if _cached_confirmation:
+            result["offline_until"] = int(_cached_confirmation.get("not_after") or 0)
     return result
 
 
@@ -478,25 +690,102 @@ def state() -> dict:
         return _state_unlocked()
 
 
+def _ensure_heartbeat(code: str, device: str) -> None:
+    """启动后台心跳（每进程一个）：定期复查吊销/换机状态并续租。"""
+    global _heartbeat_running
+    with _heartbeat_lock:
+        if _heartbeat_running:
+            return
+        _heartbeat_running = True
+        _heartbeat_stop.clear()
+    threading.Thread(target=_heartbeat_loop, args=(normalize_code(code), device), daemon=True).start()
+
+
+def _heartbeat_loop(code: str, device: str) -> None:
+    global _heartbeat_running
+    try:
+        while not _heartbeat_stop.is_set():
+            outcome = _heartbeat_once(code, device)
+            if outcome not in {"active", "network"}:
+                return
+            if _heartbeat_stop.wait(_HEARTBEAT_INTERVAL):
+                return
+    finally:
+        with _heartbeat_lock:
+            _heartbeat_running = False
+
+
+def _heartbeat_once(code: str, device: str) -> str:
+    """一次心跳：active 表示续租成功，network 表示暂时连不上，其余为服务端判定失效。"""
+    global _cached_payload, _cached_confirmation
+    try:
+        envelope = _post("/v1/heartbeat", {
+            "code": code,
+            "device_id": device,
+            "nonce": secrets.token_hex(8),
+        })
+        confirmation = _open_envelope(envelope)
+    except LicenseError:
+        return "network"
+    status = str(confirmation.get("status") or "")
+    if status != "active":
+        with _license_lock:
+            _cached_payload = None
+            _cached_confirmation = None
+            _record_issue(_status_message(status))
+        return status
+    with _license_lock:
+        try:
+            data = json.loads(license_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return "stop"
+        if not isinstance(data, dict) or _fingerprint(str(data.get("code") or "")) != _fingerprint(code):
+            return "stop"
+        data.update({"lease": envelope, "last_heartbeat": time.time(), "device": device})
+        try:
+            _save_state(data)
+        except OSError:
+            pass
+        _cached_confirmation = confirmation
+    return "active"
+
+
 def activate(code: str) -> dict:
-    """校验并保存激活码；失败抛 LicenseError（中文原因）。"""
+    """校验并保存激活码；首次激活必须联网确认（失败抛 LicenseError）。"""
     with _license_lock:
         payload = verify_code(code)
-        _write_file(normalize_code(code), time.time())
-        global _loaded, _cached_payload, _last_issue
+        now = time.time()
+        confirmation = None
+        device = ""
+        data = {"code": normalize_code(code), "last_seen": now}
+        if server_url():
+            device = device_id()
+            try:
+                result = _request_activation(code, device, payload)
+            except LicenseServerUnreachable as exc:
+                raise LicenseError("首次激活需要联网确认，请检查网络后重试。") from exc
+            confirmation = result["confirmation"]
+            data.update({"lease": result["envelope"], "device": device, "last_heartbeat": now})
+        _save_state(data)
+        global _loaded, _cached_payload, _cached_confirmation, _last_issue
         _loaded = True
         _cached_payload = payload
+        _cached_confirmation = confirmation
         _last_issue = ""
         _log_event(f"激活成功：memo={payload.get('memo') or '—'} 机器码={machine_code()}")
+        if device:
+            _ensure_heartbeat(normalize_code(code), device)
         return _state_unlocked()
 
 
 def deactivate() -> None:
-    """删除本机授权（换机转移前使用）。"""
+    """删除本机授权（换机转移前使用），并停止后台心跳。"""
+    _heartbeat_stop.set()
     with _license_lock:
-        global _loaded, _cached_payload, _last_issue
+        global _loaded, _cached_payload, _cached_confirmation, _last_issue
         _loaded = True
         _cached_payload = None
+        _cached_confirmation = None
         _last_issue = ""
         try:
             license_path().unlink()

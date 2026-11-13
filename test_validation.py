@@ -511,6 +511,27 @@ class ImagePackAndTemplateTests(unittest.TestCase):
         self.assertEqual([p.name for p in pack['main_1_1']], ['宝贝主图01.jpg'])
         self.assertEqual([p.name for p in pack['main_3_4']], ['主图3比4-01.jpg'])
 
+    def test_sku_names_with_portrait_tokens_remain_skus(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            names = [
+                '颜色23-4弹【羁绊款】漩涡鸣人送10支笔芯.jpg',
+                '颜色24-3-4弹.jpg',
+                '颜色25－3比4款.jpg',
+            ]
+            for name, size in zip(names, [(800, 800), (3, 4), (800, 800)]):
+                Image.new('RGB', size).save(root / name)
+            for name in ['主图3比4-01.jpg', '主图3-4-02.jpg']:
+                Image.new('RGB', (3, 4)).save(root / name)
+            pack = seller.scan_image_pack(root)
+            self.assertCountEqual([p.name for p in pack['main_3_4']],
+                                  ['主图3比4-01.jpg', '主图3-4-02.jpg'])
+            self.assertEqual([s['image'].name for s in pack['skus']], names)
+            self.assertEqual([s['slot'] for s in pack['skus']],
+                             ['颜色23', '颜色24', '颜色25'])
+            self.assertEqual(pack['skus'][0]['name'], '4弹【羁绊款】漩涡鸣人送10支笔芯')
+            self.assertEqual(pack['main_1_1'], [])
+
     def test_main_image_name_and_ratio_are_combined(self):
         root = Path(tempfile.mkdtemp())
         self.addCleanup(lambda: __import__('shutil').rmtree(root, ignore_errors=True))

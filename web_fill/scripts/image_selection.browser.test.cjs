@@ -2,7 +2,7 @@ const {test} = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const {chromium} = require('../../.work/node_modules/playwright-core');
-const helpers = fs.readFileSync(__dirname + '/_helpers.inc.js', 'utf8');
+const helpers = fs.readFileSync(__dirname + '/_helpers.inc.js', 'utf8').replace(/^await ensureFront\(\);\s*$/m, '');
 
 test('verification searches off-page reused assets by hash and preserves genuine misses', async () => {
   const old = 'qn_5f8dbf429a1fc797ab4e11e6_详情22.png';

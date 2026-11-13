@@ -74,9 +74,13 @@ async page => {
   }
 
   async function readSelectorState() {
+    return selectorAction('read');
+  }
+
+  async function selectorAction(action) {
     const frame = videoSelectorFrame();
     if (!frame) return { noFrame: true };
-    return await frame.evaluate((want) => {
+    return await frame.evaluate(({want, action}) => {
       const text = (document.body.innerText || "");
       const lists = [...document.querySelectorAll('[class*=VideoList--list]')]
         .filter((el) => !/listView/.test(el.className));
@@ -84,22 +88,49 @@ async page => {
       const items = list ? list.children.length : 0;
       const itemTextsFull = list ? [...list.children].map((el) => (el.innerText || "").replace(/\s+/g, " ").trim()) : [];
       const itemTexts = itemTextsFull.map((t) => t.slice(0, 80));
+      const hash = want.match(/^qn_[0-9a-f]{16,}/i)?.[0] || '';
+      const stem = want.replace(/\.[^.]+$/, '');
+      const labels = el => [...new Set([
+        el.querySelector('[class*=card-title]')?.textContent?.trim(),
+        ...[...el.querySelectorAll('[title], img[alt]')].flatMap(e => [e.getAttribute('title'), e.getAttribute('alt')]),
+      ].filter(Boolean))];
+      const matches = el => labels(el).some(label => label === want || label === stem || label === hash
+        // The platform stores a 20-character display name, even in title/alt.
+        // Require at least 16 hash digits and a unique library item.
+        || (hash && /^qn_[0-9a-f]{16,}$/i.test(label) && hash.startsWith(label)))
+        || (el.innerText || '').includes(want) || (el.innerText || '').includes(stem);
+      const named = list ? [...list.children].filter(matches) : [];
+      const fullIdentity = named.every(el => labels(el).some(label => label === want || label === stem || label === hash));
+      const ambiguous = named.length > 1 && !(hash && fullIdentity);
+      const trusted = named.length > 0 && !ambiguous;
+      let decision = named.length ? (ambiguous ? 'AMBIGUOUS' : 'matched') : 'NOT_MATCHED';
+      if (trusted && action === 'pick') {
+        named[0].click();
+        decision = named.length > 1 ? 'clicked-first-of-same-content' : 'clicked-item';
+      } else if (trusted && action === 'checkbox') {
+        const input = named[0].querySelector('input[type=checkbox]');
+        if (input && !input.checked) input.click();
+      }
+      const checked = list ? [...list.children].filter(el => el.querySelector('input[type=checkbox]')?.checked) : [];
       return {
-        hasUploadItem: text.includes(want),
+        decision,
+        checkedText: checked.map(el => (el.innerText || '').replace(/\s+/g, ' ').trim()).join(' | '),
+        checkedMatches: trusted && checked.length === 1 && matches(checked[0]),
+        hasUploadItem: trusted || text.includes(want),
         // 可选列表里是否已有本文件条目。素材库是账号级共享的，列表里会有
         // 其他商品刚上传的视频；只能认本文件的内容寻址名，认不得就等。
-        listHasFile: itemTextsFull.some((t) => t.includes(want)),
+        listHasFile: trusted,
         // “发布成功”后底部汇总条仍会显示“N 个文件上传中”，不能据此判成
         // 还在处理；本条目已发布就放行，其他条目状态与绑定无关。
         processing: /生成封面图中|转码中|上传中/.test(text) && !/已上传|发布成功/.test(text),
-        published: /发布成功|已上传/.test(text),
+        published: trusted || (text.includes(want) && /发布成功|已上传/.test(text)),
         failed: /上传失败/.test(text),
         items,
         itemTexts,
         confirmCount: Number((text.match(/确认上传\s*\(\s*(\d+)\s*\)/) || [])[1] || 0),
         snippet: text.replace(/\s+/g, " ").slice(0, 260),
       };
-    }, names[0]);
+    }, {want: names[0], action});
   }
 
   async function refreshLibraryTab() {
@@ -165,12 +196,23 @@ async page => {
 
   let sel = await readSelectorState();
   note(`dialogOpen hasUploadItem=${sel.hasUploadItem} listHasFile=${sel.listHasFile} items=${sel.items} itemTexts=${JSON.stringify(sel.itemTexts.slice(0, 5).map(clip))}`);
+  if (!sel.listHasFile) {
+    const search = frame.locator('input[placeholder*="视频名称"]').first();
+    if (await search.count()) {
+      await search.fill(stem.match(/^qn_[0-9a-f]{16,}/i)?.[0].slice(0, 20) || stem);
+      await search.press('Enter');
+      await sleep(1500);
+      sel = await readSelectorState();
+    }
+  }
   // 断点续接：上次可能已把视频传到平台但尚未出现在可选列表。本文件回执或
   // 本文件条目任一在列即不重复投递，避免同一视频传两份（平台索引有延迟，
   // 重试时先等索引，而不是再传一遍）。文件名是内容寻址名（qn_<hash>_），
   // 跨商品、跨重试都不会撞名；列表里有其他商品的条目不算本文件已上传，
   // 不能因此跳过投递。
   if (!sel.hasUploadItem && !sel.published) {
+    if (PAYLOAD.resumeOnly) return JSON.stringify({uploaded: false, dispatched: true,
+      error: '上次视频已投递，当前素材库未确认本文件；已停止重复上传', trace});
     for (let i = 0; i < 8; i++) {
       await refreshLibraryTab();
       await sleep(8000);
@@ -196,7 +238,8 @@ async page => {
     }
     note(`setFiles=${setFiles} file=${clip(names[0])}`);
     if (setFiles !== "OK") {
-      return JSON.stringify({ clicked: clicked && clicked.clicked, need_cli_upload: true, error: "未找到上传入口", setFiles, trace });
+      return JSON.stringify({ clicked: clicked && clicked.clicked, need_cli_upload: setFiles === 'NO_INPUT',
+        dispatchUncertain: setFiles === 'FAIL', error: "未找到上传入口", setFiles, trace });
     }
     await sleep(2500);
     sel = await readSelectorState();
@@ -209,11 +252,11 @@ async page => {
     sel = await readSelectorState();
     if (sel.failed) {
       note(`uploadFailed i=${i} snippet=${clip(sel.snippet)}`);
-      return JSON.stringify({ error: "视频上传失败", detail: sel.snippet, trace });
+      return JSON.stringify({ error: "视频上传失败", dispatched: true, detail: sel.snippet, trace });
     }
   }
   note(`processingDone processing=${sel.processing} published=${sel.published} snippet=${clip(sel.snippet)}`);
-  if (sel.processing) return JSON.stringify({ error: "视频处理超时", detail: sel.snippet, trace });
+  if (sel.processing) return JSON.stringify({ error: "视频处理超时", dispatched: true, detail: sel.snippet, trace });
 
   // 收起上传子面板。“完成”按钮可能渲染在 videoSelector iframe 内，也可能在
   // 主页面 .wdeDialog 壳上（不同环境 DOM 不同），两处都试；点了哪个都行。
@@ -238,6 +281,7 @@ async page => {
   if (!sel.listHasFile) {
     return JSON.stringify({
       error: "视频已上传成功但本商品条目未出现在选择列表",
+      dispatched: true,
       detail: "平台索引有延迟，稍后点继续会按同名回执接续勾选，不会重复上传",
       detailState: { published: sel.published, hasUploadItem: sel.hasUploadItem, items: sel.items, itemTexts: sel.itemTexts, snippet: sel.snippet },
       trace,
@@ -249,23 +293,7 @@ async page => {
   // 歧义，交人工复核。named 为空时绝不能退而选“列表唯一一条”——素材库
   // 列表里那一条很可能是其他商品刚上传的视频（2026-10-01 两个商品被绑上
   // 同一第三方视频的根因），宁可选不了报错跳过，也不绑错。
-  const picked = await frame.evaluate((want) => {
-    const lists = [...document.querySelectorAll('[class*=VideoList--list]')].filter((el) => !/listView/.test(el.className));
-    const list = lists[0];
-    const itemTexts = list ? [...list.children].map((el) => (el.innerText || "").replace(/\s+/g, " ").trim().slice(0, 80)) : [];
-    if (!list || !list.children.length) return { decision: "NO_ITEM", items: 0, itemTexts };
-    const named = [...list.children].filter((el) => (el.innerText || "").includes(want));
-    const contentAddressed = /^qn_[0-9a-f]{16,}/i.test(want);
-    if (named.length > 1 && !contentAddressed) return { decision: "AMBIGUOUS", items: list.children.length, itemTexts };
-    const item = named[0];
-    if (!item) return { decision: "NOT_MATCHED", items: list.children.length, itemTexts };
-    item.click();
-    return {
-      decision: named.length > 1 ? "clicked-first-of-same-content" : "clicked-item",
-      items: list.children.length,
-      itemTexts,
-    };
-  }, stem);
+  const picked = await selectorAction('pick');
   const pick = picked.decision;
   note(`pick=${pick} items=${picked.items} itemTexts=${JSON.stringify(picked.itemTexts.slice(0, 5))}`);
   await sleep(1500);
@@ -275,13 +303,7 @@ async page => {
   if (!count && (pick === "clicked-item" || pick === "clicked-first-of-same-content")) {
     // 条目点击未触发勾选时，对同一“按名匹配到的条目”直接点它的 checkbox
     // 重试；绝不点列表第一条兜底——那会把其他商品的视频勾上。
-    await frame.evaluate((want) => {
-      const lists = [...document.querySelectorAll('[class*=VideoList--list]')].filter((el) => !/listView/.test(el.className));
-      const list = lists[0];
-      const named = list ? [...list.children].filter((el) => (el.innerText || "").includes(want)) : [];
-      const input = named[0] && named[0].querySelector("input[type=checkbox]");
-      if (input) input.click();
-    }, stem);
+    await selectorAction('checkbox');
     await sleep(1500);
     count = (await readSelectorState()).confirmCount;
     note(`checkboxRetry count=${count}`);
@@ -303,20 +325,10 @@ async page => {
   // 绑定前最后一道校验：读取当前已勾选条目的文本，必须能对上本商品的内容
   // 寻址名。读不到勾选状态（checkedText 为空）时以 pick 的按名匹配结果为准
   // 放行；一旦读得到且不匹配，立即拒绝绑定，视频按可选项告警跳过。
-  const checkedText = await frame.evaluate((want) => {
-    const lists = [...document.querySelectorAll('[class*=VideoList--list]')].filter((el) => !/listView/.test(el.className));
-    const list = lists[0];
-    if (!list) return "";
-    return [...list.children]
-      .filter((el) => {
-        const input = el.querySelector("input[type=checkbox]");
-        return input && input.checked;
-      })
-      .map((el) => (el.innerText || "").replace(/\s+/g, " ").trim())
-      .join(" | ");
-  }, stem);
+  const checked = await selectorAction('checked');
+  const checkedText = checked.checkedText || '';
   note(`checkedVerify count=${count} checkedText=${clip(checkedText) || "<unreadable>"}`);
-  if (checkedText && !checkedText.includes(stem)) {
+  if (!checked.checkedMatches) {
     return JSON.stringify({
       error: "勾选校验失败：已勾选条目不是本商品视频，拒绝绑定",
       pick, checkedText,

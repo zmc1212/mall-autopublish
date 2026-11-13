@@ -32,6 +32,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from desktop import license as lic  # noqa: E402
+from desktop import license_service as service  # noqa: E402
 
 _HEX = set("0123456789ABCDEF")
 
@@ -112,7 +113,7 @@ def issue_code(machine_code: str, days: int, memo: str) -> tuple[str, dict]:
     return lic.build_code(payload, seed), payload
 
 
-def append_history(payload: dict, code: str, days: int) -> None:
+def append_history(payload: dict, code: str, days: int, *, registered: bool = False) -> None:
     record = {
         "time": datetime.now().isoformat(timespec="seconds"),
         "machine_code": "-".join(payload["fp"][i : i + 4] for i in range(0, 16, 4)),
@@ -120,10 +121,48 @@ def append_history(payload: dict, code: str, days: int) -> None:
         "expires_at": payload["exp"],
         "memo": payload["memo"],
         "code": code,
+        "registered": bool(registered),
+        "revoked": False,
     }
     history = key_dir() / "history.jsonl"
     with history.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def update_history_status(code: str, revoked: bool) -> None:
+    """把本机流水里的吊销状态与授权服务同步，便于发码时一眼看到。"""
+    history = key_dir() / "history.jsonl"
+    if not history.is_file():
+        return
+    records = load_history()
+    changed = False
+    for record in records:
+        if str(record.get("code") or "").strip() == str(code or "").strip():
+            record["revoked"] = bool(revoked)
+            changed = True
+    if not changed:
+        return
+    temp = history.with_suffix(".tmp")
+    temp.write_text("".join(json.dumps(item, ensure_ascii=False) + "\n" for item in records), encoding="utf-8")
+    os.replace(temp, history)
+
+
+def register_code(payload: dict, code: str) -> tuple[bool, str]:
+    """发码时同步登记到授权服务；失败不阻塞发码，但会明确提示。"""
+    try:
+        service.register(
+            code,
+            fingerprint=payload["fp"],
+            expires_at=int(payload.get("exp") or 0),
+            memo=payload.get("memo") or "",
+        )
+    except service.LicenseServiceError as exc:
+        return False, f"未登记到授权服务：{exc}"
+    return True, "已登记到授权服务（可吊销）"
+
+
+def revoked_text(record: dict) -> str:
+    return "已停用" if record.get("revoked") else "正常"
 
 
 def load_history() -> list[dict]:
@@ -206,8 +245,70 @@ def cmd_issue(args) -> int:
         out_path = Path(args.out)
         out_path.write_text(code + "\n", encoding="utf-8")
         print(f"已写入文件：{out_path}")
-    append_history(payload, code, max(0, int(args.days or 0)))
+    if args.no_register:
+        registered, note = False, "已跳过授权服务登记（该码无法远程吊销）"
+    else:
+        registered, note = register_code(payload, code)
+    append_history(payload, code, max(0, int(args.days or 0)), registered=registered)
+    print(note)
     print(f"已记录签发流水：{key_dir() / 'history.jsonl'}")
+    return 0
+
+
+def _find_history_code(code: str) -> str:
+    """允许只输入机器码/备注前缀时，取最近一条匹配记录。"""
+    text = str(code or "").strip()
+    records = load_history()
+    for record in reversed(records):
+        if str(record.get("code") or "") == text:
+            return text
+    matches = [r for r in records if text and text in str(r.get("code") or "")]
+    return str(matches[-1].get("code")) if matches else text
+
+
+def cmd_revoke(args) -> int:
+    code = _find_history_code(args.code)
+    try:
+        service.revoke(code)
+    except service.LicenseServiceError as exc:
+        print(f"吊销失败：{exc}")
+        return 1
+    update_history_status(code, True)
+    print("已吊销：客户下次心跳（最长 6 小时）或重新打开软件后失效。")
+    return 0
+
+
+def cmd_unrevoke(args) -> int:
+    code = _find_history_code(args.code)
+    try:
+        service.unrevoke(code)
+    except service.LicenseServiceError as exc:
+        print(f"恢复失败：{exc}")
+        return 1
+    update_history_status(code, False)
+    print("已恢复授权。")
+    return 0
+
+
+def cmd_rebind(args) -> int:
+    code = _find_history_code(args.code)
+    try:
+        service.rebind(code)
+    except service.LicenseServiceError as exc:
+        print(f"换绑失败：{exc}")
+        return 1
+    print("已解绑全部设备，客户可在新设备上重新激活。")
+    return 0
+
+
+def cmd_lookup(args) -> int:
+    code = _find_history_code(args.code)
+    try:
+        data = service.lookup(code)
+    except service.LicenseServiceError as exc:
+        print(f"查询失败：{exc}")
+        return 1
+    print(json.dumps(data.get("record") or data, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -430,10 +531,11 @@ def _build_main_window(root) -> None:
     machine_entry.grid(row=0, column=1, columnspan=2, sticky="we", pady=4)
 
     ttk.Label(frame, text="有效天数：").grid(row=1, column=0, sticky="w", pady=4)
-    days_var = tk.StringVar(value="0")
-    days_box = ttk.Combobox(frame, textvariable=days_var, width=7, values=("0", "30", "90", "180", "365"))
+    # 默认限期：永久码在客户退款后无法收回，仅在明确要求时手动改为 0。
+    days_var = tk.StringVar(value="365")
+    days_box = ttk.Combobox(frame, textvariable=days_var, width=7, values=("365", "180", "90", "30", "0"))
     days_box.grid(row=1, column=1, sticky="w", pady=4)
-    ttk.Label(frame, text="0 = 永久，也可输入任意天数").grid(row=1, column=2, sticky="w", padx=(8, 0))
+    ttk.Label(frame, text="默认 365 天；0 = 永久（退款后无法收回，慎用）").grid(row=1, column=2, sticky="w", padx=(8, 0))
 
     ttk.Label(frame, text="客户备注：").grid(row=2, column=0, sticky="w", pady=4)
     memo_var = tk.StringVar()
@@ -457,9 +559,17 @@ def _build_main_window(root) -> None:
 
     def on_issue() -> None:
         try:
-            days_text = days_var.get().strip() or "0"
+            days_text = days_var.get().strip()
+            if not days_text:
+                raise ValueError("请填写有效天数；0 表示永久（退款后无法收回）")
             if not days_text.isdigit():
                 raise ValueError("有效天数应为非负整数。")
+            if int(days_text) == 0 and not messagebox.askyesno(
+                "确认签发永久激活码",
+                "永久激活码在客户退款后无法收回，只能依赖远程吊销。\n\n确定要签发永久码吗？",
+                parent=root,
+            ):
+                return
             code, payload = issue_code(machine_var.get(), int(days_text), memo_var.get())
         except ValueError as exc:
             messagebox.showerror("发码失败", str(exc), parent=root)
@@ -471,9 +581,13 @@ def _build_main_window(root) -> None:
         root.clipboard_clear()
         root.clipboard_append(code)
         root.update()
-        append_history(payload, code, int(days_var.get().strip() or "0"))
+        if service.server_url():
+            registered, note = register_code(payload, code)
+        else:
+            registered, note = False, "未配置授权服务（该码无法远程吊销）"
+        append_history(payload, code, int(days_text), registered=registered)
         refresh_history()
-        status_var.set("激活码已复制到剪贴板，可直接粘贴发给客户；流水已记录。")
+        status_var.set(f"激活码已复制到剪贴板；{note}。")
 
     def on_copy() -> None:
         output.configure(state="normal")
@@ -499,6 +613,11 @@ def _build_main_window(root) -> None:
         text=f"私钥：{private_key_path()}（请勿外传）",
         foreground="#B91C1C",
     ).grid(row=6, column=0, columnspan=2, sticky="w")
+    ttk.Label(
+        frame,
+        text="授权服务：已配置" if service.server_url() else "授权服务：未配置",
+        foreground="#0F766E" if service.server_url() else "#B45309",
+    ).grid(row=6, column=2, sticky="e")
 
     # ---- 签发流水：全量列表 + 搜索 + 查看完整激活码 ----
     ttk.Separator(frame).grid(row=7, column=0, columnspan=3, sticky="we", pady=(6, 2))
@@ -511,13 +630,14 @@ def _build_main_window(root) -> None:
     query_entry.pack(side="left")
     ttk.Button(history_header, text="打开流水文件夹", command=on_open_history_dir).pack(side="right")
 
-    history_columns = ("time", "machine", "memo", "validity")
+    history_columns = ("time", "machine", "memo", "validity", "status")
     history_tree = ttk.Treeview(frame, columns=history_columns, show="headings", height=8)
     for column, text, width in (
         ("time", "时间", 148),
         ("machine", "机器码", 142),
-        ("memo", "备注", 112),
+        ("memo", "备注", 100),
         ("validity", "有效期", 84),
+        ("status", "状态", 56),
     ):
         history_tree.heading(column, text=text)
         history_tree.column(column, width=width, anchor="w", stretch=False)
@@ -547,6 +667,7 @@ def _build_main_window(root) -> None:
                     rec.get("machine_code", ""),
                     rec.get("memo") or "—",
                     validity_text(rec),
+                    revoked_text(rec),
                 ),
             )
         total = len(load_history())
@@ -583,9 +704,57 @@ def _build_main_window(root) -> None:
         root.update()
         status_var.set("已复制该条激活码，可直接粘贴发给客户。")
 
+    def _selected_record() -> dict | None:
+        selected = history_tree.selection()
+        return detail_records.get(selected[0]) if selected else None
+
+    def on_revoke(revoked: bool) -> None:
+        record = _selected_record()
+        if not record:
+            messagebox.showinfo("发码工具", "请先在上方点击一条签发记录。", parent=root)
+            return
+        code = str(record.get("code") or "")
+        action = "吊销" if revoked else "恢复"
+        detail_text = "吊销后客户会在下次心跳（最长 6 小时）或重新打开软件时失效。" if revoked else "恢复后客户可继续使用。"
+        if not messagebox.askyesno(
+            f"确认{action}",
+            f"确定要{action}备注为「{record.get('memo') or '—'}」的授权吗？\n\n{detail_text}",
+            parent=root,
+        ):
+            return
+        try:
+            (service.revoke if revoked else service.unrevoke)(code)
+        except service.LicenseServiceError as exc:
+            messagebox.showerror(f"{action}失败", str(exc), parent=root)
+            return
+        update_history_status(code, revoked)
+        refresh_history()
+        status_var.set(f"已{action}该授权。")
+
+    def on_rebind() -> None:
+        record = _selected_record()
+        if not record:
+            messagebox.showinfo("发码工具", "请先在上方点击一条签发记录。", parent=root)
+            return
+        if not messagebox.askyesno(
+            "确认换绑设备",
+            "换绑会清空该激活码已绑定的设备，客户需在新设备上重新激活。\n\n确定继续吗？",
+            parent=root,
+        ):
+            return
+        try:
+            service.rebind(str(record.get("code") or ""))
+        except service.LicenseServiceError as exc:
+            messagebox.showerror("换绑失败", str(exc), parent=root)
+            return
+        status_var.set("已解绑全部设备，客户可在新设备上重新激活。")
+
     detail_buttons = ttk.Frame(frame)
     detail_buttons.grid(row=11, column=2, sticky="n", pady=(4, 0))
     ttk.Button(detail_buttons, text="复制激活码", command=on_copy_history_code).pack(anchor="e")
+    ttk.Button(detail_buttons, text="吊销授权", command=lambda: on_revoke(True)).pack(anchor="e", pady=(4, 0))
+    ttk.Button(detail_buttons, text="恢复授权", command=lambda: on_revoke(False)).pack(anchor="e", pady=(4, 0))
+    ttk.Button(detail_buttons, text="换绑设备", command=on_rebind).pack(anchor="e", pady=(4, 0))
 
     history_tree.bind("<<TreeviewSelect>>", lambda _event: show_detail())
     history_query.trace_add("write", lambda *_args: refresh_history())
@@ -604,10 +773,20 @@ def main(argv=None) -> int:
     )
     parser_issue = sub.add_parser("issue", help="为客户机器签发激活码")
     parser_issue.add_argument("--machine-code", required=True, help="客户激活页显示的机器码")
-    parser_issue.add_argument("--days", type=int, default=0, help="有效天数，0 或缺省表示永久")
+    parser_issue.add_argument("--days", type=int, default=365, help="有效天数，默认 365；0 表示永久（退款后无法收回）")
     parser_issue.add_argument("--memo", default="", help="客户备注（≤40 字，显示在设置页）")
     parser_issue.add_argument("--out", default="", help="可选：同时把激活码写入该文件供客户导入")
+    parser_issue.add_argument("--no-register", action="store_true", help="跳过授权服务登记（该码将无法远程吊销）")
     parser_issue.set_defaults(func=cmd_issue)
+    for name, func, help_text in (
+        ("revoke", cmd_revoke, "吊销激活码（退款/违规时使用）"),
+        ("unrevoke", cmd_unrevoke, "恢复已吊销的激活码"),
+        ("rebind", cmd_rebind, "清空绑定设备，客户换机后可重新激活"),
+        ("lookup", cmd_lookup, "查询激活码在服务端的登记与设备情况"),
+    ):
+        command = sub.add_parser(name, help=help_text)
+        command.add_argument("--code", required=True, help="完整激活码，或本机流水中的唯一片段")
+        command.set_defaults(func=func)
     sub.add_parser("gui", help="图形界面发码").set_defaults(func=cmd_gui)
     sub.add_parser("selftest", help="自检：RFC 8032 测试向量 + 签发验证闭环").set_defaults(
         func=cmd_selftest

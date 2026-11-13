@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import copy
 import json
 import os
 import re
@@ -10,16 +11,24 @@ import sys
 import threading
 import time
 import traceback
+import uuid
 from datetime import datetime
 from pathlib import Path
 
-from . import paths
+from . import code_watch, detail_browser, paths
+from .image_preview import is_supported_pack_path, preview_cache_token, preview_metadata
 from .modules import load_seller, load_web
 
 DONE_EXECUTIONS = frozenset({"已填写未提交", "结果待核实"})
 RESUME_EXECUTIONS = frozenset({"失败", "暂停", "已停止", "提交失败"})
+ATTENTION_EXECUTIONS = frozenset({
+    "失败", "暂停", "提交失败", "提交待核实", "结果待核实", "已停止",
+})
 FLOW_COMPLETE_STAGE = "complete"
 FLOW_FIELDS = (
+    "execution_reset_id",
+    "resume_checkpoint",
+    "last_browser_write",
     "flow_version",
     "sku_image_strategy",
     "seller_account",
@@ -31,8 +40,34 @@ FLOW_FIELDS = (
     "material_preview",
     "material_folder",
     "last_error",
+    "video_warning",
+    "video_status",
     "updated_at",
 )
+
+# 清除执行记录时需要重置的字段（clear_row_state / clear_rows_state 共用）。
+CLEAR_EXECUTION_KEYS = (
+    "execution", "notice", "errors", "taobao_item_id", "view_url", "edit_url", "url",
+    "resume_checkpoint", "legacy_checkpoint", "last_browser_write",
+    "flow_version", "sku_image_strategy", "seller_account", "flow_stage", "spec_image_stage",
+    "run_status", "sku_material_manifest", "material_result", "material_preview", "last_error",
+    "updated_at", "material_folder", "duration_seconds", "video_warning", "video_status",
+)
+
+
+def _reset_execution_fields(item, reset_id):
+    """把一条执行状态记录重置回「未执行」。"""
+    for key in CLEAR_EXECUTION_KEYS:
+        if key == "execution":
+            item[key] = "未执行"
+        elif key == "errors":
+            item[key] = []
+        elif key == "duration_seconds":
+            item[key] = None
+        else:
+            item[key] = ""
+    item["execution_reset_id"] = reset_id
+
 
 FLOW_STAGE_LABELS = {
     "pending": "待入库",
@@ -69,7 +104,13 @@ STEP_LABELS = {
     "spec_images_resume": "规格图核验续传",
     "main_1_1": "1:1主图",
     "main_3_4": "3:4主图",
+    "main_images": "主图",
     "details": "详情图",
+    "probe_state": "检查已填内容",
+    "sku_audit": "核对规格",
+    "tags": "填写标签",
+    "video": "主视频",
+    "video_dialog_close": "关闭视频弹窗",
     "logistics": "物流",
     "warehouse": "放入仓库",
     "submit": "提交",
@@ -197,10 +238,22 @@ def serialize_row(item):
     pack = ""
     if product.get("pack_dir"):
         pack = str(product.get("pack_dir"))
+    preview = preview_metadata(product, item.get("pack_fingerprint"))
+    product_id = item.get("product_id") or product.get("product_id") or ""
+    preview_url = ""
+    row_number = item.get("row")
+    if preview.get("available") and row_number is not None:
+        from urllib.parse import quote
+
+        version = preview.get("cache_token") or preview_cache_token(product, item.get("pack_fingerprint"))
+        query = f"row={quote(str(row_number), safe='')}&product_id={quote(str(product_id), safe='')}"
+        if version:
+            query += f"&v={quote(version, safe='')}"
+        preview_url = f"/api/item/preview?{query}"
     links = _action_links(item)
     return {
         "row": item.get("row"),
-        "product_id": item.get("product_id") or product.get("product_id") or "",
+        "product_id": product_id,
         "title": product.get("title") or "",
         "category": product.get("category") or "",
         "brand": product.get("brand") or "",
@@ -215,8 +268,12 @@ def serialize_row(item):
         "video_name": str(video_display.get("name") or ""),
         "video_ok": bool(video_display.get("playable")),
         "pack": pack,
-        "pack_found": bool(pack and Path(pack).is_dir()),
+        "pack_found": bool(pack and is_supported_pack_path(pack)),
         "pack_fingerprint": str(item.get("pack_fingerprint") or ""),
+        "preview_url": preview_url,
+        "preview_available": bool(preview.get("available")),
+        "preview_name": str(preview.get("name") or ""),
+        "preview_media_type": str(preview.get("media_type") or ""),
         "taobao_item_id": links.get("taobao_item_id") or "",
         "view_url": links.get("view_url") or "",
         "edit_url": links.get("edit_url") or "",
@@ -314,11 +371,46 @@ def current_step_label(steps=None):
     return STEP_LABELS.get(key, key)
 
 
+def _has_cjk(text):
+    return any("\u4e00" <= char <= "\u9fff" for char in str(text or ""))
+
+
+def worker_phase_label(phase="", steps=None):
+    """Return a human phase for worker events.
+
+    WorkerRuntime reports the raw script stem as ``phase`` while the steps
+    list contains the richer pipeline state.  Prefer that list and keep raw
+    unknown stems out of the UI; already-human Chinese phases remain intact.
+    """
+    if isinstance(steps, list) and steps:
+        label = current_step_label(steps)
+        if label and (_has_cjk(label) or label in STEP_LABELS.values()):
+            return label
+    raw = str(phase or "").strip()
+    if raw in STEP_LABELS:
+        return STEP_LABELS[raw]
+    if _has_cjk(raw):
+        return raw
+    return "执行中"
+
+
 class JobManager:
     def __init__(self):
         self.lock = threading.RLock()
         self.cancel = threading.Event()
         self.thread = None
+        self.update_pending = False
+        # The pipeline owns the actual worker pool.  JobManager keeps the
+        # batch-level immutable settings snapshot and a compact view of worker
+        # activity so the API remains useful while items finish out of order.
+        self.batch_settings = None
+        self.concurrency = 2
+        self.worker_events = {}
+        self.active_worker_events = {}
+        self._completed_rows = set()
+        self._attention_rows = set()
+        self.attention_count = 0
+        self.global_blocker = ""
         self.workbook_path = ""
         self.workspace_path = ""
         self.workspace_scan = None
@@ -354,8 +446,226 @@ class JobManager:
         self._login_check_settle = 2.0
         self._login_check_grace = 2.0
         self._auto_check_wait = 8.0
+        # 最近一次成功的 CDP 探测结果：任务运行期间 Chrome 忙碌可能让
+        # 单次探测超时，轮询短暂复用该结果，避免顶部徽标闪回「未连接」。
+        self._last_good_probe = None
+        self._last_good_probe_at = 0.0
+        self._probe_stale_seconds = 15.0
         self._restored = False
         self.restored = False
+
+    @staticmethod
+    def _setting(settings, key, default=None):
+        if isinstance(settings, dict):
+            return settings.get(key, default)
+        return getattr(settings, key, default)
+
+    @staticmethod
+    def _saved_debug_browser():
+        """Read the live visibility preference without changing browser paths."""
+        try:
+            return bool(getattr(paths.load_settings(), "debug_browser", False))
+        except Exception:
+            return False
+
+    def _batch_context_retained(self):
+        """Whether the current batch still owns the browser context.
+
+        A completed batch can still retain pages for rows requiring manual
+        review.  Those pages belong to the batch snapshot until the review is
+        resolved, so status/open/reveal endpoints must not switch to a newly
+        saved profile or CDP port merely because the status is ``done``.
+        """
+        with self.lock:
+            if self.batch_settings is None:
+                return False
+            if self.status != "done":
+                return True
+            return any(
+                row.get("execution") in {"暂停", "失败", "结果待核实", "提交失败", "提交待核实"}
+                for row in self.rows
+            )
+
+    @classmethod
+    def _settings_snapshot(cls, settings):
+        """Copy settings once so a later PUT cannot mutate this batch."""
+        try:
+            snapshot = copy.deepcopy(settings)
+        except Exception:
+            snapshot = dict(getattr(settings, "__dict__", {}) or {})
+        try:
+            concurrency = int(cls._setting(snapshot, "concurrency", 2) or 2)
+        except (TypeError, ValueError):
+            concurrency = 2
+        concurrency = max(1, min(8, concurrency))
+        if isinstance(snapshot, dict):
+            snapshot["concurrency"] = concurrency
+        else:
+            try:
+                snapshot.concurrency = concurrency
+            except Exception:
+                snapshot = dict(getattr(snapshot, "__dict__", {}) or {})
+                snapshot["concurrency"] = concurrency
+        return snapshot
+
+    @classmethod
+    def _settings_dict(cls, settings):
+        if settings is None:
+            return {}
+        if isinstance(settings, dict):
+            return dict(settings)
+        return dict(getattr(settings, "__dict__", {}) or {})
+
+    def _worker_step_log_entry(self, worker_id, row, product_id, steps, label):
+        """把 worker 进度事件的步骤标签还原成日志行；同一标签只记一次。
+
+        并行化后进度写入 worker 独立目录，共享 web_fill_progress.json 恒空，
+        旧 _consume_fill_progress 的逐步日志随之失效；实时步骤面板改由
+        worker 事件驱动，格式与其保持一致。
+        """
+        if not isinstance(steps, list) or not steps or not label:
+            return None
+        last_step = steps[-1] if isinstance(steps[-1], dict) else {}
+        key = str(last_step.get("step") or "")
+        if not key or key == "end":
+            return None
+        token = (worker_id, row, key, label if key == "spec_images" else "")
+        if token in self.seen_steps:
+            return None
+        self.seen_steps.add(token)
+        extra = ""
+        if last_step.get("skipped") or (isinstance(last_step.get("result"), dict) and last_step["result"].get("skipped")):
+            extra = "已完成，跳过"
+        prefix = f"[槽 {worker_id}] " if int(self.concurrency or 1) > 1 else ""
+        who = str(product_id or "").strip()
+        if not who:
+            who = f"第 {row} 行" if row is not None else "当前商品"
+        return f"{prefix}{who} · {label}" + (f" {extra}" if extra else "")
+
+    def _on_worker_event(self, event):
+        """Consume pipeline worker events without assuming completion order."""
+        if not isinstance(event, dict):
+            return
+        kind = str(event.get("event") or "").strip().lower()
+        if kind not in {"start", "progress", "done", "global_blocker"}:
+            return
+        try:
+            worker_id = int(event.get("worker_id") or 0)
+        except (TypeError, ValueError):
+            worker_id = 0
+        row = event.get("row")
+        product_id = str(event.get("product_id") or "")
+        output_dir = str(event.get("output_dir") or "")
+        phase = str(event.get("phase") or "").strip()
+        steps = event.get("steps")
+        phase = worker_phase_label(phase, steps)
+        status = str(event.get("status") or "").strip()
+        if not status:
+            item = event.get("item")
+            if isinstance(item, dict):
+                status = str(item.get("execution") or item.get("run_status") or "").strip()
+        item = event.get("item")
+        item_execution = str(item.get("execution") or "").strip() if isinstance(item, dict) else ""
+        now = time.time()
+        normalized = dict(event)
+        normalized.update({
+            "event": kind,
+            "worker_id": worker_id,
+            "row": row,
+            "product_id": product_id,
+            "status": status,
+            "phase": phase,
+            "output_dir": output_dir,
+        })
+        log_entry = None
+        with self.lock:
+            if event.get("video_status"):
+                video_fields = {"video_status": event["video_status"]}
+                if "video_warning" in event:
+                    video_fields["video_warning"] = event["video_warning"]
+                for current in self.rows:
+                    if current.get("row") == row and current.get("product_id") == product_id:
+                        current.update(video_fields)
+                for bundle in self.products:
+                    meta = bundle.get("meta") or {}
+                    if meta.get("row") == row and meta.get("product_id") == product_id:
+                        meta.update(video_fields)
+                        bundle["meta"] = meta
+            previous = self.active_worker_events.get(worker_id) or {}
+            normalized["started_at"] = previous.get("started_at") or event.get("started_at") or now
+            normalized["activity_at"] = now
+            normalized["stalled"] = bool(event.get("stalled", False))
+            if isinstance(steps, list):
+                normalized["steps"] = list(steps)
+            self.worker_events[worker_id] = normalized
+            if kind in {"start", "progress"}:
+                self.active_worker_events[worker_id] = normalized
+                self.current_row = row
+                self.current_id = product_id
+                if phase and not self.global_blocker:
+                    self.phase = phase
+                if kind == "progress":
+                    log_entry = self._worker_step_log_entry(worker_id, row, product_id, steps, phase)
+            elif kind == "done":
+                self.active_worker_events.pop(worker_id, None)
+                if phase and not self.global_blocker:
+                    self.phase = phase
+            elif kind == "global_blocker":
+                blocker = str(
+                    event.get("blocker")
+                    or event.get("notice")
+                    or event.get("message")
+                    or phase
+                    or "全局任务阻断"
+                ).strip()
+                self.global_blocker = blocker
+                self.blocker = blocker
+                self.phase = "需人工处理"
+                if self.status == "running":
+                    self.status = "stopping"
+                log_entry = blocker
+            self.activity_at = now
+            self.stalled = False
+            attention_status = item_execution or status
+            if kind == "done" and attention_status in ATTENTION_EXECUTIONS:
+                key = row if row is not None else product_id
+                self._attention_rows.add(key)
+                self.attention_count = len(self._attention_rows)
+        if log_entry:
+            # “全局阻断：”只属于 global_blocker 分支；progress 步骤日志共用
+            # log_entry 变量，加同样前缀会把普通进度伪装成全局故障（2026-10-06
+            # 用户把步骤进度误读为任务失败）。
+            if kind == "global_blocker":
+                self.log(f"全局阻断：{log_entry}", "error")
+            else:
+                self.log(log_entry, "info")
+
+    def preview_product(self, row, product_id=""):
+        """按当前内存清单定位商品，供只读主图预览接口使用。"""
+        self._ensure_restored()
+        try:
+            row_number = int(row)
+        except (TypeError, ValueError):
+            return None
+        wanted = str(product_id or "").strip()
+        with self.lock:
+            for bundle in self.products:
+                if not isinstance(bundle, dict):
+                    continue
+                meta = dict(bundle.get("meta") or {})
+                product = dict(bundle.get("product") or {})
+                current_row = meta.get("row", product.get("row"))
+                if current_row != row_number:
+                    continue
+                current_id = str(meta.get("product_id") or product.get("product_id") or "").strip()
+                if wanted and wanted != current_id:
+                    continue
+                # 让预览接口使用与当前清单行相同的版本标记，旧 URL 不会
+                # 因为 row/product_id 恰好重用而指向新工作空间的图片。
+                if meta.get("pack_fingerprint") and "pack_fingerprint" not in product:
+                    product["pack_fingerprint"] = meta.get("pack_fingerprint")
+                return copy.deepcopy(product)
+        return None
 
     def snapshot(self):
         self._ensure_restored()
@@ -382,6 +692,18 @@ class JobManager:
             else:
                 elapsed = None
             durations = [value for value in self.item_durations if value > 0]
+            active_workers = []
+            for worker_id, event in sorted(self.active_worker_events.items(), key=lambda pair: pair[0]):
+                active_workers.append({
+                    "worker_id": str(worker_id),
+                    "row": event.get("row"),
+                    "product_id": str(event.get("product_id") or ""),
+                    "status": str(event.get("status") or ""),
+                    "phase": str(event.get("phase") or ""),
+                    "started_at": event.get("started_at"),
+                    "activity_at": event.get("activity_at"),
+                    "stalled": bool(event.get("stalled", False)),
+                })
             return {
                 "status": self.status,
                 "phase": self.phase or current_step_label(),
@@ -391,6 +713,12 @@ class JobManager:
                 "current_id": self.current_id,
                 "done": self.done,
                 "total": self.total,
+                "concurrency": self.concurrency,
+                "sku_image_strategy": self._setting(self.batch_settings if running and self.batch_settings is not None else paths.load_settings(), "sku_image_strategy", "slim_material"),
+                "active_workers": active_workers,
+                "active_count": len(active_workers),
+                "attention_count": self.attention_count,
+                "global_blocker": self.global_blocker,
                 "started_at": self.started_at or None,
                 "finished_at": self.finished_at or None,
                 "elapsed_seconds": round(elapsed, 1) if elapsed is not None else None,
@@ -422,8 +750,25 @@ class JobManager:
         if stage:
             if stage != FLOW_COMPLETE_STAGE:
                 return False
-            selected = paths.load_settings().sku_image_strategy
+            # A running batch owns an immutable settings snapshot.  The user
+            # may save a new image strategy while it is running, but that
+            # value must only affect the next start/continue action.  Once a
+            # batch is paused/stopped, the next resume intentionally reads the
+            # saved settings again through ``paths.load_settings``.
+            with self.lock:
+                batch_settings = (
+                    self.batch_settings
+                    if self.status in {"running", "stopping"} and self.batch_settings is not None
+                    else None
+                )
+            selected = self._setting(
+                batch_settings if batch_settings is not None else paths.load_settings(),
+                "sku_image_strategy",
+                "slim_material",
+            )
             completed = row.get("sku_image_strategy") or ""
+            if selected in {"publish_page", "both"} and row.get("flow_version") in {"spec-column-v1", "both-images-v1"}:
+                return False  # These versions counted SKU搜索主图 as specification photos.
             targets = {"slim_material": {"slim_material"},
                        "publish_page": {"publish_page"},
                        "both": {"slim_material", "publish_page"}}
@@ -432,7 +777,9 @@ class JobManager:
             return False
         if has_item_id:
             return False
-        return (row.get("execution") or "") in DONE_EXECUTIONS
+        # A filled form or an unverified response without an item ID is not
+        # a completed warehouse product. Continue must examine it again.
+        return False
 
     def _row_flow_resumable(self, row):
         # 有商品 ID 的商品永远按已有商品续跑；策略和阶段只决定补哪类图，
@@ -442,14 +789,30 @@ class JobManager:
         stage = (row.get("flow_stage") or "").strip()
         legacy = not (row.get("flow_version") or stage)
         if legacy:
-            return (row.get("execution") or "") in RESUME_EXECUTIONS
+            return (row.get("execution") or "") in RESUME_EXECUTIONS | {
+                "已填写未提交", "提交待核实", "结果待核实",
+            }
         if stage in {"", "pending", "filling", FLOW_COMPLETE_STAGE}:
             return (row.get("execution") or "") in RESUME_EXECUTIONS
         return True
 
     def log(self, message, level="info"):
         text = _plain(message)
-        entry = {"time": _now(), "level": level, "message": text}
+        runtime = None
+        # Import lazily: desktop jobs also runs in installs where web_fill is
+        # not imported until the first task, and log() is called during boot.
+        try:
+            from web_fill.runtime import current_runtime
+            runtime = current_runtime()
+        except Exception:
+            runtime = None
+        context = {}
+        if runtime is not None:
+            for field in ("worker_id", "row", "product_id"):
+                value = getattr(runtime, field, None)
+                if value not in (None, ""):
+                    context[field] = str(value) if field == "worker_id" else value
+        entry = {"time": _now(), "level": level, "message": text, **context}
         with self.lock:
             self.logs.append(entry)
             if len(self.logs) > MAX_LOGS:
@@ -469,7 +832,10 @@ class JobManager:
                 except OSError:
                     pass
             with log_file.open("a", encoding="utf-8") as stream:
-                stream.write(f"{entry['time']} [{level}] {text}\n")
+                prefix = " ".join(f"{field}={value}" for field, value in context.items())
+                if prefix:
+                    prefix = f"[{prefix}] "
+                stream.write(f"{entry['time']} [{level}] {prefix}{text}\n")
         except OSError:
             pass
 
@@ -485,6 +851,10 @@ class JobManager:
             "current_id": self.current_id,
             "done": self.done,
             "total": self.total,
+            "concurrency": self.concurrency,
+            "attention_count": self.attention_count,
+            "global_blocker": self.global_blocker,
+            "batch_settings": self._settings_dict(self.batch_settings),
             "result_xlsx": self.result_xlsx,
             "result_json": self.result_json,
             "started_at": self.started_at or None,
@@ -501,15 +871,65 @@ class JobManager:
             return
         try:
             with self.lock:
-                payload = self._session_payload()
-            try:
-                # 执行历史档案独立于当前行，整体覆盖会话时必须保留。
-                existing = module.load_session() or {}
-                if existing.get("execution_history"):
-                    payload["execution_history"] = existing.get("execution_history")
-            except Exception:
-                pass
-            module.save_session(payload)
+                # ``rows`` contains mutable dicts.  Copy it while holding the
+                # manager lock; otherwise a worker can mutate the same dict
+                # after this method releases the lock and before the session
+                # transaction commits.
+                payload = copy.deepcopy(self._session_payload())
+            update = getattr(module, "update_session", None)
+            if update is not None:
+                def merge(existing):
+                    # 执行历史档案独立于当前行，整体覆盖会话时必须保留。
+                    if existing.get("execution_history"):
+                        payload["execution_history"] = existing.get("execution_history")
+
+                    # A flow checkpoint may commit between the manager
+                    # snapshot above and this transaction.  The checkpoint
+                    # carries ``updated_at`` on both rows and product metas;
+                    # preserve that newer state instead of replacing it with
+                    # the stale manager snapshot.  If the manager snapshot is
+                    # newer, its values remain authoritative.
+                    def key(item):
+                        if not isinstance(item, dict):
+                            return None
+                        row = item.get("row")
+                        pid = str(item.get("product_id") or "")
+                        return (row, pid)
+
+                    def merge_state(saved, incoming):
+                        if not isinstance(saved, dict) or not isinstance(incoming, dict):
+                            return
+                        saved_at = str(saved.get("updated_at") or "")
+                        incoming_at = str(incoming.get("updated_at") or "")
+                        if not saved_at or (incoming_at and incoming_at > saved_at):
+                            return
+                        for field in (
+                            "execution", "notice", "errors", "taobao_item_id",
+                            "view_url", "edit_url", "duration_seconds", *FLOW_FIELDS,
+                        ):
+                            if field in saved:
+                                incoming[field] = copy.deepcopy(saved[field])
+
+                    def merge_rows(saved_rows, incoming_rows):
+                        saved_by_key = {key(item): item for item in saved_rows or []}
+                        for incoming in incoming_rows or []:
+                            merge_state(saved_by_key.get(key(incoming)), incoming)
+
+                    merge_rows(existing.get("rows"), payload.get("rows"))
+                    saved_products = {
+                        key((bundle or {}).get("meta") or {}): (bundle or {}).get("meta")
+                        for bundle in existing.get("products") or []
+                        if isinstance(bundle, dict)
+                    }
+                    for bundle in payload.get("products") or []:
+                        if not isinstance(bundle, dict):
+                            continue
+                        merge_state(saved_products.get(key(bundle.get("meta") or {})), bundle.get("meta"))
+                    existing.update(payload)
+
+                update(merge)
+            else:
+                raise RuntimeError("会话模块不支持事务写入")
         except Exception as exc:
             # 会话保存失败意味着断点续跑状态可能丢失，必须可见而不是静默
             self.log(f"会话保存失败，断点续跑状态可能不完整: {exc}", "warn")
@@ -552,6 +972,15 @@ class JobManager:
                 self.phase = "已恢复上次清单"
             self.result_xlsx = session.get("result_xlsx") or self.result_xlsx
             self.result_json = session.get("result_json") or self.result_json
+            try:
+                self.concurrency = max(1, min(8, int(session.get("concurrency") or self.concurrency)))
+            except (TypeError, ValueError):
+                pass
+            self.global_blocker = str(session.get("global_blocker") or self.global_blocker)
+            try:
+                self.attention_count = max(0, int(session.get("attention_count") or self.attention_count))
+            except (TypeError, ValueError):
+                pass
             self.started_at = float(session.get("started_at") or 0.0)
             self.finished_at = float(session.get("finished_at") or 0.0)
             durations = session.get("item_durations")
@@ -765,12 +1194,13 @@ class JobManager:
                 self.log("自动检测登录状态跳过：未找到可用浏览器", "warn")
                 return
             with self._auto_check_lock:
-                if not web.cdp_available():
-                    web.start_persistent_chrome(
-                        focus=False,
-                        # 调试模式尊重“保持显示”偏好；默认模式保持收起不弹窗。
-                        hide_if_logged_in=not bool(getattr(settings, "debug_browser", False)),
-                    )
+                # Existing browsers also need their runtime startup preference
+                # verified; the previous version may have only changed JSON.
+                web.start_persistent_chrome(
+                    focus=False,
+                    # 调试模式尊重“保持显示”偏好；默认模式保持收起不弹窗。
+                    hide_if_logged_in=not bool(getattr(settings, "debug_browser", False)),
+                )
                 if not web.cdp_available():
                     raise RuntimeError("已尝试后台启动浏览器，但调试端口未就绪")
                 login = self._wait_login_settled(web)
@@ -849,11 +1279,49 @@ class JobManager:
         if self._auto_check_lock.acquire(timeout=max(0.0, seconds)):
             self._auto_check_lock.release()
 
+    def _stale_probe(self, active):
+        """任务运行期探测失败时返回最近一次成功的 CDP 探测结果。
+
+        批处理上下文保留期间浏览器由任务自己管理；Chrome 忙碌时的单次
+        探测超时不代表断开。空闲或超过 ``_probe_stale_seconds`` 时返回
+        None，如实上报当前状态。
+        """
+        if not active:
+            return None
+        with self.lock:
+            probe = self._last_good_probe
+            if not probe or not probe.get("cdp"):
+                return None
+            if time.time() - self._last_good_probe_at > self._probe_stale_seconds:
+                return None
+            return {"browser": probe.get("browser") or "", "login": dict(probe.get("login") or {})}
+
     def chrome_status(self):
-        settings = paths.load_settings()
+        # A running batch owns its immutable settings snapshot.  The settings
+        # page may have been edited meanwhile, but status polling must not
+        # reload those paths into the live worker runtime or report the new
+        # profile/port as if it belonged to the active batch.
+        active = self._batch_context_retained()
+        with self.lock:
+            batch_settings = copy.deepcopy(self.batch_settings) if active else None
+        if active:
+            settings = batch_settings
+        else:
+            settings = paths.load_settings()
+            # save_settings intentionally leaves the current process
+            # environment untouched while a batch is active. Once the old
+            # browser context is no longer retained, sync the saved profile,
+            # port and output paths before reloading the web module. A mocked
+            # or malformed settings object must not make status polling fail.
+            try:
+                settings = paths.configure_environ(settings) or settings
+            except Exception:
+                pass
         web = load_web()
-        web.reload_paths()
-        chrome = paths.browser_exe_path(settings.chrome_path)
+        if not active:
+            web.reload_paths()
+        chrome_path = self._setting(settings, "chrome_path", "")
+        chrome = paths.browser_exe_path(chrome_path)
         found = bool(chrome and Path(chrome).is_file())
         cdp = False
         browser = ""
@@ -870,18 +1338,35 @@ class JobManager:
                     except Exception:
                         pass
                     self._hide_chrome_after_login = False
+                with self.lock:
+                    self._last_good_probe = {"cdp": True, "browser": browser, "login": dict(login)}
+                    # 用 wall clock 而不是 monotonic：这里只是 15 秒级的
+                    # 陈旧度判断，且 chrome_status 的既有测试按调用次数
+                    # mock monotonic，不能再消耗它的序列。
+                    self._last_good_probe_at = time.time()
             else:
-                self._stable_login_status(login)
+                fallback = self._stale_probe(active)
+                if fallback is None:
+                    self._stable_login_status(login)
+                else:
+                    cdp, browser, login = True, fallback["browser"], fallback["login"]
         except Exception as exc:
-            login = {"logged_in": False, "blocker": str(exc), "url": ""}
-            self._stable_login_status(login)
+            fallback = self._stale_probe(active)
+            if fallback is None:
+                login = {"logged_in": False, "blocker": str(exc) or "未连接调试 Chrome", "url": ""}
+                self._stable_login_status(login)
+            else:
+                cdp, browser, login = True, fallback["browser"], fallback["login"]
         return {
             "chrome_path": str(chrome or ""),
             "chrome_found": found,
-            "browser_source": paths.browser_source(settings.chrome_path),
-            "profile": settings.chrome_profile,
-            "cdp_port": settings.cdp_port,
-            "debug_browser": bool(getattr(settings, "debug_browser", False)),
+            "browser_source": paths.browser_source(chrome_path),
+            "profile": self._setting(settings, "chrome_profile", ""),
+            "cdp_port": self._setting(settings, "cdp_port", 0),
+            # Window visibility is an immediate preference and is therefore
+            # read from disk even while the browser path/port stay frozen to
+            # the batch context above.
+            "debug_browser": self._saved_debug_browser() if active else bool(self._setting(settings, "debug_browser", False)),
             "cdp": cdp,
             "browser": browser,
             "logged_in": bool(login.get("logged_in")),
@@ -913,23 +1398,21 @@ class JobManager:
 
     def reveal_chrome(self):
         """Show the managed automation browser without changing the saved visibility preference."""
-        settings = paths.configure_environ()
+        active = self._batch_context_retained()
+        with self.lock:
+            batch_settings = copy.deepcopy(self.batch_settings) if active else None
+        settings = batch_settings if active else paths.configure_environ()
         web = load_web()
-        web.reload_paths()
-        browser = paths.browser_exe_path(settings.chrome_path)
+        if not active:
+            web.reload_paths()
+        chrome_path = self._setting(settings, "chrome_path", "")
+        browser = paths.browser_exe_path(chrome_path)
         if not browser or not browser.is_file():
             raise RuntimeError("未找到可用浏览器")
 
         self._hide_chrome_after_login = False
         self._wait_for_login_check()
-        if web.cdp_available():
-            shown = web.reveal_seller_chrome()
-            action = "focused"
-        else:
-            action = web.start_persistent_chrome(focus=True, hide_if_logged_in=False)
-            shown = True
-        if not shown:
-            raise RuntimeError("浏览器已连接，但未找到可显示的窗口；请关闭残留浏览器后重试")
+        action = web.start_persistent_chrome(focus=True, hide_if_logged_in=False)
 
         status = self.chrome_status()
         status["opened"] = action
@@ -938,7 +1421,10 @@ class JobManager:
         return status
 
     def _hide_chrome_for_fill(self):
-        if paths.load_settings().debug_browser:
+        with self.lock:
+            batch_settings = self.batch_settings if self.status in {"running", "stopping"} else None
+        debug_browser = bool(self._setting(batch_settings, "debug_browser", False)) if batch_settings is not None else paths.load_settings().debug_browser
+        if debug_browser:
             self._hide_chrome_after_login = False
             try:
                 load_web().reveal_automation_chrome()
@@ -952,6 +1438,26 @@ class JobManager:
             if web.cdp_available():
                 web.hide_automation_chrome()
                 self._hide_chrome_after_login = False
+        except Exception:
+            pass
+
+    def _apply_chrome_pref_for_fill(self):
+        """填单/入库运行期间的窗口可见性跟随「显示自动化浏览器」开关。
+
+        隐藏实现（hide_automation_chrome）是"移出屏幕 + 移除任务栏按钮但保持
+        IsWindowVisible"，配合防节流启动参数 Chrome 渲染不冻结，自动化点击
+        不会超时，因此运行期间无需再为可靠性强制显示窗口；勾选开关可实时
+        查看现场。结束/暂停后的可见性由 _finish_browser 按开关恢复。
+        """
+        self._hide_chrome_after_login = False
+        if not self._saved_debug_browser():
+            try:
+                load_web().hide_automation_chrome()
+            except Exception:
+                pass
+            return
+        try:
+            load_web().reveal_automation_chrome()
         except Exception:
             pass
 
@@ -976,7 +1482,11 @@ class JobManager:
             web = load_web()
         except Exception:
             return
-        if not paths.load_settings().debug_browser:
+        # This preference is deliberately live: saving the display switch
+        # must affect a running/paused batch without changing its profile or
+        # CDP endpoint.
+        debug_browser = self._saved_debug_browser()
+        if not debug_browser:
             try:
                 web.hide_automation_chrome()
             except Exception:
@@ -989,15 +1499,20 @@ class JobManager:
             pass
 
     def open_chrome(self):
-        settings = paths.configure_environ()
+        active = self._batch_context_retained()
+        with self.lock:
+            batch_settings = copy.deepcopy(self.batch_settings) if active else None
+        settings = batch_settings if active else paths.configure_environ()
         web = load_web()
-        web.reload_paths()
-        browser = paths.browser_exe_path(settings.chrome_path)
+        if not active:
+            web.reload_paths()
+        chrome_path = self._setting(settings, "chrome_path", "")
+        browser = paths.browser_exe_path(chrome_path)
         if not browser or not browser.is_file():
             raise RuntimeError("未找到可用浏览器：安装包缺少内置 Chromium，且未检测到自定义或系统 Chrome")
         # 后台登录检测可能正在启动同一个浏览器；最多等它收尾，避免双开。
         self._wait_for_login_check()
-        debug_browser = bool(getattr(settings, "debug_browser", False))
+        debug_browser = self._saved_debug_browser()
         action = web.start_persistent_chrome(
             focus=True,
             # 点击按钮后先确保浏览器真实显示且可交互。是否已登录由带稳定期
@@ -1018,10 +1533,16 @@ class JobManager:
                 except Exception:
                     pass
                 self._hide_chrome_after_login = False
-            try:
-                web.prune_automation_tabs(keep_fill_pages=True)
-            except Exception:
-                pass
+            # An active batch owns its pages through the worker pool.  Do not
+            # run a process-wide cleanup from the manual browser entrypoint.
+            if not active:
+                try:
+                    web.reconcile_browser_tabs(keep_fill_pages=True)
+                except Exception:
+                    try:
+                        web.prune_automation_tabs(keep_fill_pages=True)
+                    except Exception:
+                        pass
             notice = (
                 "调试模式已开启，自动化浏览器保持显示"
                 if debug_browser
@@ -1055,9 +1576,13 @@ class JobManager:
         url = links.get("view_url") if kind == "view" else links.get("edit_url")
         if not url:
             raise RuntimeError("还没有商品链接，请先入库提交")
-        self._hide_chrome_after_login = False
         web = load_web()
-        result = web.open_item_url(url)
+        # 商品查看和编辑都在独立的内置 Chromium 中打开。这个入口不复用
+        # 入库浏览器的 profile/CDP 端口，也不调用会清理入库页签的旧入口。
+        opener = getattr(web, "open_item_url_in_builtin_browser", None)
+        if not callable(opener):
+            raise RuntimeError("当前运行时缺少独立商品详情浏览器")
+        result = opener(url)
         self.log(f"已打开{'查看' if kind == 'view' else '编辑'}商品 {found.get('product_id') or ''}")
         return result
 
@@ -1068,13 +1593,8 @@ class JobManager:
         用于本地残留了已被千牛后台删除的商品 ID，导致永远走续跑补图的情况。
         """
         pid = str(product_id or "")
+        reset_id = uuid.uuid4().hex
         cleared = None
-        clear_keys = (
-            "execution", "notice", "errors", "taobao_item_id", "view_url", "edit_url",
-            "flow_version", "sku_image_strategy", "seller_account", "flow_stage", "spec_image_stage",
-            "run_status", "sku_material_manifest", "material_result", "material_preview", "last_error",
-            "updated_at", "material_folder", "duration_seconds",
-        )
         with self.lock:
             if self.status in {"running", "stopping"}:
                 raise RuntimeError("任务正在运行，请先停止后再清除")
@@ -1083,15 +1603,7 @@ class JobManager:
                     continue
                 if pid and str(item.get("product_id") or "") not in {"", pid}:
                     continue
-                for key in clear_keys:
-                    if key in ("execution",):
-                        item[key] = "未执行"
-                    elif key == "errors":
-                        item[key] = []
-                    elif key == "duration_seconds":
-                        item[key] = None
-                    else:
-                        item[key] = ""
+                _reset_execution_fields(item, reset_id)
                 cleared = dict(item)
                 break
             for bundle in self.products:
@@ -1100,15 +1612,8 @@ class JobManager:
                     continue
                 if pid and str(meta.get("product_id") or "") not in {"", pid}:
                     continue
-                for key in clear_keys:
-                    if key == "execution":
-                        meta[key] = "未执行"
-                    elif key == "errors":
-                        meta[key] = []
-                    elif key == "duration_seconds":
-                        meta[key] = None
-                    else:
-                        meta[key] = ""
+                _reset_execution_fields(meta, reset_id)
+                _reset_execution_fields(bundle.setdefault("product", {}), reset_id)
                 bundle["meta"] = meta
                 if cleared is None:
                     cleared = dict(meta)
@@ -1118,7 +1623,7 @@ class JobManager:
         module = _job_session()
         if module is not None:
             try:
-                module.forget_execution(row=row, product_id=pid)
+                module.forget_execution(row=row, product_id=pid, reset_id=reset_id)
             except Exception as exc:
                 self.log(f"执行历史清除失败（{pid or row}）: {exc}", "warn")
         self._save_session()
@@ -1126,10 +1631,54 @@ class JobManager:
         self.log(f"{label} 已清除执行状态，下次会重新入库", "warn")
         return {"ok": True, "row": row, "product_id": cleared.get("product_id") or ""}
 
-    def _pending_products(self, force_new=False, retry_failed=False):
+    def clear_rows_state(self, rows):
+        """批量清除多行商品的执行状态（执行明细一键清除入口）。
+
+        语义与 clear_row_state 一致：仅清空 rows 与 products[].meta 的执行
+        字段，商品数据保留。行号不在当前清单里的会被忽略；全部未知时才报错。
+        """
+        wanted = {int(r) for r in rows or []}
+        if not wanted:
+            raise RuntimeError("请先选择要清除的记录")
+        cleared_rows = set()
+        reset_ids = {row: uuid.uuid4().hex for row in wanted}
+        with self.lock:
+            if self.status in {"running", "stopping"}:
+                raise RuntimeError("任务正在运行，请先停止后再清除")
+            for item in self.rows:
+                if item.get("row") not in wanted:
+                    continue
+                _reset_execution_fields(item, reset_ids[item.get("row")])
+                cleared_rows.add(item.get("row"))
+            for bundle in self.products:
+                meta = bundle.get("meta") or {}
+                if meta.get("row") not in wanted:
+                    continue
+                _reset_execution_fields(meta, reset_ids[meta.get("row")])
+                _reset_execution_fields(bundle.setdefault("product", {}), reset_ids[meta.get("row")])
+                bundle["meta"] = meta
+                cleared_rows.add(meta.get("row"))
+        if not cleared_rows:
+            raise RuntimeError("找不到该商品")
+        module = _job_session()
+        if module is not None:
+            try:
+                module.forget_executions(rows=cleared_rows, reset_ids=reset_ids)
+            except Exception as exc:
+                self.log(f"执行历史批量清除失败（{len(cleared_rows)} 行）: {exc}", "warn")
+        self._save_session()
+        self.log(f"已批量清除 {len(cleared_rows)} 条执行记录，对应商品下次会重新入库", "warn")
+        return {"ok": True, "cleared": len(cleared_rows)}
+
+    def _pending_products(self, force_new=False, retry_failed=False, selected_rows=None):
+        selection = None if selected_rows is None else {
+            (item["row"], item["product_id"]) for item in selected_rows
+        }
         pending = []
         for bundle in self.products:
             meta = dict(bundle.get("meta") or {})
+            if selection is not None and (meta.get("row"), str(meta.get("product_id") or (bundle.get("product") or {}).get("product_id") or "")) not in selection:
+                continue
             # rows 是执行明细的即时镜像。某些中断时序下 on_item_done
             # 先刷新了 rows、随后才写入 products[].meta；续跑不能因此丢掉
             # 已显示的商品 ID，否则会把已有商品误送回新建发布页。
@@ -1150,25 +1699,19 @@ class JobManager:
                     if key == "errors":
                         if value is not None:
                             meta[key] = list(value or [])
-                    elif value not in (None, ""):
+                    elif value not in (None, "") or (key == "video_warning" and key in row_state):
                         meta[key] = value
             if meta.get("validation") != "通过":
                 continue
             execution = meta.get("execution") or "未执行"
-            has_item_id = bool(str(meta.get("taobao_item_id") or "").strip())
-            stage = (meta.get("flow_stage") or "").strip()
-            legacy = not (meta.get("flow_version") or meta.get("flow_stage"))
-            if retry_failed:
-                if self._row_flow_done(meta):
-                    continue
-                if legacy and not has_item_id and execution not in RESUME_EXECUTIONS:
-                    continue
-            elif not force_new and self._row_flow_done(meta):
-                continue
-            elif not force_new and legacy and not has_item_id and execution in DONE_EXECUTIONS:
+            if (retry_failed or not force_new) and self._row_flow_done(meta):
                 continue
             product = dict(bundle.get("product") or {})
             product["execution"] = execution
+            product["execution_reset_id"] = meta.get("execution_reset_id") or product.get("execution_reset_id") or ""
+            for key in ("resume_checkpoint", "last_browser_write"):
+                if meta.get(key):
+                    product[key] = copy.deepcopy(meta[key])
             product["notice"] = meta.get("notice") or product.get("notice") or ""
             product["errors"] = list(meta.get("errors") or [])
             product["flow_version"] = meta.get("flow_version") or product.get("flow_version") or ""
@@ -1181,32 +1724,72 @@ class JobManager:
             product["material_preview"] = meta.get("material_preview") or product.get("material_preview") or []
             product["material_folder"] = meta.get("material_folder") or product.get("material_folder") or ""
             product["last_error"] = meta.get("last_error") or product.get("last_error") or ""
+            product["video_warning"] = meta.get("video_warning", product.get("video_warning")) or ""
+            product["video_status"] = meta.get("video_status") or product.get("video_status") or ""
             product["taobao_item_id"] = meta.get("taobao_item_id") or product.get("taobao_item_id") or ""
             product["view_url"] = meta.get("view_url") or product.get("view_url") or ""
             product["edit_url"] = meta.get("edit_url") or product.get("edit_url") or ""
             pending.append(product)
         return pending
 
-    def start_job(self, confirm_submit=True, limit=0, force_new=False, retry_failed=False):
+    def start_job(self, confirm_submit=True, limit=0, concurrency=None, force_new=False, retry_failed=False, selected_rows=None, workbook_path=None):
         with self.lock:
+            if self.update_pending:
+                raise RuntimeError("已安排任务结束后重启更新，请先取消自动重启再开始新任务")
             if self.status in {"running", "stopping"}:
                 raise RuntimeError("已有入库任务在运行")
+            stale = code_watch.stale_code_files()
+            if stale:
+                raise RuntimeError(code_watch.stale_code_notice(stale))
             if not self.workbook_path:
                 raise RuntimeError("请先导入商品清单或选择工作空间")
-            executable = self._pending_products(force_new=force_new, retry_failed=retry_failed)
+            if workbook_path is not None and Path(workbook_path).resolve() != Path(self.workbook_path).resolve():
+                raise RuntimeError("当前清单已变化，请刷新后重新选择商品")
+            if selected_rows is not None:
+                selected_rows = copy.deepcopy(selected_rows)
+                selected_keys = {(item["row"], item["product_id"]) for item in selected_rows}
+                available = {(row.get("row"), str(row.get("product_id") or "")) for row in self.rows}
+                if not selected_keys or len(selected_keys) != len(selected_rows) or not selected_keys.issubset(available):
+                    raise RuntimeError("所选商品已变化或包含重复项，请重新选择后执行")
+                fingerprints = {(row.get("row"), str(row.get("product_id") or "")): str(row.get("pack_fingerprint") or "") for row in self.rows}
+                if any(item.get("pack_fingerprint") is not None and item["pack_fingerprint"] != fingerprints[(item["row"], item["product_id"])] for item in selected_rows):
+                    raise RuntimeError("所选商品素材已变化，请重新扫描并选择后执行")
+            executable = self._pending_products(force_new=force_new, retry_failed=retry_failed, selected_rows=selected_rows)
             if not executable:
+                if selected_rows is not None:
+                    raise RuntimeError("所选商品没有通过校验的未完成项，已完成商品会自动跳过")
                 if retry_failed:
-                    raise RuntimeError("没有失败、暂停或已停止的商品")
+                    raise RuntimeError("没有通过校验的未完成商品")
                 if force_new:
                     raise RuntimeError("没有通过校验的商品，无法入库")
                 raise RuntimeError("没有待处理商品。如需重新建品，请在执行明细中清除对应商品的记录后重试")
+            self.batch_settings = self._settings_snapshot(paths.load_settings())
+            if concurrency is not None:
+                try:
+                    requested_concurrency = max(1, min(8, int(concurrency)))
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError("并发数必须是 1 到 8 之间的整数") from exc
+                if isinstance(self.batch_settings, dict):
+                    self.batch_settings["concurrency"] = requested_concurrency
+                else:
+                    self.batch_settings.concurrency = requested_concurrency
+            try:
+                self.concurrency = max(1, min(8, int(self._setting(self.batch_settings, "concurrency", 2) or 2)))
+            except (TypeError, ValueError):
+                self.concurrency = 2
             self.cancel.clear()
             self.status = "running"
             self.blocker = ""
+            self.global_blocker = ""
             self.phase = "准备"
             self.done = 0
             self.total = len(executable) if not limit else min(len(executable), int(limit))
             self.seen_steps = set()
+            self.worker_events = {}
+            self.active_worker_events = {}
+            self._completed_rows = set()
+            self._attention_rows = set()
+            self.attention_count = 0
             self.activity_at = time.time()
             self.started_at = time.time()
             self.finished_at = 0.0
@@ -1216,7 +1799,7 @@ class JobManager:
             self.result_json = ""
         self._hide_chrome_for_fill()
         if retry_failed:
-            mode = "只重试失败项"
+            mode = "重试未完成项"
         elif force_new:
             mode = "从头新建"
         else:
@@ -1229,7 +1812,8 @@ class JobManager:
         else:
             extra_tab = "，接着当前发布页未完成的步骤"
         self.log(
-            f"{mode}：{self.total} 条，放入仓库，确认提交到仓库"
+            f"{mode}：{self.total} 条，放入仓库，确认提交到仓库；并发 {self.concurrency}"
+            + (f"；仅处理所选 {len(selected_rows)} 件商品" if selected_rows is not None else "；全部未完成项")
             + extra_tab
         )
         self.thread = threading.Thread(
@@ -1239,6 +1823,7 @@ class JobManager:
                 "limit": int(limit or 0),
                 "force_new": bool(force_new),
                 "retry_failed": bool(retry_failed),
+                "selected_rows": selected_rows,
             },
             daemon=True,
             name="qianniu-job",
@@ -1252,7 +1837,7 @@ class JobManager:
                 return self.snapshot()
             self.status = "stopping"
         self.cancel.set()
-        self.log("已请求暂停，当前页面操作结束后停止；保留发布页，之后可继续", "warn")
+        self.log("已请求暂停，正在中断当前页面操作并保留现场；之后可继续", "warn")
         return self.snapshot()
 
     def job_history(self, limit=30):
@@ -1329,7 +1914,14 @@ class JobManager:
     def _watch_progress(self, stop):
         watch_state = {"last_label": "", "last_id": None}
         while not stop.wait(0.4):
-            self._consume_fill_progress(read_fill_progress(), watch_state)
+            # Concurrent workers write progress to their isolated output
+            # directories and report it through ``on_worker_event``.  Read
+            # the legacy shared progress file only for the serial path; the
+            # watchdog itself is shared and checks each active worker event.
+            with self.lock:
+                serial = self.concurrency <= 1
+            if serial:
+                self._consume_fill_progress(read_fill_progress(), watch_state)
             self._check_stalled()
 
     def _check_stalled(self):
@@ -1337,80 +1929,137 @@ class JobManager:
 
         不强杀流水线：浏览器现场必须保留给人工判断，任务可继续或协作停止。
         """
-        if self.status != "running" or self.stalled:
-            return
-        idle = time.time() - self.activity_at
-        threshold = stall_seconds()
-        if idle <= threshold:
-            return
         with self.lock:
             if self.status != "running" or self.stalled:
+                # A batch-level stall has already been reported.  Worker
+                # slots can still recover independently, so continue below
+                # only when the batch itself is not marked stalled.
+                batch_stalled = self.stalled
+            else:
+                batch_stalled = False
+            idle = time.time() - self.activity_at
+        threshold = stall_seconds()
+        worker_messages = []
+        with self.lock:
+            if self.status != "running":
                 return
-            self.stalled = True
-            self.blocker = (
-                f"任务已超过 {max(1, threshold // 60)} 分钟无任何进展，"
-                "可能被页面弹窗或验证阻塞"
-            )
-        if paths.load_settings().debug_browser:
-            self._reveal_chrome_for_attention()
+            now = time.time()
+            for worker_id, state in self.active_worker_events.items():
+                last = float(state.get("activity_at") or now)
+                if now - last <= threshold:
+                    continue
+                if state.get("stalled"):
+                    continue
+                state["stalled"] = True
+                worker_messages.append(
+                    f"执行槽 {worker_id}（第{state.get('row')}行 {state.get('product_id') or ''}）"
+                )
+            if idle > threshold and not batch_stalled:
+                self.stalled = True
+                self.blocker = (
+                    f"任务已超过 {max(1, threshold // 60)} 分钟无任何进展，"
+                    "可能被页面弹窗或验证阻塞"
+                )
+            elif worker_messages:
+                self.stalled = True
+                self.blocker = "；".join(worker_messages) + "超过停滞阈值，可能被页面弹窗或验证阻塞"
+            elif batch_stalled:
+                return
+            elif not self.stalled:
+                return
+        # 停滞意味着可能被弹窗/验证阻塞；窗口可见性跟随开关——隐藏窗口
+        # 渲染正常，不会因隐藏而卡死，未勾选时保持隐藏并提示如何查看现场。
+        self._apply_chrome_pref_for_fill()
+        if self._saved_debug_browser():
             self.log(f"{self.blocker}；已显示自动化浏览器，请检查现场后选择暂停或继续等待", "error")
         else:
-            self.log(f"{self.blocker}；浏览器保持隐藏，需要查看现场时可在设置中勾选“显示自动化浏览器”", "error")
+            self.log(f"{self.blocker}；浏览器保持隐藏，勾选「显示自动化浏览器」可查看现场后选择暂停或继续等待", "error")
 
-    def _run_job(self, confirm_submit=True, limit=0, force_new=False, retry_failed=False):
+    def _run_job(self, confirm_submit=True, limit=0, force_new=False, retry_failed=False, selected_rows=None):
         stop = threading.Event()
-        paths.configure_environ()
-        try:
-            (paths.playwright_output_dir() / "web_fill_progress.json").write_text("[]", encoding="utf-8")
-        except OSError:
-            pass
+        with self.lock:
+            settings = copy.deepcopy(self.batch_settings)
+            concurrency = self.concurrency
+        if settings is None:
+            settings = self._settings_snapshot(paths.load_settings())
+        # Configure the loaded runtime once from the immutable batch snapshot.
+        # Settings writes during this run are handled by the server/UI layer
+        # without reloading the active runtime.
+        paths.configure_environ(settings)
+        watcher = None
+        if concurrency <= 1:
+            try:
+                (paths.playwright_output_dir() / "web_fill_progress.json").write_text("[]", encoding="utf-8")
+            except OSError:
+                pass
+        # The concurrent path has no single shared progress file, but its
+        # worker events still need periodic stall checks.
         watcher = threading.Thread(target=self._watch_progress, args=(stop,), daemon=True)
         watcher.start()
         seller = load_seller()
-        settings = paths.configure_environ()
         paths.apply_to_loaded_modules()
-        self._hide_chrome_for_fill()
-        try:
-            load_web().prune_automation_tabs(keep_fill_pages=True)
-        except Exception:
-            pass
+        self._apply_chrome_pref_for_fill()
         try:
             with self.lock:
-                selected = self._pending_products(force_new=force_new, retry_failed=retry_failed)
+                selected = self._pending_products(force_new=force_new, retry_failed=retry_failed, selected_rows=selected_rows)
                 source = self.workbook_path
             cap = int(limit or 0)
             selected = selected[:cap] if cap else selected
             web_fill = seller.load_web_fill()
+            runtime_settings = copy.deepcopy(settings)
+            if isinstance(runtime_settings, dict):
+                runtime_settings["workbook_path"] = source
+            else:
+                try:
+                    runtime_settings.workbook_path = source
+                except Exception:
+                    runtime_settings = dict(getattr(runtime_settings, "__dict__", {}) or {})
+                    runtime_settings["workbook_path"] = source
             finished = {"count": 0}
             item_started = {}
 
             def on_start(product):
                 # 重试同一条目时不重置计时，时长覆盖该条的全部尝试
-                item_started.setdefault(product.get("row"), time.time())
+                item_key = product.get("row")
+                if item_key is None:
+                    item_key = str(product.get("product_id") or "")
                 with self.lock:
+                    item_started.setdefault(item_key, time.time())
                     self.current_row = product.get("row")
                     self.current_id = str(product.get("product_id") or "")
                     self.phase = "开始填写"
                     self.done = finished["count"]
-                    self.seen_steps = set()
+                    if self.concurrency <= 1:
+                        self.seen_steps = set()
                     self.activity_at = time.time()
                 self.log(f"正在填写第 {product.get('row')} 行 {product.get('product_id') or ''}")
 
             def on_done(product, item):
-                finished["count"] += 1
-                started = item_started.pop(product.get("row"), None)
+                item_key = product.get("row")
+                if item_key is None:
+                    item_key = str(product.get("product_id") or "")
+                with self.lock:
+                    first_done = item_key not in self._completed_rows
+                    if first_done:
+                        self._completed_rows.add(item_key)
+                        finished["count"] += 1
+                    started = item_started.pop(item_key, None)
                 if started:
                     item["duration_seconds"] = round(time.time() - started, 1)
                 execution = item.get("execution") or ""
                 notice = str(item.get("notice") or "").strip()
                 serialized = serialize_row({**product, **item})
-                flow_fields = {key: item.get(key) for key in FLOW_FIELDS if item.get(key) not in (None, "")}
+                flow_fields = {key: item.get(key) for key in FLOW_FIELDS
+                               if item.get(key) not in (None, "") or (key == "video_warning" and key in item)}
                 pause_code = pause_reason_code(notice) if execution == "暂停" else ""
                 with self.lock:
                     self.done = finished["count"]
-                    if item.get("duration_seconds"):
+                    if first_done and item.get("duration_seconds"):
                         self.item_durations.append(float(item["duration_seconds"]))
-                    if execution == "暂停":
+                    if execution in ATTENTION_EXECUTIONS:
+                        self._attention_rows.add(item_key)
+                        self.attention_count = len(self._attention_rows)
+                    if execution == "暂停" and not self.global_blocker:
                         self.blocker = notice
                     for row in self.rows:
                         if row.get("row") != product.get("row"):
@@ -1460,7 +2109,17 @@ class JobManager:
                 self.log(f"{pid} 第 {attempt}/{retry_limit} 次自动重试：{notice[:200]}", "warn")
 
             def on_flow(product, item):
+                # 建品成功瞬间 ID/执行状态就已确定，必须随 flow 字段一起实时
+                # 回写：否则明细里“已入库，待补图”配着“未执行/无ID”，已入库
+                # 计数也停在 0，直到整条补图流程终态才纠正。
                 fields = {
+                    "execution_reset_id": item.get("execution_reset_id"),
+                    "resume_checkpoint": item.get("resume_checkpoint"),
+                    "last_browser_write": item.get("last_browser_write"),
+                    "execution": item.get("execution"),
+                    "taobao_item_id": item.get("taobao_item_id"),
+                    "view_url": item.get("view_url"),
+                    "edit_url": item.get("edit_url"),
                     "flow_version": item.get("flow_version"),
                     "sku_image_strategy": item.get("sku_image_strategy"),
                     "flow_stage": item.get("flow_stage"),
@@ -1471,22 +2130,35 @@ class JobManager:
                     "material_preview": item.get("material_preview"),
                     "material_folder": item.get("material_folder"),
                     "last_error": item.get("last_error"),
+                    "video_status": item.get("video_status"),
                 }
-                fields = {key: value for key, value in fields.items() if value not in (None, "")}
+                if "video_warning" in item:
+                    fields["video_warning"] = item["video_warning"]
+                fields = {key: value for key, value in fields.items()
+                          if value not in (None, "") or (key == "video_warning" and value == "")}
                 if not fields:
                     return
+                if fields.get("taobao_item_id"):
+                    # ID 就位时补齐查看/编辑链接；只在显式出现 ID 时处理，
+                    # 避免中途 emit 缺 ID 字段时把已回填的链接清空。
+                    link_module = _job_session()
+                    if link_module is not None and hasattr(link_module, "apply_action_links"):
+                        fields = {
+                            key: value
+                            for key, value in link_module.apply_action_links(fields).items()
+                            if value not in (None, "") or (key == "video_warning" and value == "")
+                        }
                 module = _job_session()
                 if module is None or not hasattr(module, "patch_flow_state"):
-                    return
-                try:
-                    module.patch_flow_state(
-                        product.get("row"),
-                        product.get("product_id") or "",
-                        fields,
-                    )
-                except Exception as exc:
-                    # 断点状态写盘失败会让续跑回退到较粗的阶段，必须留痕
-                    self.log(f"续跑状态写入失败（{product.get('product_id') or product.get('row')}）: {exc}", "warn")
+                    raise RuntimeError("续跑状态写入不可用")
+                # A checkpoint write is part of the item outcome.  Let the
+                # pipeline see the error so it cannot report a successful
+                # item whose resume state was lost.
+                module.patch_flow_state(
+                    product.get("row"),
+                    product.get("product_id") or "",
+                    fields,
+                )
                 with self.lock:
                     self.activity_at = time.time()
                     for row in self.rows:
@@ -1512,16 +2184,19 @@ class JobManager:
                 on_item_done=on_done,
                 on_item_retry=on_retry,
                 on_flow_stage=on_flow,
+                concurrency=concurrency,
+                on_worker_event=self._on_worker_event,
+                runtime_settings=runtime_settings,
                 force_new=force_new,
-                sku_template_import=settings.sku_template_import,
-                skip_spec_images=settings.skip_spec_images,
-                sku_image_strategy=settings.sku_image_strategy,
-                spec_upload_batch_size=settings.spec_upload_batch_size,
-                item_retry_limit=getattr(settings, "item_retry_limit", 0),
+                sku_template_import=self._setting(settings, "sku_template_import", False),
+                skip_spec_images=self._setting(settings, "skip_spec_images", False),
+                sku_image_strategy=self._setting(settings, "sku_image_strategy", "slim_material"),
+                spec_upload_batch_size=self._setting(settings, "spec_upload_batch_size", 0),
+                item_retry_limit=self._setting(settings, "item_retry_limit", 0),
             )
             by_row = {item.get("row"): item for item in executed or []}
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-            results_dir = Path(settings.results_dir)
+            results_dir = Path(self._setting(settings, "results_dir", paths.default_results_dir()))
             results_dir.mkdir(parents=True, exist_ok=True)
             source_path = Path(source)
             output = results_dir / f"{source_path.stem}.结果-{stamp}.xlsx"
@@ -1541,9 +2216,9 @@ class JobManager:
                             if web_item.get(key):
                                 item[key] = web_item.get(key)
                         for key in FLOW_FIELDS:
-                            if web_item.get(key) not in (None, ""):
+                            if web_item.get(key) not in (None, "") or (key == "video_warning" and key in web_item):
                                 item[key] = web_item.get(key)
-                        if item.get("execution") in {"暂停", "失败", "提交失败", "提交待核实"}:
+                        if item.get("execution") in ATTENTION_EXECUTIONS:
                             attention.append(
                                 f"第{item.get('row')}行 {item.get('product_id') or ''} "
                                 f"{item.get('execution')}: {str(item.get('notice') or '')[:80]}"
@@ -1555,6 +2230,7 @@ class JobManager:
                 self.rows = updated_rows
                 self.done = len(executed or [])
                 self.total = len(selected)
+                self.attention_count = max(self.attention_count, len(attention))
             entries = [[
                 stamp,
                 r.get("row"),
@@ -1575,6 +2251,9 @@ class JobManager:
                 "workspace_path": self.workspace_path,
                 "confirm_submit": bool(confirm_submit),
                 "force_new": bool(force_new),
+                "concurrency": concurrency,
+                "attention_count": len(attention),
+                "global_blocker": self.global_blocker,
                 "total": len(selected),
                 "done": len(executed or []),
                 "started_at": self.started_at or None,
@@ -1590,7 +2269,11 @@ class JobManager:
                 self.finished_at = time.time()
                 self.result_xlsx = str(output)
                 self.result_json = str(journal)
-                if self.cancel.is_set():
+                if self.global_blocker:
+                    self.status = "paused"
+                    self.phase = "需人工处理"
+                    pause_code = pause_reason_code(self.global_blocker)
+                elif self.cancel.is_set():
                     self.status = "stopped"
                     self.phase = "已停止"
                 elif attention:
@@ -1631,7 +2314,10 @@ class JobManager:
             self._save_session()
         finally:
             stop.set()
-            watcher.join(timeout=1.5)
+            if watcher is not None:
+                watcher.join(timeout=1.5)
+            with self.lock:
+                self.active_worker_events.clear()
             self._finish_browser()
             self._save_session()
 
@@ -1646,15 +2332,15 @@ class JobManager:
         if preserve:
             # 需人工检查的现场（图片/错误/待核实）跟随「显示自动化浏览器」
             # 开关：勾选时显示且登录轮询不收起，未勾选时保持隐藏不弹窗。
-            if paths.load_settings().debug_browser:
+            debug_browser = self._saved_debug_browser()
+            if debug_browser:
                 self._reveal_chrome_for_attention()
             else:
                 self._hide_chrome_for_fill()
             return
-        try:
-            load_web().prune_automation_tabs()
-        except Exception:
-            pass
+        # Worker sessions already released their own pages in the pool.  A
+        # successful desktop run must not globally close legacy or user tabs
+        # that have no ownership registry entry.
         self._hide_chrome_for_fill()
 
 

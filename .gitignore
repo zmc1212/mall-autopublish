@@ -15,6 +15,7 @@ dist/
 # Playwright & Browser
 .playwright/
 .playwright-cli/
+.wrangler/
 %SystemDrive%/
 
 # Project specific caches and outputs
@@ -38,6 +39,14 @@ Thumbs.db
 
 # 运行日志（真实运行日志写在 %APPDATA%，根目录 logs/ 为历史遗留）
 logs/
+
+# AI 工具产物（设计稿、评审记录、会话记忆、计划文件）
+.impeccable/
+.workbuddy/
+.zcode/plans/
+
+# 本地销售素材（闲鱼文案与主图，不随代码仓库分发）
+闲鱼上架资料/
 
 # 千牛导出的模板样本
 SKU模板_*.xls

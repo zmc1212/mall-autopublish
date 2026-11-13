@@ -1,7 +1,14 @@
 import { useEffect, useRef } from "react";
 import type { RefObject } from "react";
 
-const FOCUSABLE = 'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])';
+const FOCUSABLE = 'button, [href], input, select, textarea, [tabindex]';
+
+function focusableElements(node: HTMLElement | null) {
+  return Array.from(node?.querySelectorAll<HTMLElement>(FOCUSABLE) || [])
+    .filter(element => !element.matches(':disabled, [hidden], [inert], [aria-disabled="true"]')
+      && element.tabIndex >= 0 && element.getClientRects().length > 0
+      && getComputedStyle(element).visibility !== "hidden");
+}
 
 // 打开中的弹窗栈：Escape 和 Tab 陷阱只作用于最上层弹窗，
 // 避免"确认弹窗叠在明细弹窗上时一次 Escape 关掉两层"。
@@ -31,7 +38,7 @@ export function useDialogBehavior(
       // 尊重组件内的 autoFocus（如确认弹窗聚焦"清除"按钮），焦点不在弹窗内时才移入第一个控件
       const activeInside = document.activeElement instanceof HTMLElement && node.contains(document.activeElement);
       if (!activeInside) {
-        const first = node.querySelectorAll<HTMLElement>(FOCUSABLE)[0];
+        const first = focusableElements(node)[0];
         if (first) first.focus();
         else node.focus();
       }
@@ -45,15 +52,15 @@ export function useDialogBehavior(
         return;
       }
       if (event.key !== "Tab" || !isTop()) return;
-      const focusables = node?.querySelectorAll<HTMLElement>(FOCUSABLE);
-      if (!focusables || focusables.length === 0) return;
+      const focusables = focusableElements(node);
+      if (focusables.length === 0) { event.preventDefault(); node?.focus(); return; }
       const first = focusables[0];
       const last = focusables[focusables.length - 1];
       if (!first || !last) return;
-      if (event.shiftKey && document.activeElement === first) {
+      if (event.shiftKey && (document.activeElement === first || !node?.contains(document.activeElement))) {
         event.preventDefault();
         last.focus();
-      } else if (!event.shiftKey && document.activeElement === last) {
+      } else if (!event.shiftKey && (document.activeElement === last || !node?.contains(document.activeElement))) {
         event.preventDefault();
         first.focus();
       }

@@ -51,7 +51,9 @@ test('detail binding resets upload preselection before inserting in file order',
         imgs.map(img => img.dataset.name)), names, `preselected: ${preselected}`);
     }
     await page.setContent('<div class="item pic"><img><input type="checkbox" checked disabled></div>');
-    const clear = new Function('page', 'frame', helpers + 'return clearPictureSpaceSelection(frame);');
+    // helpers 顶层有 await ensureFront()，必须用 AsyncFunction 包装。
+    const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+    const clear = new AsyncFunction('page', 'frame', helpers + 'return clearPictureSpaceSelection(frame);');
     await assert.rejects(clear(page, page), /PAUSE:.*预选状态无法清除/);
   } finally { await browser.close(); }
 });
@@ -129,3 +131,61 @@ test('detail binding reopens the picker when the library deduplicates identical 
     }
   } finally { await browser.close(); }
 });
+
+test('detail binding releases a late preselected card and re-picks it in place', async () => {
+  const browser = await chromium.launch({headless: true,
+    executablePath: process.env.CHROME_PATH || 'C:/Program Files/Google/Chrome/Application/chrome.exe'});
+  try {
+    const page = await browser.newPage();
+    const names = Array.from({length: 5}, (_, i) => `详情0${i + 1}.jpg`);
+    await page.setContent('<div id="lite-decoration-editor"></div><iframe width="600" height="400"></iframe>');
+    const frame = page.frames()[1];
+    await frame.setContent(names.map((name) => `<div class="item pic"><img>
+      <input type="checkbox" data-name="${name}">${name}</div>`).join('') +
+      '<button class="btn btn-blue">确定</button>');
+    await frame.evaluate(names => {
+      window.queue = [];
+      document.addEventListener('change', event => {
+        const name = event.target.dataset.name;
+        window.queue = window.queue.filter(item => item !== name);
+        if (!event.target.checked) return;
+        window.queue.push(name);
+        // 模拟上传完成后的迟到预选：每次勾选后，下一张被页面自动勾上。
+        const next = names[names.indexOf(name) + 1];
+        const nextBox = next && [...document.querySelectorAll('input')]
+          .find(el => el.dataset.name === next);
+        if (nextBox && !nextBox.checked) {
+          setTimeout(() => {
+            nextBox.checked = true;
+            nextBox.dispatchEvent(new Event('change', {bubbles: true}));
+          }, 0);
+        }
+      });
+      document.querySelector('button').onclick = () => {
+        const editor = parent.document.querySelector('#lite-decoration-editor');
+        for (const name of window.queue) {
+          const img = parent.document.createElement('img');
+          img.width = 120;
+          img.dataset.name = name;
+          editor.append(img);
+        }
+        parent.document.querySelector('iframe').style.display = 'none';
+      };
+    }, names);
+    const fixtureHelpers = helpers.replace('const sleep = (ms) => page.waitForTimeout(ms);',
+      'const sleep = () => page.waitForTimeout(0);') + `
+      function pictureSpaceFrame() { return page.frames()[1]; }
+      async function dismissKnow() {}
+      async function assertNoSecurityChallenge() {}
+      async function waitUploadResultClosed() { return 'CLOSED'; }
+    `;
+    const run = new Function('return (' + source.replace('/*PAYLOAD*/', JSON.stringify({phase: 'bind', names}))
+      .replace('/*HELPERS*/', () => fixtureHelpers) + ')')();
+    const result = JSON.parse(await run(page));
+    assert.equal(result.after.imgs, names.length);
+    assert.equal(result.after.dialog, false);
+    assert.deepEqual(await page.locator('#lite-decoration-editor img').evaluateAll(imgs =>
+      imgs.map(img => img.dataset.name)), names, 'late preselection must not break file order');
+  } finally { await browser.close(); }
+});
+

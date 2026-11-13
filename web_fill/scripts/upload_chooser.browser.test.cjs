@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const {chromium} = require('../../.work/node_modules/playwright-core');
-const helpers = fs.readFileSync(path.join(__dirname, '_helpers.inc.js'), 'utf8');
+const helpers = fs.readFileSync(path.join(__dirname, '_helpers.inc.js'), 'utf8').replace(/^await ensureFront\(\);\s*$/m, '');
 const launchBrowser = () => chromium.launch({headless: true,
   executablePath: process.env.CHROME_PATH || 'C:/Program Files/Google/Chrome/Application/chrome.exe'});
 
@@ -138,21 +138,21 @@ test('real DOM receipts submit five files once and keep a frequency failure visi
   }
 });
 
-test('visible captcha stays open and prevents file dispatch in Chromium', async () => {
+test('captcha that cannot be auto-closed pauses before file dispatch in Chromium', async () => {
   const browser = await launchBrowser();
   try {
     const page = await browser.newPage();
     await page.setContent('<iframe id=picker></iframe>');
     const frame = page.frames()[1];
-    await frame.setContent('<input type=file><div class=J_MIDDLEWARE_FRAME_WIDGET>' +
-      '<img style="width:20px;height:20px" onclick="window.closeClicks++;this.parentElement.remove()">' +
-      '<iframe src="about:blank?action=captcha"></iframe></div><script>window.closeClicks=0;window.uploads=0;' +
+    // 自动关闭策略（2026-10-04）：带关闭按钮的验证框会被自动关闭并重试；
+    // 只有自动关闭未生效（此处是无关闭控件的裸验证 iframe）才暂停留人工。
+    await frame.setContent('<input type=file>' +
+      '<iframe src="about:blank?action=captcha"></iframe><script>window.closeClicks=0;window.uploads=0;' +
       'document.querySelector("input").onchange=()=>window.uploads++;</script>');
     const run = new Function('page', 'frame', helpers + 'return finishLocalUploadBatch(frame, [], ["a.jpg"]);');
-    await assert.rejects(() => run(page, frame), /PAUSE:.*手动完成验证/);
-    assert.equal(await frame.evaluate(() => window.closeClicks), 0);
+    await assert.rejects(() => run(page, frame), /PAUSE:.*(手动完成验证|人工处理)/);
     assert.equal(await frame.evaluate(() => window.uploads), 0);
-    assert.equal(await frame.locator('.J_MIDDLEWARE_FRAME_WIDGET').count(), 1);
+    assert.equal(await frame.locator('iframe[src*="action=captcha"]').count(), 1);
   } finally {
     await browser.close();
   }

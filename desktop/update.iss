@@ -1,5 +1,7 @@
 #define MyAppName "千牛自动上架"
-#define MyAppVersion "1.2.0"
+#ifndef MyAppVersion
+#define MyAppVersion "1.3.0"
+#endif
 #define MyAppExeName "千牛自动上架.exe"
 #define MyAppIconFile "..\logo\40c40691-9747-453a-a1d1-f2c94d393f34.ico"
 
@@ -36,6 +38,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Source: "..\dist\千牛自动上架\千牛自动上架.exe"; DestDir: "{app}"; Flags: ignoreversion restartreplace
 Source: "..\dist\千牛自动上架\*.py"; DestDir: "{app}"; Flags: ignoreversion restartreplace
 Source: "..\dist\千牛自动上架\千牛字段映射.json"; DestDir: "{app}"; Flags: ignoreversion restartreplace
+Source: "..\dist\千牛自动上架\runtime-manifest.json"; DestDir: "{app}"; Flags: ignoreversion restartreplace
 Source: "..\dist\千牛自动上架\_internal\*"; DestDir: "{app}\_internal"; Flags: ignoreversion restartreplace recursesubdirs createallsubdirs
 Source: "..\dist\千牛自动上架\web\*"; DestDir: "{app}\web"; Flags: ignoreversion restartreplace recursesubdirs createallsubdirs
 Source: "..\dist\千牛自动上架\templates\*"; DestDir: "{app}\templates"; Flags: ignoreversion restartreplace recursesubdirs createallsubdirs

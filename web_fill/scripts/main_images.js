@@ -5,6 +5,22 @@ async page => {
   const files = PAYLOAD.files || [];
   const names = PAYLOAD.names || files.map((p) => String(p).split(/[\\/]/).pop());
   const field = PAYLOAD.field || "#sell-field-mainImagesGroup";
+  if (phase === "slot_count") {
+    // 只读复核：与 bind 阶段完全相同的口径重读主图位。页面异步插入缩略图
+    // 时 bind 阶段的读数可能偏少，这里给渲染留出额外的追赶窗口。
+    let slot = { imgs: 0, empty: -1 };
+    for (let i = 0; i < 24; i++) {
+      slot = await page.evaluate((sel) => {
+        const fieldEl = document.querySelector(sel);
+        const imgs = fieldEl ? [...fieldEl.querySelectorAll("img")].filter((el) => el.width > 40).length : 0;
+        const empty = fieldEl ? fieldEl.querySelectorAll(".image-empty").length : -1;
+        return { imgs, empty };
+      }, field);
+      if (slot.imgs >= names.length) break;
+      await sleep(500);
+    }
+    return JSON.stringify({ slot, names });
+  }
   // The same picker survives upload -> receipt -> binding. Escape closes it
   // asynchronously, leaving a soon-to-detach Frame in page.frames().
   await dismissKnow({ escape: false });
@@ -67,8 +83,13 @@ async page => {
   }
   await sleep(600);
   await page.mouse.click(80, 120);
+  // 缩略图是异步插入/加载的，width 从 0 到正常有延迟；数量仍在增长时必须
+  // 继续等，否则会把已写入的图误报成缺图（2026-10-02 客户机真实复现：
+  // 图片包 5 张页面读到 4 张，数秒后 probe 却读到 5 张）。
   let slot = { imgs: 0, empty: -1 };
-  for (let i = 0; i < 20; i++) {
+  let previous = -1;
+  let stale = 0;
+  for (let i = 0; i < 60; i++) {
     slot = await page.evaluate((sel) => {
       const fieldEl = document.querySelector(sel);
       const imgs = fieldEl ? [...fieldEl.querySelectorAll("img")].filter((el) => el.width > 40).length : 0;
@@ -76,6 +97,9 @@ async page => {
       return { imgs, empty };
     }, field);
     if (slot.imgs >= names.length) break;
+    stale = slot.imgs === previous ? stale + 1 : 0;
+    previous = slot.imgs;
+    if (stale >= 16) break; // 连续 8 秒数量无增长：判定为真实缺失，不再空等
     await sleep(500);
   }
   return JSON.stringify({ selected, slot }, null, 2);

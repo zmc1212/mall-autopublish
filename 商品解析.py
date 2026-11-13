@@ -216,6 +216,17 @@ def scan_image_pack(dir_path):
     classified = set()
     for path in files:
         stem = path.stem
+        # 规格名可能包含“3-4”或“3比4”（如颜色23-4弹），优先按明确的规格前缀分类。
+        match = SKU_NAME.match(stem)
+        if match:
+            skus.append({
+                "slot": match.group(1),
+                "name": match.group(2).strip(),
+                "image": path,
+                "_n": _sort_num(match.group(1)),
+            })
+            classified.add(path)
+            continue
         if PORTRAIT_NAME.search(stem):
             portraits.append((_sort_num(stem), path.name, path))
             classified.add(path)
@@ -235,15 +246,6 @@ def scan_image_pack(dir_path):
             details.append((int(match.group(1)), path.name, path))
             classified.add(path)
             continue
-        match = SKU_NAME.match(stem)
-        if match:
-            skus.append({
-                "slot": match.group(1),
-                "name": match.group(2).strip(),
-                "image": path,
-                "_n": _sort_num(match.group(1)),
-            })
-            classified.add(path)
     for path in files:
         if path in classified:
             continue
@@ -328,7 +330,13 @@ def resolve_product(row, sku_rows=None, pack=None, templates=None, base_dir=None
     main_images = pack_mains or [resolve_path(p, base_dir) for p in split_paths(row.get("主图路径*"))]
     portrait_images = pack_portraits or [resolve_path(p, base_dir) for p in split_paths(row.get("3:4主图路径"))]
     detail_images = pack_details or [resolve_path(p, base_dir) for p in split_paths(row.get("详情图路径"))]
-    spec_name = str(sales_tpl.get("spec_name") or "商品规格").strip() or "商品规格"
+    # 规格维度名由类目销售属性决定（潮玩盲盒的 p-1627207 叫“款式描述”），
+    # 类目属性模板声明了 spec_name 时优先于通用销售模板。
+    spec_name = str(
+        (attr_tpl.get("spec_name") if present(attr_tpl.get("spec_name")) else None)
+        or (sales_tpl.get("spec_name") if present(sales_tpl.get("spec_name")) else None)
+        or "商品规格"
+    ).strip() or "商品规格"
     default_price = first_present(row, "价格*") if present(first_present(row, "价格*")) else row.get("价格*")
     default_stock = first_present(row, "库存*") if present(first_present(row, "库存*")) else row.get("库存*")
     product_id = str(row.get("商品标识*") or "").strip()

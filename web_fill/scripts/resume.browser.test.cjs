@@ -3,7 +3,8 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const {chromium} = require('../../.work/node_modules/playwright-core');
-const load = name => new Function('return (' + fs.readFileSync(path.join(__dirname,name),'utf8').replace('/*PAYLOAD*/','{}').replace('/*HELPERS*/','') + ')')();
+const helpers = fs.readFileSync(path.join(__dirname, '_helpers.inc.js'), 'utf8');
+const load = name => new Function('return (' + fs.readFileSync(path.join(__dirname,name),'utf8').replace('/*PAYLOAD*/','{}').replace('/*HELPERS*/', () => helpers) + ')')();
 
 test('real Chromium: recover checkpoint after reload and recount remaining SKU images', async () => {
   const browser = await chromium.launch({headless:true, executablePath:process.env.CHROME_PATH || 'C:/Program Files/Google/Chrome/Application/chrome.exe'});

@@ -1,89 +1,31 @@
 import type { ReactNode } from "react";
-import { Cable, FileSpreadsheet, Play, Settings } from "lucide-react";
-
+import { Cable, FileSpreadsheet, Package, Settings2, LockKeyhole } from "lucide-react";
 import cn from "../utils/classnames";
-
 export const NAV_ITEMS = [
-  { id: "connect", label: "连接", icon: Cable },
-  { id: "workbook", label: "清单", icon: FileSpreadsheet },
-  { id: "run", label: "执行", icon: Play },
-  { id: "settings", label: "设置", icon: Settings },
+  { id: "connect", label: "连接店铺", icon: Cable },
+  { id: "workbook", label: "商品清单", icon: FileSpreadsheet },
+  { id: "run", label: "执行入库", icon: Package },
+  { id: "settings", label: "设置与工具", icon: Settings2 },
 ] as const;
-
 export type NavId = (typeof NAV_ITEMS)[number]["id"];
-
-interface SidebarProps {
-  current: NavId;
-  onChange: (id: NavId) => void;
-  className?: string;
-}
-
-export default function Sidebar({ current, onChange, className = "" }: SidebarProps) {
-  return (
-    <aside
-      className={cn(
-        "flex h-full w-56 shrink-0 flex-col bg-sidebar text-white",
-        className,
-      )}
-    >
-      <div className="border-b border-white/10 px-5 py-6">
-        <p className="text-xs tracking-widest text-sidebar-muted">SELLER TOOLS</p>
-        <h1 className="mt-1 text-lg font-semibold">千牛自动上架</h1>
-        <p className="mt-2 text-xs leading-5 text-sidebar-muted">
-          选择工作空间，校验后放入仓库。不会立刻上架。
-        </p>
-      </div>
-      <nav className="flex flex-1 flex-col gap-1 p-3" aria-label="功能分区">
-        {NAV_ITEMS.map((item) => {
-          const Icon = item.icon;
-          const active = current === item.id;
-          return (
-            <button
-              key={item.id}
-              type="button"
-              onClick={() => onChange(item.id)}
-              className={cn(
-                "flex min-h-11 items-center gap-3 rounded-lg px-3 text-sm transition-colors duration-150",
-                {
-                  "bg-white/10 text-white": active,
-                  "text-sidebar-muted hover:bg-white/5 hover:text-white": !active,
-                },
-              )}
-              aria-current={active ? "page" : undefined}
-            >
-              <Icon className="h-4 w-4" aria-hidden="true" />
-              {item.label}
-            </button>
-          );
-        })}
-      </nav>
-      <div className="shrink-0 px-5 pb-5" aria-label="千牛自动上架品牌标识">
-        <img
-          src="/app-logo.png"
-          alt="千牛自动上架 Logo"
-          className="mx-auto h-auto w-full max-w-46 drop-shadow-[0_10px_28px_rgba(34,211,238,0.25)]"
-        />
-      </div>
-    </aside>
-  );
-}
-
-export function PanelFrame({
-  title,
-  hint,
-  children,
-}: {
-  title: string;
-  hint?: string;
-  children: ReactNode;
+export default function Sidebar({ current, onChange, className = "" }: {
+  current: NavId; onChange: (id: NavId) => void; className?: string;
 }) {
-  return (
-    <section className="flex min-h-0 min-w-0 flex-1 flex-col gap-3 overflow-hidden">
-      <header className="shrink-0">
-        <h2 className="text-xl font-semibold">{title}</h2>
-        {hint ? <p className="mt-1 line-clamp-2 text-sm text-slate-500" title={hint}>{hint}</p> : null}
-      </header>
-      {children}
-    </section>
-  );
+  return <aside className={cn("app-sidebar flex h-full shrink-0 flex-col bg-sidebar", className)}>
+    <div className="app-brand">
+      <Package className="h-10 w-10 shrink-0 text-primary" strokeWidth={1.65} aria-hidden="true" />
+      <div><strong>千牛自动上架</strong><small><span>高效整理商品</span><span>轻松入库</span></small></div>
+    </div>
+    <nav className="app-nav flex-1" aria-label="功能分区">
+      {NAV_ITEMS.map(({ id, label, icon: Icon }) => <button key={id} type="button" onClick={() => onChange(id)} aria-label={label} title={label} aria-current={current === id ? "page" : undefined}>
+        <Icon className="h-5 w-5 shrink-0" strokeWidth={1.7} aria-hidden="true" /><span className="app-nav-label">{label}</span>
+      </button>)}
+    </nav>
+    <div className="sidebar-note flex items-center gap-2 px-5 pb-6 text-[11px] text-sidebar-muted">
+      <LockKeyhole className="h-4 w-4 shrink-0" aria-hidden="true" /><span><span className="whitespace-nowrap">仅放入仓库，</span><span className="whitespace-nowrap">不自动上架</span></span>
+    </div>
+  </aside>;
+}
+export function PanelFrame({ title, hint, actions, children }: { title: string; hint?: string; actions?: ReactNode; children: ReactNode }) {
+  return <section className="panel-frame"><header className={cn("panel-heading", Boolean(actions) && "flex flex-wrap items-center justify-between gap-4")}><div className="min-w-0"><h2>{title}</h2>{hint && <p>{hint}</p>}</div>{actions && <div className="max-w-full shrink-0">{actions}</div>}</header>{children}</section>;
 }

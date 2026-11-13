@@ -108,13 +108,17 @@ test('whole category script selects custom brand, fills model and reaches publis
     const page = await browser.newPage();
     await page.route('http://category.test/**', route => route.fulfill({contentType: 'text/html', body: '<meta charset="utf-8">中性笔'}));
     await page.goto('http://category.test/category.htm');
-    await page.setContent(`<button role="tab">中性笔</button><div class="next-select">
+    await page.setContent(`<button role="tab">中性笔</button>
+      <input role="combobox" placeholder="请输入" style="width:0;height:0;padding:0;border:0">
+      <div class="next-select">
       <input id="brand" role="combobox" placeholder="请输入" readonly></div>
       <input id="model" role="combobox" placeholder="请输入">
       <button id="next" disabled>确认，下一步</button>
       <div class="next-overlay-wrapper opened" hidden>
         <div class="options-search"><input></div><div class="options-content"></div>
       </div>`);
+    assert.equal(await page.getByRole('combobox', {name: /^请输入$/}).count(), 3);
+    assert.equal(await page.locator('input[role="combobox"][placeholder="请输入"]:visible').count(), 2);
     await page.evaluate(() => {
       const popup = document.querySelector('.next-overlay-wrapper');
       const brand = document.querySelector('#brand');

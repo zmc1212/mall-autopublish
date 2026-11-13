@@ -235,13 +235,24 @@ async page => {
     // for two detail positions. Commit the current ordered batch, reopen the
     // picker, and select that same card again so the duplicate is inserted at
     // the correct position instead of being reported as a stale selection.
+    // 去重判定同时覆盖名单里的同一 qn_ 标识和已勾选的同一素材 ID。
     const identity = pictureIdentityQuery(name);
-    const repeatedContent = /^qn_[a-f0-9]{24}$/i.test(identity)
-      && picked.some(item => pictureIdentityQuery(item.name) === identity);
-    if (one.alreadySelected && repeatedContent) {
+    const repeatedContent = (/^qn_[a-f0-9]{24}$/i.test(identity)
+        && picked.some(item => pictureIdentityQuery(item.name) === identity))
+      || (one.target && String(one.target).startsWith("material:")
+        && picked.some(item => item.target === one.target));
+    if (one.ok && one.alreadySelected && !repeatedContent) {
+      // 上传完成的迟到预选会把本批之外的卡片提前勾上（勾选先于本批，
+      // 直接提交会插到错误位置）。先就地取消预选再按当前位重新勾选，
+      // 使勾选顺序与详情顺序一致。
+      if (await releasePictureSpaceCards(frame, [one.target])) {
+        one = (await pickPictureSpaceCards(frame, [name]))[0] || one;
+      }
+    }
+    if (one.ok && one.alreadySelected) {
       await commitSelection(frame);
       frame = await openPictureSpace();
-      if (!frame) throw new Error("PAUSE:详情图重复素材窗口未能重新打开，已保留当前内容");
+      if (!frame) throw new Error("PAUSE:详情图素材窗口未能重新打开，已保留当前内容");
       await assertNoSecurityChallenge();
       await clearPictureSpaceSelection(frame);
       one = (await pickPictureSpaceCards(frame, [name]))[0] || { name, ok: false };

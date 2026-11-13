@@ -1,9 +1,38 @@
 async page => {
   const P = /*PAYLOAD*/;
+  // 本脚本不含 helpers 注入标记（render_script 不会内联 _helpers.inc.js），
+  // 前台化逻辑就地内联，语义与 helpers 的 ensureFront 一致：后台页签/隐藏
+  // 窗口里点击必超时。注意：注释里不能出现注入标记字面量，否则会被替换。
+  try {
+    if (await page.evaluate(() => document.visibilityState) !== "visible") {
+      await page.bringToFront().catch(() => {});
+      await page.waitForFunction(() => document.visibilityState === "visible", null,
+        { polling: 100, timeout: 3000 }).catch(() => {});
+    }
+  } catch (_) {}
   const pause = text => { throw new Error('PAUSE:' + text); };
   const drawerSelector = '.next-drawer[class*=material-batch]:visible';
   const drawer = () => page.locator(drawerSelector);
   const imageKey = value => String(value || '').split('?')[0].replace(/_(?:\d+x\d+).*$/, '');
+  const previewAttributePlaceholder = value => String(value || '').trim() === '-';
+
+  function knownPreviewAttributeDifference(source, row) {
+    if (!source || !row || !Object.prototype.hasOwnProperty.call(source, 'attributes_text')
+        || !Object.prototype.hasOwnProperty.call(row, 'attributes_text')) return null;
+    const baseline = String(source.attributes_text || '').trim();
+    const preview = String(row.attributes_text || '').trim();
+    if (!baseline || baseline === preview || !previewAttributePlaceholder(preview)) return null;
+    return {
+      field: 'attributes_text',
+      baseline: source.attributes_text,
+      preview: row.attributes_text,
+      reason: 'preview_placeholder',
+    };
+  }
+
+  const withoutPreviewEvidence = rows => (rows || []).map(row => Object.fromEntries(
+    Object.entries(row || {}).filter(([key]) => key !== 'preview_attribute_diff')
+  ));
 
   const imageBodies = new Map();
   const imageErrors = new Map();
@@ -167,7 +196,7 @@ async page => {
     return result;
   }
 
-  function compare(rows, originals, requireImage) {
+  function compare(rows, originals, requireImage, options = {}) {
     if (rows.length !== originals.length || !rows.length) pause('确认页 SKU 数量不符');
     const used = new Set();
     for (const row of rows) {
@@ -177,13 +206,26 @@ async page => {
       if (row.price !== old.price && Number(row.price) !== Number(old.price)) pause('价格变化');
       if (Number(row.stock) !== Number(old.stock) || row.search_title !== old.search_title) pause('库存或搜索标题变化');
       for (const key of ['attributes_text', 'merchant_code']) {
-        if (key in old && row[key] !== old[key]) pause('属性或商家编码变化或无法读取');
+        if (key in old && row[key] !== old[key]) {
+          if (key === 'attributes_text' && options.allowPreviewAttributes) {
+            const diff = knownPreviewAttributeDifference(old, row);
+            if (diff) {
+              // Keep both sides in the persisted preview payload.  This is
+              // evidence of a lossy preview, not proof that the server value
+              // changed; verify phase still compares strictly to baseline.
+              row.preview_attribute_diff = diff;
+              continue;
+            }
+          }
+          pause('属性或商家编码变化或无法读取');
+        }
       }
       if (requireImage && !row.image) pause('SKU 缺少搜索主图');
     }
   }
 
   await guard();
+  if (P.phase === 'guard') return JSON.stringify({guarded:true});
   if (P.phase === 'inspect') return JSON.stringify({baseline:await state(false), preview:await state(true)});
   if (P.phase === 'baseline') return JSON.stringify(await baseline());
   if (P.phase === 'upload') {
@@ -208,16 +250,41 @@ async page => {
     const result = await state(true);
     if (result.wrongItem) pause('素材确认商品 ID 不符');
     if (!result.ready && !result.drawerOpen) pause('没有待处理素材抽屉；上传结果不明确，停止自动重传');
+    if (result.ready && P.baseline) compare(result.rows, P.baseline, true, {allowPreviewAttributes:true});
     return JSON.stringify(result);
   }
   if (P.phase === 'adopt') {
     const result = await state(true);
     if (!result.ready || result.wrongItem) pause('缺少目标商品确认页');
-    compare(result.rows, P.baseline, true);
-    if (JSON.stringify(result.rows) !== JSON.stringify(P.preview)) pause('预览内容已变化');
+    compare(result.rows, P.baseline, true, {allowPreviewAttributes:true});
+    if (JSON.stringify(withoutPreviewEvidence(result.rows))
+        !== JSON.stringify(withoutPreviewEvidence(P.preview))) pause('预览内容已变化');
     await guard();
-    await drawer().getByRole('button', {name:'采纳', exact:true}).click({timeout:10000});
-    await drawer().waitFor({state:'hidden', timeout:20000});
+    const adopt = drawer().getByRole('button', {name:'采纳', exact:true});
+    if (await adopt.count() !== 1) {
+      // The page is still at the pre-adoption checkpoint.  It is safe to
+      // pause here because no click was attempted.
+      pause('采纳按钮不唯一或不可读，请核对确认页');
+    }
+    try {
+      await adopt.click({timeout:10000});
+    } catch (error) {
+      // A Playwright click timeout cannot prove that the platform did not
+      // accept the action.  Return an uncertain result so Python advances to
+      // server verification instead of retrying Adopt on resume.
+      return JSON.stringify({adopted:false, uncertain:true,
+        notice:'采纳结果待核实；已保留确认页，恢复时只刷新服务器核验',
+        error:String(error).slice(0, 4000)});
+    }
+    try {
+      await drawer().waitFor({state:'hidden', timeout:20000});
+    } catch (error) {
+      // The click has already been dispatched.  Never issue a second click;
+      // the next stage checks whether the server committed the image.
+      return JSON.stringify({adopted:true, uncertain:true,
+        notice:'采纳结果待核实；已保留当前页面，恢复时只刷新服务器核验',
+        error:String(error).slice(0, 4000)});
+    }
     return JSON.stringify({adopted:true});
   }
   if (P.phase === 'verify') {
@@ -225,6 +292,10 @@ async page => {
     // Reload to verify persisted server state, rather than optimistic UI only.
     await page.reload({waitUntil:'domcontentloaded', timeout:20000});
     await page.getByRole('button', {name:'素材批量导入', exact:true}).waitFor({timeout:20000});
+    // A verification tab is opened at the SKU list root.  Re-select the
+    // exact item after reload so virtualized rows from another product can
+    // never be mistaken for this item's server state.
+    if (P.fresh) await baseline();
     let result;
     for (let i=0; i<8; i++) {
       await guard();

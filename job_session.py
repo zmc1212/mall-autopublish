@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -16,6 +18,9 @@ ACTION_LINK_KEYS = ("taobao_item_id", "view_url", "edit_url")
 # 可能是别的商品；只信显式传入的 ID，不再从文本刮取。
 FAIL_EXECUTIONS = frozenset({"失败", "暂停", "提交失败", "已停止"})
 FLOW_KEYS = (
+    "execution_reset_id",
+    "resume_checkpoint",
+    "last_browser_write",
     "flow_version",
     "sku_image_strategy",
     "seller_account",
@@ -27,10 +32,21 @@ FLOW_KEYS = (
     "material_preview",
     "material_folder",
     "last_error",
+    "video_warning",
+    "video_status",
     "updated_at",
 )
 ALL_EXTENDED_KEYS = tuple(dict.fromkeys(ACTION_LINK_KEYS + FLOW_KEYS))
 HISTORY_LIMIT = 500
+
+# ``job_session.json`` is the single durable source of execution state.  A
+# worker must never perform a load/modify/save sequence outside this lock: the
+# atomic ``replace`` below prevents torn files, but it cannot prevent two
+# workers from overwriting each other's row updates.  RLock keeps the public
+# read/write helpers composable for the desktop process while the transaction
+# helper keeps the whole mutation under one lock acquisition.
+_SESSION_LOCK = threading.RLock()
+_NO_SAVE = object()
 
 
 def _clip(text, limit=240):
@@ -115,10 +131,13 @@ def apply_action_links(target, submitted=None, notice="", href="", execution="")
 
 
 def extend_flow_fields(target, source=None):
-    """把扩展流程字段复制进记录，且不覆盖目标里已有的非空值。"""
+    """保留已有流程值；恢复断点与告警以最新显式记录为准。"""
     data = dict(target or {})
     source = dict(source or {})
     for key in FLOW_KEYS:
+        if key in {"video_warning", "video_status", "resume_checkpoint", "last_browser_write"} and key in source:
+            data[key] = source.get(key) or ""
+            continue
         if data.get(key) not in (None, ""):
             continue
         if source.get(key) not in (None, ""):
@@ -186,7 +205,7 @@ def latest_result_session():
     return {}
 
 
-def load_session():
+def _load_session_unlocked():
     path = session_path()
     data = {}
     if path and path.is_file():
@@ -208,7 +227,18 @@ def load_session():
     return data
 
 
-def save_session(data):
+def load_session():
+    """Read a consistent session snapshot.
+
+    Mutations use ``_session_update`` below so that the read and write happen
+    in one transaction.  Keeping the lock here also gives readers a coherent
+    view when a worker is committing a checkpoint.
+    """
+    with _SESSION_LOCK:
+        return _load_session_unlocked()
+
+
+def _save_session_unlocked(data):
     path = session_path()
     if not path:
         return None
@@ -218,6 +248,39 @@ def save_session(data):
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
     tmp.replace(path)
     return path
+
+
+def save_session(data):
+    """Persist a complete session snapshot under the session lock."""
+    with _SESSION_LOCK:
+        return _save_session_unlocked(data)
+
+
+def _session_update(mutator):
+    """Run one load/modify/save transaction.
+
+    ``mutator`` receives the loaded dict and may mutate it in place.  Return
+    ``_NO_SAVE`` when the operation is a no-op or when no session exists.  A
+    normal ``None`` return commits and returns the written path; any other
+    return value is returned unchanged after the commit.
+    """
+    with _SESSION_LOCK:
+        data = _load_session_unlocked()
+        result = mutator(data)
+        if result is _NO_SAVE:
+            return None
+        path = _save_session_unlocked(data)
+        return path if result is None else result
+
+
+def update_session(mutator):
+    """Public transaction hook for the desktop manager.
+
+    The callback must mutate the supplied session dict in place.  Its return
+    value follows ``_session_update``; ordinary callbacks return ``None`` and
+    receive the committed path in return.
+    """
+    return _session_update(mutator)
 
 
 def _fingerprint_allows(old_fingerprint, current_fingerprint):
@@ -236,7 +299,7 @@ def _has_execution_state(row):
         return True
     if any(row.get(key) for key in ACTION_LINK_KEYS):
         return True
-    return bool(str(row.get("flow_stage") or "").strip())
+    return bool(str(row.get("flow_stage") or row.get("execution_reset_id") or "").strip())
 
 
 def _history_record(row):
@@ -251,7 +314,7 @@ def _history_record(row):
     for key in ACTION_LINK_KEYS:
         record[key] = row.get(key) or ""
     for key in FLOW_KEYS:
-        if row.get(key) not in (None, ""):
+        if row.get(key) not in (None, "") or (key == "video_warning" and key in row):
             record[key] = row.get(key)
     return record
 
@@ -283,52 +346,103 @@ def _sync_history_from_rows(data, row=None, product_id=""):
     return changed
 
 
-def forget_execution(row=None, product_id=""):
-    """清空某商品的执行状态并删除其历史归档（手动清除入口），
-    否则下次校验会被 merge_execution 按会话行或历史再次回贴。"""
-    data = load_session()
-    if not data:
-        return None
+def _reset_execution_record(item, reset_id):
+    item.update(execution="未执行", notice="", errors=[], duration_seconds=None)
+    for key in (*ACTION_LINK_KEYS, *FLOW_KEYS, "url", "resume_checkpoint", "legacy_checkpoint", "last_browser_write"):
+        item[key] = ""
+    item["execution_reset_id"] = reset_id
+
+
+def forget_execution(row=None, product_id="", reset_id=""):
+    """清空执行状态，保留本次手动清除的标记，防止恢复清除前的旧 ID。"""
     pid = str(product_id or "")
-    targets = set()
-    cleared_keys = ("taobao_item_id", "view_url", "edit_url", *FLOW_KEYS)
-    changed = False
-    for item in data.get("rows") or []:
-        if row is not None and item.get("row") != row:
-            continue
-        item_pid = str(item.get("product_id") or "")
-        if pid and item_pid and item_pid != pid:
-            continue
-        if item_pid:
-            targets.add(item_pid)
-        item["execution"] = "未执行"
-        item["notice"] = ""
-        item["errors"] = []
-        for key in cleared_keys:
-            item[key] = ""
-        changed = True
-    for bundle in data.get("products") or []:
-        meta = bundle.get("meta") or {}
-        if row is not None and meta.get("row") != row:
-            continue
-        item_pid = str(meta.get("product_id") or "")
-        if pid and item_pid and item_pid != pid:
-            continue
-        if item_pid:
-            targets.add(item_pid)
-        meta["execution"] = "未执行"
-        meta["notice"] = ""
-        for key in cleared_keys:
-            meta[key] = ""
-        bundle["meta"] = meta
-        changed = True
-    if not targets and not changed:
+    reset_id = reset_id or uuid.uuid4().hex
+
+    def mutate(data):
+        if not data:
+            return _NO_SAVE
+        targets = {}
+        changed = False
+        for item in data.get("rows") or []:
+            if row is not None and item.get("row") != row:
+                continue
+            item_pid = str(item.get("product_id") or "")
+            if pid and item_pid and item_pid != pid:
+                continue
+            _reset_execution_record(item, reset_id)
+            if item_pid:
+                targets[item_pid] = item
+            changed = True
+        for bundle in data.get("products") or []:
+            meta = bundle.get("meta") or {}
+            if row is not None and meta.get("row") != row:
+                continue
+            item_pid = str(meta.get("product_id") or "")
+            if pid and item_pid and item_pid != pid:
+                continue
+            _reset_execution_record(meta, reset_id)
+            _reset_execution_record(bundle.setdefault("product", {}), reset_id)
+            if item_pid:
+                targets.setdefault(item_pid, meta)
+            bundle["meta"] = meta
+            changed = True
+        if not targets and not changed:
+            return _NO_SAVE
+        history = dict(data.get("execution_history") or {})
+        for key, item in targets.items():
+            history[key] = _history_record(item)
+        data["execution_history"] = history
         return None
-    history = dict(data.get("execution_history") or {})
-    for key in targets:
-        history.pop(key, None)
-    data["execution_history"] = history
-    return save_session(data)
+
+    return _session_update(mutate)
+
+
+def forget_executions(rows=None, reset_ids=None):
+    """批量清空多行商品的执行状态并记录各行清除标记（一键清除入口）。
+
+    与 forget_execution 相同的重置语义，但在一次会话事务里完成，
+    避免逐行清除时的多次读盘写盘。rows 为 None 时清空全部行。
+    """
+    wanted = None if rows is None else {int(r) for r in rows}
+    reset_ids = dict(reset_ids or {})
+
+    def reset_id_for(row):
+        return reset_ids.setdefault(row, uuid.uuid4().hex)
+
+    def mutate(data):
+        if not data:
+            return _NO_SAVE
+        targets = {}
+        changed = False
+        for item in data.get("rows") or []:
+            if wanted is not None and item.get("row") not in wanted:
+                continue
+            item_pid = str(item.get("product_id") or "")
+            _reset_execution_record(item, reset_id_for(item.get("row")))
+            if item_pid:
+                targets[item_pid] = item
+            changed = True
+        for bundle in data.get("products") or []:
+            meta = bundle.get("meta") or {}
+            if wanted is not None and meta.get("row") not in wanted:
+                continue
+            item_pid = str(meta.get("product_id") or "")
+            reset_id = reset_id_for(meta.get("row"))
+            _reset_execution_record(meta, reset_id)
+            _reset_execution_record(bundle.setdefault("product", {}), reset_id)
+            if item_pid:
+                targets.setdefault(item_pid, meta)
+            bundle["meta"] = meta
+            changed = True
+        if not targets and not changed:
+            return _NO_SAVE
+        history = dict(data.get("execution_history") or {})
+        for key, item in targets.items():
+            history[key] = _history_record(item)
+        data["execution_history"] = history
+        return None
+
+    return _session_update(mutate)
 
 
 def merge_execution(results, workbook_path):
@@ -358,17 +472,21 @@ def merge_execution(results, workbook_path):
             continue
         if not _fingerprint_allows(old.get("pack_fingerprint"), item.get("pack_fingerprint")):
             continue
+        # execution 之外，已入库的商品 ID 或流程阶段同样是必须回贴的执行事实：
+        # 运行中断点里 execution 可能仍是“未执行”，但 ID/flow_stage 已经落盘。
+        if not _has_execution_state(old):
+            continue
         execution = old.get("execution") or "未执行"
         if execution and execution != "未执行":
             item["execution"] = execution
             item["notice"] = _clip(old.get("notice") or item.get("notice") or "")
-            for key in ACTION_LINK_KEYS:
-                if old.get(key):
-                    item[key] = old.get(key)
-            for key in FLOW_KEYS:
-                if old.get(key) not in (None, ""):
-                    item[key] = old[key]
-            item.update(apply_action_links(item))
+        for key in ACTION_LINK_KEYS:
+            if old.get(key):
+                item[key] = old.get(key)
+        for key in FLOW_KEYS:
+            if old.get(key) not in (None, "") or (key == "video_warning" and key in old):
+                item[key] = old[key]
+        item.update(apply_action_links(item))
     return results
 
 
@@ -404,101 +522,121 @@ def remember_workbook(workbook_path, results):
             mtime = Path(source).stat().st_mtime
     except OSError:
         mtime = None
-    existing = load_session()
-    existing.update({
-        "workbook_path": source,
-        "workbook_mtime": mtime,
-        "products": products,
-        "rows": rows,
-        "count": len(rows),
-    })
-    existing.setdefault("status", "idle")
-    history = dict(existing.get("execution_history") or {})
-    for row in rows:
-        row_pid = str(row.get("product_id") or "")
-        if not row_pid or not _has_execution_state(row):
-            continue
-        history[row_pid] = _history_record(row)
-    existing["execution_history"] = _prune_history(history)
-    return save_session(existing)
+    def mutate(existing):
+        existing.update({
+            "workbook_path": source,
+            "workbook_mtime": mtime,
+            "products": products,
+            "rows": rows,
+            "count": len(rows),
+        })
+        existing.setdefault("status", "idle")
+        history = dict(existing.get("execution_history") or {})
+        for row in rows:
+            row_pid = str(row.get("product_id") or "")
+            if not row_pid or not _has_execution_state(row):
+                continue
+            history[row_pid] = _history_record(row)
+        existing["execution_history"] = _prune_history(history)
+        return None
+
+    return _session_update(mutate)
 
 
 def patch_execution(row, product_id, execution, notice="", errors=None, status=None, phase=None, blocker=None, extra=None):
-    data = load_session()
-    if not data:
-        return None
     pid = str(product_id or "")
     extra = extra or {}
-    links = apply_action_links({"notice": notice, **extra}, execution=execution)
-    flow_patch = {key: extra.get(key) for key in FLOW_KEYS if extra.get(key) not in (None, "")}
-    if flow_patch.get("flow_stage") == "complete":
-        flow_patch.update(run_status="completed", last_error="")
-    for bundle in data.get("products") or []:
-        meta = bundle.get("meta") or {}
-        if meta.get("row") != row:
-            continue
-        if pid and str(meta.get("product_id") or "") not in {"", pid}:
-            continue
-        meta["execution"] = execution
-        meta["notice"] = notice
-        meta.update(flow_patch)
-        meta["updated_at"] = datetime.now().isoformat(timespec="seconds")
-        if errors is not None:
-            meta["errors"] = list(errors)
-        for key in ACTION_LINK_KEYS:
-            if links.get(key):
-                meta[key] = links[key]
-        bundle["meta"] = meta
-        product = bundle.get("product") or {}
-        product["execution"] = execution
-        bundle["product"] = product
-    for item in data.get("rows") or []:
-        if item.get("row") != row:
-            continue
-        item["execution"] = execution
-        item["notice"] = notice
-        item.update(flow_patch)
-        item["updated_at"] = datetime.now().isoformat(timespec="seconds")
-        for key in ACTION_LINK_KEYS:
-            if links.get(key):
-                item[key] = links[key]
-    _sync_history_from_rows(data, row=row, product_id=pid)
-    if status:
-        data["status"] = status
-    if phase is not None:
-        data["phase"] = phase
-    if blocker is not None:
-        data["blocker"] = blocker
-    return save_session(data)
+
+    def mutate(data):
+        if not data:
+            return _NO_SAVE
+        links = apply_action_links({"notice": notice, **extra}, execution=execution)
+        flow_patch = {key: extra.get(key) for key in FLOW_KEYS
+                      if extra.get(key) not in (None, "") or (key == "video_warning" and key in extra)}
+        if flow_patch.get("flow_stage") == "complete":
+            flow_patch.update(run_status="completed", last_error="")
+        for bundle in data.get("products") or []:
+            meta = bundle.get("meta") or {}
+            if meta.get("row") != row:
+                continue
+            if pid and str(meta.get("product_id") or "") not in {"", pid}:
+                continue
+            meta["execution"] = execution
+            meta["notice"] = notice
+            meta.update(flow_patch)
+            meta["updated_at"] = datetime.now().isoformat(timespec="seconds")
+            if errors is not None:
+                meta["errors"] = list(errors)
+            for key in ACTION_LINK_KEYS:
+                if links.get(key):
+                    meta[key] = links[key]
+            bundle["meta"] = meta
+            product = bundle.get("product") or {}
+            product["execution"] = execution
+            for key in ("video_warning", "video_status", "resume_checkpoint", "last_browser_write"):
+                if key in flow_patch:
+                    product[key] = flow_patch[key]
+            bundle["product"] = product
+        for item in data.get("rows") or []:
+            if item.get("row") != row:
+                continue
+            item["execution"] = execution
+            item["notice"] = notice
+            item.update(flow_patch)
+            item["updated_at"] = datetime.now().isoformat(timespec="seconds")
+            for key in ACTION_LINK_KEYS:
+                if links.get(key):
+                    item[key] = links[key]
+        _sync_history_from_rows(data, row=row, product_id=pid)
+        if status:
+            data["status"] = status
+        if phase is not None:
+            data["phase"] = phase
+        if blocker is not None:
+            data["blocker"] = blocker
+        return None
+
+    return _session_update(mutate)
 
 
 def patch_flow_state(row, product_id, fields=None):
-    """商品 ID 与最新阶段即时落盘；不改变 execution 展示字段。"""
-    data = load_session()
-    if not data:
-        return None
+    """商品 ID、执行状态与最新阶段即时落盘（建品成功瞬间即持久化）。
+
+    只接受显式传入的 ID/链接/execution，不从 notice/url 文本刮取；
+    终态 execution 仍由 patch_execution 权威写入。
+    """
     pid = str(product_id or "")
-    patch = {key: value for key, value in (fields or {}).items() if key in FLOW_KEYS}
+    allowed = FLOW_KEYS + ACTION_LINK_KEYS + ("execution",)
+    patch = {
+        key: value for key, value in (fields or {}).items()
+        if key in allowed and (value not in (None, "") or (key == "video_warning" and value == ""))
+    }
     links = apply_action_links(patch)
     patch.update({key: links[key] for key in ACTION_LINK_KEYS if links.get(key)})
     patch["updated_at"] = datetime.now().isoformat(timespec="seconds")
     if not patch:
         return None
-    for bundle in data.get("products") or []:
-        meta = bundle.get("meta") or {}
-        if meta.get("row") != row:
-            continue
-        if pid and str(meta.get("product_id") or "") not in {"", pid}:
-            continue
-        meta.update(patch)
-        bundle["meta"] = meta
-        bundle["product"] = extend_flow_fields(bundle.get("product") or {}, meta)
-    for item in data.get("rows") or []:
-        if item.get("row") != row:
-            continue
-        item.update(patch)
-    _sync_history_from_rows(data, row=row, product_id=pid)
-    return save_session(data)
+
+    def mutate(data):
+        if not data:
+            return _NO_SAVE
+        for bundle in data.get("products") or []:
+            meta = bundle.get("meta") or {}
+            if meta.get("row") != row:
+                continue
+            if pid and str(meta.get("product_id") or "") not in {"", pid}:
+                continue
+            meta.update(patch)
+            bundle["meta"] = meta
+            bundle["product"] = extend_flow_fields(bundle.get("product") or {}, meta)
+        for item in data.get("rows") or []:
+            if item.get("row") != row:
+                continue
+            item.update(patch)
+        _sync_history_from_rows(data, row=row, product_id=pid)
+        return None
+
+    return _session_update(mutate)
 
 
 _RESTORE_TRIED = False

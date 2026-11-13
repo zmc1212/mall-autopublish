@@ -73,10 +73,33 @@ class DesktopPathTests(unittest.TestCase):
         self.assertTrue(any(item.startswith("--remote-debugging-port=") for item in args))
         self.assertNotIn("https://myseller.taobao.com/", args)
         self.assertNotIn("--restore-last-session", args)
-        prefs = Path(web.PROFILE) / "Default" / "Preferences"
-        self.assertTrue(prefs.is_file())
-        data = __import__("json").loads(prefs.read_text(encoding="utf-8"))
-        self.assertEqual(data["session"]["restore_on_startup"], 1)
+
+        # Chromium protects session.restore_on_startup with Secure Preferences.
+        # The launcher may initialize the profile, but it must not rewrite either
+        # Preferences or Local State behind Chromium's back.
+        default = Path(web.PROFILE) / "Default"
+        default.mkdir(parents=True, exist_ok=True)
+        prefs = default / "Preferences"
+        local_state = Path(web.PROFILE) / "Local State"
+        prefs_before = {
+            "session": {"restore_on_startup": 5},
+            "profile": {"exit_type": "Crashed", "exited_cleanly": False},
+            "test_marker": "keep-preferences",
+        }
+        local_before = {
+            "profile": {"exit_type": "Crashed"},
+            "test_marker": "keep-local-state",
+        }
+        prefs.write_text(json.dumps(prefs_before), encoding="utf-8")
+        local_state.write_text(json.dumps(local_before), encoding="utf-8")
+        prefs_bytes = prefs.read_bytes()
+        local_state_bytes = local_state.read_bytes()
+        # A second launch-argument construction must preserve the same bytes too.
+        web.chrome_launch_args()
+        self.assertEqual(prefs.read_bytes(), prefs_bytes)
+        self.assertEqual(local_state.read_bytes(), local_state_bytes)
+        self.assertEqual(json.loads(prefs.read_text(encoding="utf-8")), prefs_before)
+        self.assertEqual(json.loads(local_state.read_text(encoding="utf-8")), local_before)
 
         cookies = Path(web.PROFILE) / "Default" / "Network"
         cookies.mkdir(parents=True, exist_ok=True)
@@ -273,7 +296,33 @@ class DesktopApiTests(unittest.TestCase):
         self.assertIn("debug_browser_applied", response.json())
         self.assertIsInstance(response.json()["debug_browser_applied"], bool)
 
-    def test_pending_products_skip_done_unless_force_new(self):
+    def test_status_reports_stale_code_and_blocks_job_start(self):
+        from fastapi.testclient import TestClient
+        from desktop import code_watch
+        from desktop.server import app
+
+        client = TestClient(app)
+        self.assertEqual(client.get("/api/status").json()["stale_code"]["files"], [])
+
+        # 模拟进程启动后磁盘代码被改动：启动快照整体 mtime 过期
+        stale_snapshot = {
+            key: (value[0] + 1, value[1]) for key, value in code_watch.STARTUP_SNAPSHOT.items()
+        }
+        with unittest.mock.patch.object(code_watch, "STARTUP_SNAPSHOT", stale_snapshot):
+            stale = client.get("/api/status").json()["stale_code"]["files"]
+            self.assertTrue(stale)
+            self.assertTrue(all(name.endswith(".py") for name in stale))
+            response = client.post("/api/job/start", json={})
+            self.assertEqual(response.status_code, 400, response.text)
+            self.assertIn("重新打开应用", response.json()["detail"])
+
+        # 快照与磁盘一致时不拦截：start_job 继续走正常流程（此处清单/待处理状态
+        # 取决于同进程前面用例留下的 MANAGER 状态），只要不再报代码失配即可
+        response = client.post("/api/job/start", json={})
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertNotIn("代码已更新", response.json()["detail"])
+
+    def test_continue_includes_filled_unsubmitted_and_failed_products(self):
         from desktop.jobs import JobManager
         manager = JobManager()
         manager.workbook_path = "x.xlsx"
@@ -287,13 +336,35 @@ class DesktopApiTests(unittest.TestCase):
             {"validation": "通过", "execution": "失败"},
             {"validation": "失败", "execution": "未执行"},
         ]
-        self.assertEqual([item["product_id"] for item in manager._pending_products(False)], ["B"])
+        self.assertEqual([item["product_id"] for item in manager._pending_products(False)], ["A", "B"])
         self.assertEqual([item["product_id"] for item in manager._pending_products(True)], ["A", "B"])
-        self.assertEqual([item["product_id"] for item in manager._pending_products(retry_failed=True)], ["B"])
+        self.assertEqual([item["product_id"] for item in manager._pending_products(retry_failed=True)], ["A", "B"])
         snap = manager.snapshot()
         self.assertTrue(snap["can_resume"])
-        self.assertEqual(snap["pending"], 1)
-        self.assertEqual(snap["retryable"], 1)
+        self.assertEqual(snap["pending"], 2)
+        self.assertEqual(snap["retryable"], 2)
+
+    def test_continue_carries_pause_checkpoint_and_selects_newly_valid_unexecuted_product(self):
+        from desktop.jobs import JobManager
+        manager = JobManager()
+        checkpoint = {'key': 'product', 'href': 'https://item.upload.taobao.com/sell/v2/publish.htm?catId=123',
+                      'submit_started': False}
+        metas = [
+            {'row': 5, 'product_id': 'LOGALOGA', 'validation': '通过', 'execution': '暂停',
+             'resume_checkpoint': checkpoint, 'last_browser_write': {'script': 'sku_import.js'}},
+            {'row': 8, 'product_id': '火影', 'validation': '通过', 'execution': '未执行'},
+            {'row': 9, 'product_id': '已入库', 'validation': '通过', 'execution': '已入库',
+             'taobao_item_id': '123456789', 'flow_stage': 'complete',
+             'flow_version': 'both-images-v2', 'sku_image_strategy': 'both'},
+        ]
+        manager.products = [{'meta': dict(meta), 'product': {'row': meta['row'], 'product_id': meta['product_id']}}
+                            for meta in metas]
+        manager.rows = [dict(meta) for meta in metas]
+        for retry in (False, True):
+            selected = manager._pending_products(retry_failed=retry)
+            self.assertEqual([row['row'] for row in selected], [5, 8])
+            self.assertEqual(selected[0]['resume_checkpoint'], checkpoint)
+            self.assertEqual(selected[0]['last_browser_write']['script'], 'sku_import.js')
 
     def test_existing_item_id_is_never_filtered_as_legacy_done(self):
         from desktop.jobs import JobManager
@@ -468,6 +539,20 @@ class DesktopApiTests(unittest.TestCase):
         self.assertEqual(row["video_name"], "")
         self.assertFalse(row["video_ok"])
 
+    def test_video_worker_progress_updates_only_its_product_and_serializes_status(self):
+        from desktop.jobs import JobManager, serialize_row
+        manager = JobManager()
+        manager.rows = [{'row': 2, 'product_id': 'A', 'video_status': 'failed', 'video_warning': '旧失败'},
+                        {'row': 3, 'product_id': 'B', 'video_status': 'uploaded'}]
+        manager.products = [{'meta': {'row': 2, 'product_id': 'A', 'video_status': 'failed'}, 'product': {}}]
+        manager._on_worker_event({'event': 'progress', 'worker_id': 1, 'row': 2, 'product_id': 'A',
+                                  'phase': 'video', 'video_status': 'bound', 'video_warning': ''})
+        self.assertEqual(manager.rows[0]['video_status'], 'bound')
+        self.assertEqual(manager.rows[0]['video_warning'], '')
+        self.assertEqual(manager.rows[1]['video_status'], 'uploaded')
+        self.assertEqual(manager.products[0]['meta']['video_status'], 'bound')
+        self.assertEqual(serialize_row(manager.rows[0])['video_status'], 'bound')
+
     def test_open_item_opens_view_url(self):
         from desktop.jobs import JobManager
         manager = JobManager()
@@ -484,9 +569,14 @@ class DesktopApiTests(unittest.TestCase):
                 opened.append(url)
                 return {"ok": True, "url": url, "via": "default-browser"}
 
+            def open_item_url_in_builtin_browser(self, url):
+                opened.append(url)
+                return {"ok": True, "url": url, "via": "builtin-browser"}
+
         with unittest.mock.patch("desktop.jobs.load_web", return_value=FakeWeb()):
             result = manager.open_item(2, "火影-001", "view")
         self.assertTrue(result["ok"])
+        self.assertEqual(result["via"], "builtin-browser")
         self.assertEqual(opened, ["https://item.taobao.com/item.htm?id=1086638256748"])
         with self.assertRaises(RuntimeError):
             manager.open_item(2, "火影-001", "share")
@@ -541,6 +631,13 @@ class DesktopApiTests(unittest.TestCase):
         self.assertEqual(meta["execution"], "未执行")
         self.assertEqual(meta["taobao_item_id"], "")
         self.assertEqual(meta["flow_stage"], "")
+        reset_id = row["execution_reset_id"]
+        self.assertTrue(reset_id)
+        self.assertEqual(meta["execution_reset_id"], reset_id)
+        self.assertEqual(MANAGER.products[0]["product"]["execution_reset_id"], reset_id)
+        self.assertEqual(MANAGER._pending_products()[0]["execution_reset_id"], reset_id)
+        import job_session
+        self.assertEqual(job_session.load_session()["rows"][0]["execution_reset_id"], reset_id)
 
     def test_clear_row_state_running_rejects(self):
         from desktop.jobs import MANAGER
@@ -579,6 +676,120 @@ class DesktopApiTests(unittest.TestCase):
         missing = client.post("/api/item/clear", json={"row": 99, "product_id": "不存在"})
         self.assertEqual(missing.status_code, 400, missing.text)
 
+    def test_clear_rows_state_batch_resets(self):
+        from desktop.jobs import MANAGER
+
+        MANAGER._restored = True
+        MANAGER.status = "idle"
+        MANAGER.rows = [
+            {
+                "row": 2,
+                "product_id": "晨光-001",
+                "validation": "通过",
+                "execution": "失败",
+                "taobao_item_id": "1087608952245",
+                "flow_stage": "created",
+                "last_error": "上传失败",
+                "errors": ["上传失败"],
+                "duration_seconds": 12.5,
+            },
+            {
+                "row": 3,
+                "product_id": "晨光-002",
+                "validation": "通过",
+                "execution": "已入库",
+                "taobao_item_id": "1087608952246",
+                "flow_stage": "complete",
+                "duration_seconds": 30.0,
+            },
+            {"row": 4, "product_id": "晨光-003", "validation": "通过", "execution": "未执行"},
+        ]
+        MANAGER.products = [
+            {
+                "product": {"product_id": "晨光-001", "validation": "通过"},
+                "meta": {"row": 2, "product_id": "晨光-001", "execution": "失败", "taobao_item_id": "1087608952245"},
+            },
+            {
+                "product": {"product_id": "晨光-002", "validation": "通过"},
+                "meta": {"row": 3, "product_id": "晨光-002", "execution": "已入库", "taobao_item_id": "1087608952246"},
+            },
+        ]
+        result = MANAGER.clear_rows_state([2, 3, 99])
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["cleared"], 2)
+        for index in (0, 1):
+            row = MANAGER.rows[index]
+            self.assertEqual(row["execution"], "未执行")
+            self.assertEqual(row["taobao_item_id"], "")
+            self.assertEqual(row["flow_stage"], "")
+            self.assertEqual(row["errors"], [])
+            self.assertIsNone(row["duration_seconds"])
+            meta = MANAGER.products[index]["meta"]
+            self.assertEqual(meta["execution"], "未执行")
+            self.assertEqual(meta["taobao_item_id"], "")
+            self.assertTrue(row["execution_reset_id"])
+            self.assertEqual(meta["execution_reset_id"], row["execution_reset_id"])
+            self.assertEqual(MANAGER.products[index]["product"]["execution_reset_id"], row["execution_reset_id"])
+        self.assertNotEqual(MANAGER.rows[0]["execution_reset_id"], MANAGER.rows[1]["execution_reset_id"])
+        # 行号 99 不存在被忽略；未执行行保持原样。
+        self.assertEqual(MANAGER.rows[2]["execution"], "未执行")
+
+    def test_clear_rows_state_rejects_empty_and_unknown(self):
+        from desktop.jobs import MANAGER
+
+        MANAGER._restored = True
+        MANAGER.status = "idle"
+        MANAGER.rows = [{"row": 2, "product_id": "晨光-001", "execution": "失败"}]
+        MANAGER.products = []
+        with self.assertRaises(RuntimeError):
+            MANAGER.clear_rows_state([])
+        with self.assertRaises(RuntimeError):
+            MANAGER.clear_rows_state([99])
+
+    def test_clear_rows_state_running_rejects(self):
+        from desktop.jobs import MANAGER
+
+        MANAGER._restored = True
+        MANAGER.status = "running"
+        MANAGER.rows = [{"row": 2, "product_id": "晨光-001", "execution": "失败"}]
+        MANAGER.products = []
+        try:
+            with self.assertRaises(RuntimeError):
+                MANAGER.clear_rows_state([2])
+        finally:
+            MANAGER.status = "idle"
+
+    def test_item_clear_batch_api(self):
+        from fastapi.testclient import TestClient
+        from desktop.server import app
+        from desktop.jobs import MANAGER
+
+        MANAGER._restored = True
+        MANAGER.status = "idle"
+        MANAGER.rows = [
+            {
+                "row": 3,
+                "product_id": "火影-002",
+                "validation": "通过",
+                "execution": "已填写未提交",
+                "taobao_item_id": "1084892550240",
+                "flow_stage": "filled",
+            },
+            {"row": 4, "product_id": "火影-003", "validation": "通过", "execution": "失败", "last_error": "超时"},
+        ]
+        MANAGER.products = []
+        client = TestClient(app)
+        response = client.post("/api/item/clear-batch", json={"rows": [3, 4]})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["cleared"], 2)
+        self.assertEqual(MANAGER.rows[0]["execution"], "未执行")
+        self.assertEqual(MANAGER.rows[0]["taobao_item_id"], "")
+        self.assertEqual(MANAGER.rows[1]["execution"], "未执行")
+        empty = client.post("/api/item/clear-batch", json={"rows": []})
+        self.assertEqual(empty.status_code, 422, empty.text)
+        missing = client.post("/api/item/clear-batch", json={"rows": [99]})
+        self.assertEqual(missing.status_code, 400, missing.text)
+
     def test_item_open_api(self):
         from fastapi.testclient import TestClient
         from desktop.server import app
@@ -590,6 +801,9 @@ class DesktopApiTests(unittest.TestCase):
         class FakeWeb:
             def open_item_url(self, url):
                 return {"ok": True, "url": url, "via": "default-browser"}
+
+            def open_item_url_in_builtin_browser(self, url):
+                return {"ok": True, "url": url, "via": "builtin-browser"}
 
         with unittest.mock.patch("desktop.jobs.load_web", return_value=FakeWeb()):
             client = TestClient(app)
@@ -627,8 +841,12 @@ class DesktopApiTests(unittest.TestCase):
         rescan = client.post("/api/workspace/rescan")
         self.assertEqual(rescan.status_code, 200, rescan.text)
         self.assertEqual(rescan.json()["count"], 2)
-        start = client.post("/api/job/start", json={"retry_failed": True})
-        self.assertEqual(start.status_code, 400)
+        with unittest.mock.patch.object(MANAGER, "_run_job"), \
+             unittest.mock.patch.object(MANAGER, "_hide_chrome_for_fill"):
+            start = client.post("/api/job/start", json={"retry_failed": True})
+        self.assertEqual(start.status_code, 200)
+        self.assertEqual(MANAGER.total, 2)
+        MANAGER.status = "idle"
 
     def test_open_chrome_hides_when_logged_in(self):
         from desktop.jobs import JobManager
@@ -688,6 +906,47 @@ class DesktopApiTests(unittest.TestCase):
         self.assertIn("已收起", status["notice"])
         self.assertNotIn("前台", status["notice"])
 
+    def test_reveal_chrome_uses_persistent_start_for_connected_browser(self):
+        from desktop.jobs import JobManager
+
+        chrome = Path(self.temp.name) / "chrome.exe"
+        chrome.write_bytes(b"mz")
+        started = []
+
+        class Settings:
+            chrome_path = str(chrome)
+            chrome_profile = self.temp.name
+            cdp_port = 9222
+            debug_browser = False
+
+        class FakeWeb:
+            def reload_paths(self):
+                pass
+
+            def cdp_available(self):
+                return True
+
+            def cdp_version(self):
+                return {"Browser": "Chrome/1"}
+
+            def login_status_from_tabs(self, tabs=None):
+                return {"logged_in": True, "blocker": "", "url": "https://myseller.taobao.com/home.htm"}
+
+            def start_persistent_chrome(self, focus=False, hide_if_logged_in=True):
+                started.append((focus, hide_if_logged_in))
+                return "focused"
+
+        manager = JobManager()
+        manager._restored = True
+        with unittest.mock.patch("desktop.jobs.paths.configure_environ", return_value=Settings), \
+             unittest.mock.patch("desktop.jobs.paths.load_settings", return_value=Settings), \
+             unittest.mock.patch("desktop.jobs.paths.browser_exe_path", return_value=chrome), \
+             unittest.mock.patch("desktop.jobs.load_web", return_value=FakeWeb()):
+            status = manager.reveal_chrome()
+        self.assertEqual(started, [(True, False)])
+        self.assertEqual(status["opened"], "focused")
+        self.assertEqual(status["cdp"], True)
+
     def test_resume_hides_browser_without_waiting_for_login_settle(self):
         from desktop.jobs import JobManager
         web = unittest.mock.Mock()
@@ -718,7 +977,7 @@ class DesktopApiTests(unittest.TestCase):
                          unittest.mock.patch.object(manager, "_hide_chrome_for_fill") as hide:
                         manager._finish_browser()
                     if status == "done" and execution == "已入库":
-                        web.prune_automation_tabs.assert_called_once()
+                        web.prune_automation_tabs.assert_not_called()
                         hide.assert_called_once()
                         web.reveal_automation_chrome.assert_not_called()
                         web.hide_automation_chrome.assert_not_called()
@@ -847,7 +1106,11 @@ class DesktopApiTests(unittest.TestCase):
 
         manager = self._auto_check_manager(FakeWeb())
         manager._run_login_check()
-        self.assertEqual(spawned, [], "CDP 已连接时不应重复启动浏览器")
+        self.assertEqual(
+            spawned,
+            [(False, True)],
+            "CDP 已连接时也应通过统一入口校验并缓存运行时启动偏好",
+        )
         self.assertTrue(manager._login_confirmed)
         status = manager.chrome_status()
         self.assertTrue(status["logged_in"])
@@ -1004,8 +1267,70 @@ class DesktopApiTests(unittest.TestCase):
                 manager._auto_check_state = state
                 self.assertEqual(manager.chrome_status()["checking"], expected)
 
+    def test_chrome_status_reuses_last_probe_while_batch_active(self):
+        """任务运行期单次 CDP 探测超时不闪断：复用最近一次成功探测结果。"""
+        state = {"cdp": True}
+
+        class FakeWeb:
+            def reload_paths(self):
+                pass
+
+            def cdp_available(self):
+                return state["cdp"]
+
+            def cdp_version(self):
+                return {"Browser": "Chrome/1"}
+
+            def login_status_from_tabs(self, tabs=None):
+                return {"logged_in": True, "blocker": "", "url": "https://myseller.taobao.com/home.htm"}
+
+        manager = self._auto_check_manager(FakeWeb())
+        manager.status = "running"
+        manager.batch_settings = {"chrome_path": "", "cdp_port": 9222}
+        manager._login_confirmed = True
+        first = manager.chrome_status()
+        self.assertTrue(first["cdp"])
+        self.assertTrue(first["logged_in"])
+        # Chrome 忙碌导致下一次探测失败：批处理上下文保留期间复用缓存
+        state["cdp"] = False
+        second = manager.chrome_status()
+        self.assertTrue(second["cdp"])
+        self.assertTrue(second["logged_in"])
+        # 缓存过期后如实上报，徽标不再假显示已连接
+        manager._last_good_probe_at -= manager._probe_stale_seconds + 1.0
+        third = manager.chrome_status()
+        self.assertFalse(third["cdp"])
+        self.assertFalse(third["logged_in"])
+
+    def test_chrome_status_probe_fallback_disabled_when_idle(self):
+        """空闲时探测失败必须如实上报：缓存兜底只服务运行中的批处理。"""
+        state = {"cdp": True}
+
+        class FakeWeb:
+            def reload_paths(self):
+                pass
+
+            def cdp_available(self):
+                return state["cdp"]
+
+            def cdp_version(self):
+                return {"Browser": "Chrome/1"}
+
+            def login_status_from_tabs(self, tabs=None):
+                return {"logged_in": True, "blocker": "", "url": "https://myseller.taobao.com/home.htm"}
+
+        manager = self._auto_check_manager(FakeWeb())
+        manager._login_confirmed = True
+        state["cdp"] = True
+        self.assertTrue(manager.chrome_status()["cdp"])
+        state["cdp"] = False
+        status = manager.chrome_status()
+        self.assertFalse(status["cdp"])
+        self.assertFalse(status["logged_in"])
+
     def test_begin_login_check_runs_once_per_process(self):
         state = {"cdp": True, "tabs": [{"id": "t1", "type": "page", "url": "https://myseller.taobao.com/home.htm"}]}
+        started = []
 
         class FakeWeb:
             def reload_paths(self):
@@ -1022,6 +1347,10 @@ class DesktopApiTests(unittest.TestCase):
 
             def login_status_from_tabs(self, tabs=None):
                 return {"logged_in": True, "blocker": "", "url": state["tabs"][0]["url"]}
+
+            def start_persistent_chrome(self, focus=False, hide_if_logged_in=True):
+                started.append((focus, hide_if_logged_in))
+                return "hidden"
 
             def is_login_url(self, url):
                 return "login" in str(url)
@@ -1040,6 +1369,7 @@ class DesktopApiTests(unittest.TestCase):
             time.sleep(0.02)
         self.assertEqual(manager._auto_check_state, "done")
         self.assertFalse(manager.begin_login_check(), "每进程只自动检测一次")
+        self.assertEqual(started, [(False, True)])
         self.assertTrue(manager._login_confirmed)
 
     def test_check_login_endpoint_triggers_manager_once(self):
@@ -1072,6 +1402,49 @@ class DesktopApiTests(unittest.TestCase):
         messages = [entry.get("message") or "" for entry in manager.logs]
         self.assertTrue(any("定位填写页" in msg for msg in messages))
         self.assertFalse(any("本条结束" in msg for msg in messages))
+
+    def test_worker_progress_events_log_step_lines(self):
+        from desktop.jobs import JobManager
+
+        manager = JobManager()
+        manager._restored = True
+        manager.concurrency = 1
+
+        def progress(steps):
+            manager._on_worker_event({
+                "event": "progress", "worker_id": 1, "row": 2,
+                "product_id": "中性笔-001", "phase": str(steps[-1].get("step")),
+                "steps": steps, "status": "running",
+            })
+
+        progress([{"step": "tab", "url": "https://item.upload.taobao.com/sell/v2/publish.htm"}])
+        progress([{"step": "spec_images", "progress": "18/37"}])
+        progress([{"step": "spec_images", "progress": "19/37"}])
+        messages = [entry.get("message") or "" for entry in manager.logs]
+        self.assertTrue(any("中性笔-001 · 定位填写页" in msg for msg in messages))
+        self.assertTrue(any("中性笔-001 · 规格图 18/37" in msg for msg in messages))
+        self.assertTrue(any("中性笔-001 · 规格图 19/37" in msg for msg in messages))
+
+        # 同一标签去重：重复事件不重复刷屏；end 交给 on_done 记录
+        before = len(manager.logs)
+        progress([{"step": "spec_images", "progress": "19/37"}])
+        progress([{"step": "end", "execution": "已入库，图片已核验", "notice": ""}])
+        self.assertEqual(len(manager.logs), before)
+
+    def test_worker_progress_logs_slot_prefix_when_concurrent(self):
+        from desktop.jobs import JobManager
+
+        manager = JobManager()
+        manager._restored = True
+        manager.concurrency = 2
+        manager._on_worker_event({
+            "event": "progress", "worker_id": 2, "row": 3,
+            "product_id": "潮玩盲盒-002", "phase": "spec_images",
+            "steps": [{"step": "spec_images", "progress": "1/2"}],
+            "status": "running",
+        })
+        messages = [entry.get("message") or "" for entry in manager.logs]
+        self.assertTrue(any("[槽 2] 潮玩盲盒-002 · 规格图 1/2" in msg for msg in messages))
 
 
 class StallWatchdogTests(unittest.TestCase):
@@ -1110,17 +1483,18 @@ class StallWatchdogTests(unittest.TestCase):
         manager = JobManager()
         manager.status = "running"
         manager.activity_at = time_module.time() - 10 ** 6
-        manager._reveal_chrome_for_attention = unittest.mock.Mock()
+        manager._apply_chrome_pref_for_fill = unittest.mock.Mock()
         with unittest.mock.patch("desktop.jobs.paths.load_settings",
                                  return_value=unittest.mock.Mock(debug_browser=True)):
             manager._check_stalled()
         self.assertTrue(manager.stalled)
         self.assertIn("无任何进展", manager.blocker)
         self.assertTrue(any("无任何进展" in (entry.get("message") or "") for entry in manager.logs))
-        manager._reveal_chrome_for_attention.assert_called_once()
+        manager._apply_chrome_pref_for_fill.assert_called_once()
         self.assertTrue(any("已显示自动化浏览器" in (entry.get("message") or "") for entry in manager.logs))
 
-    def test_watchdog_stalled_keeps_browser_hidden_by_preference(self):
+    def test_watchdog_stalled_keeps_browser_hidden_when_preference_off(self):
+        """停滞时窗口可见性跟随「显示自动化浏览器」开关：未勾选保持隐藏，日志提示查看方式。"""
         import time as time_module
 
         from desktop.jobs import JobManager
@@ -1128,13 +1502,36 @@ class StallWatchdogTests(unittest.TestCase):
         manager = JobManager()
         manager.status = "running"
         manager.activity_at = time_module.time() - 10 ** 6
-        manager._reveal_chrome_for_attention = unittest.mock.Mock()
+        web = unittest.mock.Mock()
         with unittest.mock.patch("desktop.jobs.paths.load_settings",
-                                 return_value=unittest.mock.Mock(debug_browser=False)):
+                                 return_value=unittest.mock.Mock(debug_browser=False)), \
+             unittest.mock.patch("desktop.jobs.load_web", return_value=web):
             manager._check_stalled()
         self.assertTrue(manager.stalled)
-        manager._reveal_chrome_for_attention.assert_not_called()
-        self.assertTrue(any("浏览器保持隐藏" in (entry.get("message") or "") for entry in manager.logs))
+        web.hide_automation_chrome.assert_called_once()
+        web.reveal_automation_chrome.assert_not_called()
+        self.assertTrue(any("勾选「显示自动化浏览器」可查看现场" in (entry.get("message") or "")
+                            for entry in manager.logs))
+
+    def test_fill_window_visibility_follows_debug_browser_toggle(self):
+        """入库/填单运行期间的窗口显隐跟随开关：勾选显示，未勾选隐藏（屏幕外保渲染）。"""
+        from desktop.jobs import JobManager
+
+        for debug_browser, expect_reveal in ((True, True), (False, False)):
+            with self.subTest(debug_browser=debug_browser):
+                manager = JobManager()
+                web = unittest.mock.Mock()
+                with unittest.mock.patch("desktop.jobs.paths.load_settings",
+                                         return_value=unittest.mock.Mock(debug_browser=debug_browser)), \
+                     unittest.mock.patch("desktop.jobs.load_web", return_value=web):
+                    manager._apply_chrome_pref_for_fill()
+                self.assertFalse(manager._hide_chrome_after_login)
+                if expect_reveal:
+                    web.reveal_automation_chrome.assert_called_once()
+                    web.hide_automation_chrome.assert_not_called()
+                else:
+                    web.hide_automation_chrome.assert_called_once()
+                    web.reveal_automation_chrome.assert_not_called()
 
     def test_watchdog_ignores_non_running_task(self):
         import time as time_module

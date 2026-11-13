@@ -9,6 +9,7 @@ async page => {
   const searchKey = name.match(/^qn_[a-f0-9]{24}(?=[_.])/i)?.[0] || name.replace(/\.[^.]+$/, '');
   const phase = PAYLOAD.phase || 'open';
   if (!Number.isInteger(index) || index < 0 || !image) throw new Error('规格行或图片路径无效');
+  // 仅绑定自定义规格图列；<n>-skuPicture 是搜索主图，销售属性图片走批量选择器。
   const cell = page.locator(`td[id="${index}-custom_-1"]`).first();
 
   // 虚拟滚动表格只渲染视口附近的行；目标行不在 DOM 时逐屏滚动使其渲染，
@@ -16,8 +17,7 @@ async page => {
   async function bringRowIntoView(idx) {
     await page.evaluate(async (rowIndex) => {
       const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-      const cellId = `${rowIndex}-custom_-1`;
-      const exists = () => !!document.querySelector(`td[id="${cellId}"]`);
+      const exists = () => !!document.querySelector(`td[id="${rowIndex}-custom_-1"]`);
       if (exists()) return;
       let cont = null;
       for (const td of [...document.querySelectorAll('td[id$="-custom_-1"]')]) {
@@ -46,8 +46,12 @@ async page => {
   if (!(await cell.count())) await bringRowIntoView(index);
   if (!(await cell.count())) throw new Error(`未找到第 ${index + 1} 个商品规格图片单元格`);
 
-  const filled = async () => !!(await cell.locator('.image-item').count());
-  const imageSrc = async () => await cell.locator('img.image-item').first().getAttribute('src') || '';
+  // 仅检查当前自定义规格图片单元格。
+  const filled = async () => !!(await cell.locator('img.image-item, img[src]').count());
+  const imageSrc = async () => {
+    const img = cell.locator('img.image-item, img[src]').first();
+    return await img.count() ? await img.getAttribute('src') || '' : '';
+  };
   const popup = page.locator('.sell-component-image-v2-media-popup:visible');
   if (phase === 'cell') {
     // 只读核验：异常后的“结果不明确”判定用它确认单元格是否已实际写入。
@@ -60,7 +64,11 @@ async page => {
   }
   await assertNoSecurityChallenge();
   if (phase === 'open') {
-    if (await popup.count()) throw new Error('单图素材窗仍然打开，无法确认当前规格行');
+    if (await popup.count() && await popup.getAttribute('data-qianniu-spec-row') !== String(index)) {
+      throw new Error('单图素材窗仍然打开，无法确认当前规格行');
+    }
+  }
+  if (phase === 'open' && !(await popup.count())) {
     const icon = cell.locator('.main-content').first();
     await icon.scrollIntoViewIfNeeded();
     const trigger = icon.locator('[aria-haspopup="true"]').first();
@@ -85,6 +93,7 @@ async page => {
       await (await empty.count() ? empty : clickTarget).evaluate(el => el.click());
     }
   }
+  const readyDeadline = Date.now() + Math.max(1000, Math.min(45000, Number(PAYLOAD.pickerReadyTimeoutMs) || 45000));
   try {
     await popup.waitFor({ state: 'visible', timeout: 15000 });
   } catch (error) {
@@ -92,21 +101,37 @@ async page => {
       text: el.innerText, id: el.id}));
     throw new Error(`第 ${index + 1} 行规格图素材窗未打开：` + JSON.stringify(diagnostic));
   }
-  const iframe = popup.locator('iframe').first();
-  await iframe.waitFor({ state: 'attached', timeout: 15000 });
+  const owner = await popup.getAttribute('data-qianniu-spec-row');
+  if (owner !== null && owner !== String(index)) throw new Error('单图素材窗不属于当前规格行，已停止');
+  await popup.evaluate((el, {row}) => { el.dataset.qianniuSpecRow = String(row); }, {row: index});
   let frame = null;
-  for (let attempt = 0; attempt < 30 && !frame; attempt++) {
-    const handle = await iframe.elementHandle();
-    try { frame = handle ? await handle.contentFrame() : null; }
-    finally { if (handle) await handle.dispose(); }
-    if (!frame) await sleep(300);
+  let diagnostic = {};
+  while (Date.now() < readyDeadline) {
+    await assertNoSecurityChallenge();
+    // iframe 会先挂 about:blank，或在初始化时被替换。每轮从当前素材窗重新取，
+    // 不持有旧 Frame，也不刷新/关闭可能已有上传回执的窗口。
+    const iframes = popup.locator('iframe:visible');
+    for (let i = 0; i < await iframes.count(); i++) {
+      const handle = await iframes.nth(i).elementHandle();
+      let candidate = null;
+      try { candidate = handle ? await handle.contentFrame() : null; }
+      finally { if (handle) await handle.dispose(); }
+      if (!candidate) continue;
+      diagnostic = await candidate.evaluate(() => {
+        const visible = el => !!el && !!el.getBoundingClientRect().width && !!el.getBoundingClientRect().height
+          && getComputedStyle(el).visibility !== 'hidden';
+        const search = [...document.querySelectorAll('input[placeholder*="搜索"]')].some(visible);
+        const controls = [...document.querySelectorAll('button[class*="Footer_selectOk"], [class*="PicList_PicturesShow"], input[type=file]')];
+        return {url: location.href, ready: search && controls.length > 0, search,
+          buttons: [...document.querySelectorAll('button, [role=button]')].map(el => (el.innerText || '').trim()).slice(0, 12),
+          text: (document.body?.innerText || '').slice(0, 300)};
+      }).catch(error => ({error: String(error.message || error).slice(0, 180)}));
+      if (diagnostic.ready) { frame = candidate; break; }
+    }
+    if (frame) break;
+    await sleep(300);
   }
-  if (!frame) throw new Error('单图素材库 iframe 未加载');
-  await frame.locator('button').filter({ hasText: '本地上传' }).first()
-    .waitFor({ state: 'attached', timeout: 15000 });
-  await frame.locator('input[placeholder*="搜索"]').first()
-    .waitFor({ state: 'attached', timeout: 15000 });
-  await sleep(500);
+  if (!frame) throw new Error('SPEC_PICKER_NOT_READY:单图素材库未就绪，尚未触发本轮上传：' + JSON.stringify(diagnostic));
   if (phase === 'open') return JSON.stringify({ index, ready: true });
 
   async function selectAndConfirm(allowSearch) {

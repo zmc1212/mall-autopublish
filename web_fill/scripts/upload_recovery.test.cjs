@@ -2,7 +2,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
-const source = fs.readFileSync(__dirname + '/_helpers.inc.js', 'utf8');
+const source = fs.readFileSync(__dirname + '/_helpers.inc.js', 'utf8').replace(/^await ensureFront\(\);\s*$/m, '');
 
 function harness(extra = {}) {
   const context = vm.createContext({page: {}, ...extra});
@@ -103,26 +103,27 @@ test('upload status returns promptly when the server requires verification', asy
 });
 
 test('security challenge pauses instead of waiting forever', async () => {
-  const c = harness({page: {frames: () => [], evaluate: async () => '操作过于频繁 请滑动验证码'}});
+  const c = harness({page: {frames: () => [], evaluate: async () => '操作过于频繁 请滑动验证码', waitForTimeout: async () => {}}});
   c.closeSecurityChallenge = async () => false;
-  await assert.rejects(() => c.assertNoSecurityChallenge(), /PAUSE:.*手动完成验证/);
+  await assert.rejects(() => c.assertNoSecurityChallenge(), /PAUSE:.*(手动完成验证|人工处理)/);
 });
 
-test('security challenge is preserved for manual verification', async () => {
+test('security challenge is auto-dismissed through its close control', async () => {
   let clicks = 0;
-  let open = true;
-  const close = {getBoundingClientRect: () => ({width: 20, height: 20}), click() {
-    clicks++;
-    open = false;
-  }};
-  const widget = {getBoundingClientRect: () => ({width: open ? 900 : 0, height: open ? 510 : 0}),
-    querySelector: () => ({}), querySelectorAll: () => [close]};
+  let hidden = false;
+  const close = {getBoundingClientRect: () => ({width: 20, height: 20}),
+    getAttribute: () => null, innerText: '关闭',
+    click() { clicks++; hidden = true; }};
+  const widget = {getBoundingClientRect: () => ({width: hidden ? 0 : 900, height: hidden ? 0 : 510}),
+    querySelector: () => ({}), querySelectorAll: () => [close], closest: () => null,
+    style: {setProperty: () => {hidden = true;}}};
   const document = {querySelectorAll: () => [widget]};
   const c = harness({document, getComputedStyle: () => ({display: 'block', visibility: 'visible', opacity: '1'}),
     page: {frames: () => [], evaluate: async fn => fn(), waitForTimeout: async () => {}}});
-  await assert.rejects(() => c.assertNoSecurityChallenge(), /PAUSE:.*手动完成验证/);
-  assert.equal(clicks, 0);
-  assert.equal(open, true);
+  // 自动关闭策略（2026-10-04）：关闭控件生效后复核通过，不再暂停。
+  await c.assertNoSecurityChallenge();
+  assert.equal(clicks, 1);
+  assert.equal(hidden, true);
 });
 
 test('existing rate limit stops before any new file is dispatched', async () => {
@@ -422,7 +423,7 @@ test('popup gone with residual state falls back to library search', async () => 
 });
 
 test('repeated SKU names bind to their own rows', () => {
-  const specSource = fs.readFileSync(__dirname + '/spec_images.js', 'utf8');
+  const specSource = fs.readFileSync(__dirname + '/spec_images.js', 'utf8').replace(/\r\n/g, '\n');
   const start = specSource.indexOf('const skuClick = await page.evaluate((want) => {');
   const callbackStart = start + 'const skuClick = await page.evaluate('.length;
   const callbackEnd = specSource.indexOf('\n    }, {\n      ...spec,', callbackStart);
@@ -501,20 +502,28 @@ test('uninitialized uploader reloads once and sets the whole batch', async () =>
 
 test('material cards are clicked once so more than four images remain selected', async () => {
   const cards = Array.from({length: 7}, (_, i) => {
-    const card = {innerText: `详情0${i + 1}.jpg`, className: '', clicks: 0};
-    const icon = {click() {card.clicks++; card.className = card.className ? '' : 'active'}};
-    card.querySelector = () => icon;
-    card.click = () => icon.click();
+    const card = {innerText: `详情0${i + 1}.jpg`, className: '', clicks: 0,
+      getAttribute: () => null, contains: () => false};
+    const box = {checked: false, disabled: false, getAttribute: () => null,
+      click() {box.checked = !box.checked; card.clicks++;}};
+    card.querySelectorAll = () => [box];
+    card.querySelector = selector => {
+      if (selector === "input[type='checkbox']") return box;
+      if (selector === 'img') return {getAttribute: name => name === 'src' ? '' : null};
+      return null;
+    };
+    card.box = box;
     return card;
   });
   const document = {querySelectorAll: () => cards};
-  const c = harness({document});
+  const c = harness({document, getComputedStyle: () => ({display: 'block', visibility: 'visible'}),
+    window: {setTimeout}});
   const frame = {evaluate: async (fn, names) => fn(names)};
   for (const card of cards) {
     const picked = await c.pickPictureSpaceCards(frame, [card.innerText]);
-    assert.equal(picked[0].ok, true);
+    assert.equal(picked[0].ok, true, card.innerText);
   }
-  assert.equal(cards.filter(card => card.className === 'active').length, 7);
+  assert.equal(cards.filter(card => card.box.checked).length, 7);
   assert.ok(cards.every(card => card.clicks === 1));
 });
 

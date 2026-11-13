@@ -84,6 +84,7 @@ async page => {
 
   async function ensureSpecDrawer() {
     if (await page.locator(".sku-decouple-drawer").count()) return "already";
+    if (await page.locator('#sell-field-saleProp .sell-color-option-image-upload').count()) return 'sale-property';
     const opened = await page.evaluate(() => {
       const button = [...document.querySelectorAll("button")].find((el) => {
         const text = (el.innerText || "").trim();
@@ -112,7 +113,7 @@ async page => {
       if (frame) return { clicked: "REUSE_PICKER", frame };
     }
     const clicked = await page.evaluate(() => {
-      const drawer = document.querySelector(".sku-decouple-drawer");
+      const drawer = document.querySelector(".sku-decouple-drawer") || document.querySelector('#sell-field-saleProp');
       if (!drawer) return "NO_DRAWER";
       const box = drawer.querySelector(".sell-color-option-image-empty")
         || drawer.querySelector(".sell-color-option-image-upload");
@@ -122,12 +123,12 @@ async page => {
     });
     if (clicked === "NO_SPEC_IMAGE") throw new Error("规格图未找到商品规格图片控件");
     if (clicked === "READY_SPEC_IMAGE") {
-      const empty = page.locator(".sku-decouple-drawer .sell-color-option-image-empty");
+      const empty = page.locator(".sku-decouple-drawer .sell-color-option-image-empty, #sell-field-saleProp .sell-color-option-image-empty");
       const target = (await empty.count())
         ? empty.first()
-        : page.locator(".sku-decouple-drawer .sell-color-option-image-upload").first();
+        : page.locator(".sku-decouple-drawer .sell-color-option-image-upload, #sell-field-saleProp .sell-color-option-image-upload").first();
       await target.scrollIntoViewIfNeeded().catch(() => {});
-      await target.click({ force: true, timeout: 8000 });
+      await target.evaluate(el => el.click());
     }
     await sleep(1400);
     const frame = sucaiFrame() || await waitFrame(sucaiFrame, 18);
@@ -174,6 +175,7 @@ async page => {
         found: true,
         hasImage: images.length + backgrounds.length > 0,
         imageCount: images.length + backgrounds.length,
+        src: images[0]?.getAttribute('src') || '',
         name: (item.innerText || "").replace(/\s+/g, " ").trim().slice(0, 70),
         html: String(item.outerHTML || "").replace(/\s+/g, " ").slice(0, 600),
       };
@@ -181,6 +183,8 @@ async page => {
   }
 
   async function drawerImageState() {
+    const sales = await readSalesSpecImages(specs);
+    if (sales) return {open: true, filled: sales.filled, wrongTarget: false, target: sales.target};
     return page.evaluate(() => {
       const drawer = document.querySelector(".sku-decouple-drawer");
       if (!drawer) return { open: false, filled: 0, wrongTarget: false };
@@ -250,14 +254,18 @@ async page => {
   }
 
   async function persistedImageState() {
+    const sales = await readSalesSpecImages(specs);
+    if (sales) return {expected: specs.length, rowCount: sales.total, filled: sales.filled,
+      missing: sales.missing.map(index => index - 1), rows: sales.sources, target: sales.target};
     return page.evaluate((expected) => {
       const rows = [...document.querySelectorAll("table tr")].filter((tr) => {
         const text = tr.innerText || "";
         return text.includes("元") && text.includes("件") && !text.includes("SKU分类");
       });
       const details = rows.map((tr, index) => {
+        // 仅统计自定义规格列；销售属性图片已由 readSalesSpecImages 处理。
         const cell = tr.querySelector('td[id$="-custom_-1"]');
-        const images = [...(cell ? cell.querySelectorAll("img.image-item") : [])].filter((img) =>
+        const images = [...(cell ? cell.querySelectorAll("img.image-item, img[src]") : [])].filter((img) =>
           (img.width || img.naturalWidth || 0) > 16 && (img.height || img.naturalHeight || 0) > 16
         );
         const backgrounds = [...(cell ? cell.querySelectorAll(".image-item") : [])].filter((el) => {
@@ -286,6 +294,9 @@ async page => {
   async function selectSpec(spec, frame) {
     await assertNoSecurityChallenge();
     const index = specs.indexOf(spec);
+    const sales = await readSalesSpecImages(specs);
+    const targetName = sales ? sales.sources[index]?.value : spec.name;
+    if (sales && !targetName) throw new Error('无法按销售属性值定位规格图：' + spec.name);
     const skuClick = await page.evaluate((want) => {
       const dialog = document.querySelector(".batch-fill-sku-image-dialog");
       if (!dialog) return "NO_DIALOG";
@@ -298,6 +309,7 @@ async page => {
         return text === want.name || (want.slot && text.includes(want.slot)) || (want.name && text.includes(want.name));
       });
       const indexed = items[want.index];
+      if (want.saleProperty && matches.length !== 1) return 'AMBIGUOUS_SPEC:' + matches.length;
       const item = (indexed && matches.includes(indexed) ? indexed : null)
         || matches[want.occurrence] || indexed || matches[0];
       if (!item) return "NO_SPEC:" + items.length;
@@ -305,10 +317,13 @@ async page => {
       return "OK:" + items.indexOf(item) + ":" + ((item.innerText || "").replace(/\s+/g, " ").trim().slice(0, 60));
     }, {
       ...spec,
+      name: targetName,
+      saleProperty: !!sales,
       index,
       occurrence: specs.slice(0, index).filter((item) => item.name === spec.name).length,
     });
     await sleep(260);
+    if (!skuClick.startsWith('OK:')) throw new Error('规格图目标未确认：' + skuClick);
     if (!frame) return { skuClick, picClick: { ok: false, error: "NO_FRAME" } };
     // Newly uploaded cards are usually all in the current material list.
     // Avoid a remote search for every SKU: repeated searches can leave the
@@ -327,17 +342,35 @@ async page => {
     }
     await sleep(350);
     await confirmCrop();
-    let row = await specRowImageState(index);
+    const rowIndex = Number(skuClick.split(':')[1]);
+    let row = await specRowImageState(rowIndex);
     for (let i = 0; i < 6 && row.found && !row.hasImage; i++) {
       await sleep(300);
-      row = await specRowImageState(index);
+      row = await specRowImageState(rowIndex);
     }
     let innerClick = null;
     if (picClick.ok && row.found && !row.hasImage) {
+      if (picClick.alreadySelected) {
+        // Different SKU rows can intentionally share one content-addressed
+        // image. A checkbox retained from the previous row does not dispatch
+        // another assignment. Release it only after the target was read empty,
+        // then select it once for this row; ordinary pickers stay idempotent.
+        const released = await clickSucaiCard(frame, spec.file || spec.slot || spec.name, true, false, true);
+        if (!released.released) throw new Error('规格图保留选中状态未清除，未重复绑定');
+        await sleep(260);
+      }
       innerClick = await clickSucaiCard(frame, spec.file || spec.slot || spec.name);
+      await confirmCrop();
       for (let i = 0; i < 6 && !row.hasImage; i++) {
         await sleep(300);
-        row = await specRowImageState(index);
+        row = await specRowImageState(rowIndex);
+      }
+    }
+    if (sales && picClick.ok && row.hasImage) {
+      const imageKey = src => String(src || '').replace(/^https?:/i, '').split(/[?#]/)[0]
+        .replace(/(\.(?:jpg|jpeg|png|webp))_.*$/i, '$1');
+      if (!row.src || imageKey(row.src) !== imageKey(picClick.src)) {
+        throw new Error('规格图片地址与所选素材不一致：' + targetName);
       }
     }
     return { skuClick, searched, picClick, innerClick, row };

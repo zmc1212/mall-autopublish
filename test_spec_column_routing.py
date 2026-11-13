@@ -1,5 +1,7 @@
 """The listing pipeline must populate 商品规格, not SKU搜索主图."""
 import unittest
+import tempfile
+from pathlib import Path
 from unittest.mock import patch
 
 from web_fill import pipeline as p, material_import as m
@@ -143,6 +145,15 @@ class SpecColumnRoutingTests(unittest.TestCase):
                                               self.product['taobao_item_id'], True)
         submit.assert_not_called()
 
+    def test_edit_url_does_not_count_as_a_successful_save(self):
+        session = FakeSession()
+        session._href = 'https://item.upload.taobao.com/sell/v2/publish.htm?itemId=1085482487262'
+        execution, notice, links = p._submit_outcome(session, {
+            'itemId': '1085482487262', 'hasSuccess': False, 'hasFail': False})
+        self.assertEqual(execution, '提交待核实')
+        self.assertEqual(links['taobao_item_id'], '1085482487262')
+        self.assertIn('停止重复提交', notice)
+
     def test_uncertain_previous_spec_save_resumes_from_server_state(self):
         """submit_pending 死锁出口：编辑页重开后的服务器读数证明该批未写入
         时，清除标记并按缺失行继续补传，不再永久停在“已入库，待补图”。"""
@@ -219,11 +230,102 @@ class SpecBatchUploadTests(unittest.TestCase):
             captured["payloadFiles"] = upload_payload.get("files")
             return {"bind": {"saved": True}}
 
-        with patch.object(p, '_image_step', side_effect=fake_image_step):
+        with patch.object(p, '_image_step', side_effect=fake_image_step), \
+             patch.object(p, 'run_script', return_value={"v2Cells": 0, "legacyCells": 3,
+                                                         "drawer": True, "editSpecBtn": True}):
             p.spec_images_gate(FakeSession(), {"skus": skus}, [], only_rows=[1])
         self.assertEqual(captured["files"], ["b.jpg"])
         self.assertEqual(captured["onlyRows"], [1])
         self.assertEqual(captured["payloadFiles"], ["b.jpg"])
+
+    def test_spec_gate_routes_v2_pages_to_row_binding(self):
+        """新版 v2 页面（潮玩盲盒等类目）没有编辑规格抽屉，小 SKU 集也走逐行绑定。"""
+        skus = [{"name": "甲", "image": "a.jpg"}, {"name": "乙", "image": "b.jpg"}]
+        captured = {}
+
+        def fake_row_step(session, upload_payload, on_bind_progress=None, only_indexes=None, **kwargs):
+            captured["only_indexes"] = only_indexes
+            return {"bind": {"saved": True}}
+
+        for probe in ({"v2Cells": 2, "legacyCells": 0, "drawer": False, "editSpecBtn": False},
+                      {"v2Cells": 0, "legacyCells": 0, "drawer": False, "editSpecBtn": False}):
+            with patch.object(p, '_spec_row_image_step', side_effect=fake_row_step), \
+                 patch.object(p, 'run_script', return_value=probe):
+                p.spec_images_gate(FakeSession(), {"skus": skus}, [], only_rows=[1])
+            self.assertEqual(captured["only_indexes"], [1])
+
+    def test_spec_gate_keeps_drawer_batch_when_edit_spec_button_exists(self):
+        """老版页面（有编辑规格抽屉）保持批量绑定路径。"""
+        skus = [{"name": "甲", "image": "a.jpg"}, {"name": "乙", "image": "b.jpg"}]
+        with patch.object(p, '_image_step', return_value={"bind": {"saved": True}}) as image_step, \
+             patch.object(p, 'run_script', return_value={"v2Cells": 0, "legacyCells": 2,
+                                                         "drawer": False, "editSpecBtn": True}):
+            p.spec_images_gate(FakeSession(), {"skus": skus}, [], only_rows=[1])
+        self.assertEqual(image_step.call_args.args[1], "spec_images.js")
+
+    def test_sales_property_photos_use_batch_picker_even_for_large_sku_sets(self):
+        skus = [{"name": str(i), "image": "a.png"} for i in range(20)]
+        with patch.object(p, '_image_step', return_value={"bind": {"saved": True}}) as batch, \
+             patch.object(p, '_spec_row_image_step') as row, \
+             patch.object(p, 'run_script', return_value={"salePropImages": 20, "searchMainCells": 20}):
+            p.spec_images_gate(FakeSession(), {"skus": skus}, [], only_rows=[1])
+        row.assert_not_called()
+        self.assertEqual(batch.call_args.args[1], 'spec_images.js')
+
+    def test_video_warning_survives_image_completion_notice(self):
+        item = {"steps": [{"step": "video", "warning": "主视频未上传：索引未确认"}], "notice": "入库成功"}
+        p._surface_video_warning(item)
+        item.update(notice="规格图已保存", steps=[])
+        p._surface_video_warning(item)
+        self.assertIn("主视频未上传", item["notice"])
+        self.assertIn("规格图已保存", item["notice"])
+
+    def test_confirmed_video_retry_clears_old_warning(self):
+        warning = "主视频未上传：索引未确认"
+        item = {"video_warning": warning, "notice": warning + "；规格图已保存",
+                "steps": [{"step": "video", "warning": warning},
+                          {"step": "video", "uploaded": True}]}
+        p._surface_video_warning(item)
+        self.assertEqual(item["video_warning"], "")
+        self.assertEqual(item["notice"], "规格图已保存")
+
+    def test_skipped_video_does_not_clear_unverified_warning(self):
+        item = {"video_warning": "主视频未上传：索引未确认", "notice": "规格图已保存",
+                "steps": [{"step": "video", "skipped": True}]}
+        p._surface_video_warning(item)
+        self.assertIn("主视频未上传", item["notice"])
+
+    def test_video_state_does_not_claim_uploaded_before_product_save(self):
+        item = {'steps': [{'step': 'video', 'uploaded': True}], 'execution': '已填写未提交'}
+        p._surface_video_warning(item)
+        self.assertEqual(item['video_status'], 'bound')
+        item.update(taobao_item_id='123456789', execution='已入库，待补图')
+        p._surface_video_warning(item)
+        self.assertEqual(item['video_status'], 'uploaded')
+        item.update(steps=[])
+        p._surface_video_warning(item)
+        self.assertEqual(item['video_status'], 'uploaded')
+
+    def test_video_result_distinguishes_failed_upload_from_uncertain_dispatch(self):
+        self.assertEqual(p._video_result_status({'warning': '未找到上传入口'}), 'failed')
+        self.assertEqual(p._video_result_status({'dispatched': True, 'warning': '选择列表未确认'}), 'uncertain')
+        self.assertEqual(p._video_result_status({'warning': '主视频文件无法播放'}), 'invalid')
+
+    def test_sales_photo_uploads_use_content_identity_for_same_named_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            files = []
+            for index, content in enumerate([b'one', b'two']):
+                path = Path(directory) / str(index) / '颜色01.png'
+                path.parent.mkdir(); path.write_bytes(content); files.append(str(path))
+            skus = [{"name": str(i), "image": path} for i, path in enumerate(files)]
+            with patch.object(p, '_image_step', return_value={"bind": {"saved": True}}) as batch, \
+                 patch.object(p, 'run_script', return_value={"salePropImages": 2}):
+                p.spec_images_gate(FakeSession(), {"skus": skus}, [])
+            request = batch.call_args.args[2]
+            staged = batch.call_args.args[3]
+            self.assertNotEqual(Path(staged[0]).name, Path(staged[1]).name)
+            self.assertTrue(all(Path(path).name.startswith('qn_') for path in staged))
+            self.assertEqual([sku['file'] for sku in request['skus']], [Path(path).name for path in staged])
 
     def test_spec_gate_scopes_large_sku_sets_by_row_indexes(self):
         skus = [{"name": f"规格{i}", "image": f"{i}.jpg"} for i in range(13)]
@@ -300,6 +402,48 @@ class SpecBatchUploadTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, '待核实'):
                 p._repair_existing_spec_images(FakeSession(), self.web, product,
                                                self.item_id, True, spec_batch_size=1)
+
+    def test_uncertain_save_accepts_only_fresh_server_images_without_resubmitting(self):
+        product = {"title": "测试", "skus": [{"name": "甲", "image": "a.jpg"},
+                                                {"name": "乙", "image": "b.jpg"}]}
+        sources = {1: 'new.jpg', 2: 'previous.jpg'}
+        with patch.object(p, '_recover_existing_item', return_value=[]) as recover, \
+             patch.object(m, 'check_rows'), patch.object(p, 'run_script', return_value={}), \
+             patch.object(p, '_spec_column_state', side_effect=[
+                 ({2: 'previous.jpg'}, [1]), (sources, []), (sources, []),
+                 (sources, []), (sources, [])]), \
+             patch.object(p, 'spec_images_gate') as bind, \
+             patch.object(p, '_finish_publish', return_value={
+                 'taobao_item_id': self.item_id, 'execution': '提交待核实'}) as submit, \
+             patch.object(p, '_prune_tabs'), patch.object(p, '_write_progress'):
+            result = p._repair_existing_spec_images(FakeSession(), self.web, product,
+                                                    self.item_id, True, spec_batch_size=1)
+        self.assertEqual(result['execution'], '已入库，图片已核验')
+        self.assertEqual(bind.call_count, 1)
+        self.assertEqual(submit.call_count, 1)
+        self.assertTrue(recover.call_args_list[1].kwargs['preserve_edit_tabs'])
+        self.assertTrue(any(step.get('verifiedBy') == 'server-spec-sources' for step in result['steps']))
+
+    def test_uncertain_save_with_missing_or_changed_server_images_never_repeats(self):
+        product = {"title": "测试", "skus": [{"name": "甲", "image": "a.jpg"},
+                                                {"name": "乙", "image": "b.jpg"}]}
+        for persisted in ({2: 'previous.jpg'}, {1: 'wrong.jpg', 2: 'previous.jpg'},
+                          {1: 'new.jpg', 2: 'changed.jpg'}):
+            with self.subTest(persisted=persisted), \
+                 patch.object(p, '_recover_existing_item', return_value=[]), \
+                 patch.object(m, 'check_rows'), patch.object(p, 'run_script', return_value={}), \
+                 patch.object(p, '_spec_column_state', side_effect=[
+                     ({2: 'previous.jpg'}, [1]), ({1: 'new.jpg', 2: 'previous.jpg'}, []),
+                     (persisted, [1] if 1 not in persisted else [])]), \
+                 patch.object(p, 'spec_images_gate') as bind, \
+                 patch.object(p, '_finish_publish', return_value={
+                     'taobao_item_id': self.item_id, 'execution': '提交待核实'}) as submit, \
+                 patch.object(p, '_write_progress'), \
+                 self.assertRaisesRegex(RuntimeError, '服务器未确认本批图片'):
+                p._repair_existing_spec_images(FakeSession(), self.web, product,
+                                               self.item_id, True, spec_batch_size=1)
+            self.assertEqual(bind.call_count, 1)
+            self.assertEqual(submit.call_count, 1)
 
     def test_new_item_defers_spec_images_to_batches_after_creation(self):
         product = {"title": "测试", "skus": [{"name": "黑色", "image": "sku.jpg"}]}

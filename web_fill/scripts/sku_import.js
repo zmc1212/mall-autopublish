@@ -23,57 +23,75 @@ async page => {
   // SKU 表格是虚拟滚动（ver-scroll-wrap，DOM 只渲染可视区约 17 行），
   // 逐屏滚动累加全部行后再还原滚动位置。虚拟窗口的重渲染是异步的且滞后
   // 于滚动（隐藏窗口下更慢），每步必须等渲染追上再采集，否则 union 残缺。
+  // 并发下其他 worker 的脚本会把本页签切到后台：后台页签渲染帧暂停、真实
+  // scroll 事件不派发，虚拟列表不重渲染，整轮扫描只能采到起始一屏。因此
+  // 每步检测 visibilityState，发现后台就带着已采行数提前返回，由 Node 层
+  // ensureFront 夺回前台后整轮重扫（2026-10-04 规格图审计同类事故）。
   async function deepRows() {
-    return await page.evaluate(async () => {
-      const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-      const qualify = (tr) => {
-        const text = tr.innerText || "";
-        return text.includes("元") && text.includes("件") && !text.includes("SKU分类");
-      };
-      const readRow = (tr) => ({
-        text: (tr.innerText || "").replace(/\s+/g, " ").trim().slice(0, 160),
-        values: [...tr.querySelectorAll("input, textarea")].map((el) => String(el.value || "").trim()),
-      });
-      const allRows = () => [...document.querySelectorAll("table tr")].filter(qualify);
-      let cont = null;
-      for (const tr of allRows()) {
-        let el = tr.parentElement;
-        while (el && el !== document.body) {
-          const st = getComputedStyle(el);
-          if (/(auto|scroll)/.test(st.overflowY) && el.scrollHeight > el.clientHeight + 50) { cont = el; break; }
-          el = el.parentElement;
-        }
-        if (cont) break;
-      }
-      if (!cont) return allRows().map(readRow);
-      const seen = new Map();
-      const collect = () => {
+    let last = [];
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const scanned = await page.evaluate(async () => {
+        const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+        const qualify = (tr) => {
+          const text = tr.innerText || "";
+          return text.includes("元") && text.includes("件") && !text.includes("SKU分类");
+        };
+        const readRow = (tr) => ({
+          text: (tr.innerText || "").replace(/\s+/g, " ").trim().slice(0, 160),
+          values: [...tr.querySelectorAll("input, textarea")].map((el) => String(el.value || "").trim()),
+        });
+        const allRows = () => [...document.querySelectorAll("table tr")].filter(qualify);
+        let cont = null;
         for (const tr of allRows()) {
-          const row = readRow(tr);
-          // 渲染滞后的瞬间可能采到输入框还没挂值的半渲染行，跳过避免幽灵行。
-          if (!row.values.some((v) => v)) continue;
-          seen.set(JSON.stringify(row.values) + "|" + row.text, row);
+          let el = tr.parentElement;
+          while (el && el !== document.body) {
+            const st = getComputedStyle(el);
+            if (/(auto|scroll)/.test(st.overflowY) && el.scrollHeight > el.clientHeight + 50) { cont = el; break; }
+            el = el.parentElement;
+          }
+          if (cont) break;
         }
-      };
-      const startTop = cont.scrollTop;
-      cont.scrollTop = 0;
-      await pause(400);
-      collect();
-      const step = Math.max(200, Math.floor(cont.clientHeight * 0.7));
-      let guard = 0;
-      while (guard++ < 80) {
-        const before = cont.scrollTop;
-        cont.scrollTop = Math.min(before + step, cont.scrollHeight);
+        if (!cont) return { hidden: document.visibilityState !== "visible", rows: allRows().map(readRow) };
+        const seen = new Map();
+        const collect = () => {
+          for (const tr of allRows()) {
+            const row = readRow(tr);
+            // 渲染滞后的瞬间可能采到输入框还没挂值的半渲染行，跳过避免幽灵行。
+            if (!row.values.some((v) => v)) continue;
+            seen.set(JSON.stringify(row.values) + "|" + row.text, row);
+          }
+        };
+        const startTop = cont.scrollTop;
+        const bail = () => {
+          cont.scrollTop = startTop;
+          return { hidden: true, rows: [...seen.values()] };
+        };
+        cont.scrollTop = 0;
         await pause(400);
+        if (document.visibilityState !== "visible") { collect(); return bail(); }
         collect();
-        if (cont.scrollTop >= cont.scrollHeight - cont.clientHeight - 2) break;
-        if (cont.scrollTop === before) break;
-      }
-      cont.scrollTop = startTop;
-      await pause(300);
-      collect();
-      return [...seen.values()];
-    });
+        const step = Math.max(200, Math.floor(cont.clientHeight * 0.7));
+        let guard = 0;
+        while (guard++ < 80) {
+          const before = cont.scrollTop;
+          cont.scrollTop = Math.min(before + step, cont.scrollHeight);
+          await pause(400);
+          if (document.visibilityState !== "visible") { collect(); return bail(); }
+          collect();
+          if (cont.scrollTop >= cont.scrollHeight - cont.clientHeight - 2) break;
+          if (cont.scrollTop === before) break;
+        }
+        cont.scrollTop = startTop;
+        await pause(300);
+        collect();
+        return { hidden: false, rows: [...seen.values()] };
+      });
+      last = scanned.rows || [];
+      if (!scanned.hidden) return last;
+      await ensureFront();
+      await sleep(400);
+    }
+    return last;
   }
 
   function matching(rows) {
@@ -209,6 +227,8 @@ async page => {
       recognize = page.getByText("确认识别", { exact: true }).last();
     }
     if (!recognitionClicked && await recognize.count() && await recognize.isVisible() && await recognize.isEnabled()) {
+      // 长循环中途页签可能被并发 worker 抢到后台，点击前重新确保前台。
+      await ensureFront();
       try {
         await recognize.click({ timeout: 5000 });
       } catch (error) {
@@ -226,21 +246,27 @@ async page => {
       const text = marker < 0 ? "" : bodyText.slice(marker);
       if (text) {
         const normalized = text.replace(/\s+/g, "");
-        const isSpec = normalized.includes("商品规格");
+        // 规格维度名按类目取（中性笔=商品规格，潮玩盲盒=款式描述）。
+        const specName = String(PAYLOAD.spec_name || "商品规格");
+        const isSpec = normalized.includes(specName);
         const counts = [...normalized.matchAll(/已选择(\d+)个属性/g)].map((match) => Number(match[1]));
-        if (!isSpec || !counts.includes(expected.length)) {
+        // 多维度类目（潮玩盲盒=款式描述+大小）的识别属性值总数不等于规格
+        // 行数，识别文本包含全部规格名时同样视为一致；行数由最终核对兜底。
+        const allNamed = expected.every((name) => normalized.includes(name));
+        if (!isSpec || !(counts.includes(expected.length) || allNamed)) {
           return JSON.stringify({ verified: false,
             error: `识别结果与模板不一致，未自动添加：${text.replace(/\s+/g, " ").slice(0, 300)}`,
             count: rows.length, matched: matched.length, expected: expected.length, recognitionClicked });
         }
-        if (!addedDimensions.has("商品规格")) {
+        if (!addedDimensions.has(specName)) {
+          await ensureFront();
           try {
             await addCurrent.click({ timeout: 5000 });
           } catch (error) {
             await sleep(500);
             continue;
           }
-          addedDimensions.add("商品规格");
+          addedDimensions.add(specName);
           importConfirmed = true;
           stableDeep = 0;
           lastDeep = null;
@@ -261,6 +287,7 @@ async page => {
       if (typeof dialog.getByRole === "function") {
         const confirm = dialog.getByRole("button", { name: /^(确认导入|开始导入|确定导入|应用到商品|确认使用)$/ }).first();
         if (!importConfirmed && await confirm.count() && await confirm.isEnabled()) {
+          await ensureFront();
           try {
             await confirm.click({ timeout: 5000 });
             importConfirmed = true;

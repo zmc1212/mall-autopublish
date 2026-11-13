@@ -204,5 +204,211 @@ class KeygenHistoryTests(unittest.TestCase):
         self.assertEqual(kg.filter_history(records, ""), records)
 
 
+class LicenseServerTests(unittest.TestCase):
+    """联网激活与 14 天租约：服务端签名响应、吊销、换机与离线宽限。"""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        os.environ["QIANNIU_APPDATA"] = str(Path(self.temp.name))
+        self.addCleanup(os.environ.pop, "QIANNIU_APPDATA", None)
+        importlib.reload(lic)
+        self.addCleanup(importlib.reload, lic)
+
+        self.seed = os.urandom(32)
+        public_b64 = base64.b64encode(lic.ed25519_public_key(self.seed)).decode()
+        patcher = unittest.mock.patch.object(lic, "PUBLIC_KEY_B64", public_b64)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        self.server_seed = os.urandom(32)
+        server_public = base64.b64encode(lic.ed25519_public_key(self.server_seed)).decode()
+        patcher = unittest.mock.patch.object(lic, "LICENSE_SERVER_PUBLIC_KEY_B64", server_public)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = unittest.mock.patch.object(lic, "server_url", return_value="https://license.test")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        # 心跳线程在单测里不启动，单独调用 _heartbeat_once 验证。
+        patcher = unittest.mock.patch.object(lic, "_ensure_heartbeat", lambda *a, **k: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        self.device = lic.device_id()
+        self.mode = "online"
+        self.status = "active"
+        self.reject_message = ""
+        patcher = unittest.mock.patch.object(lic, "_post", side_effect=self._post)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _code(self, exp: int = 0, memo: str = "测试") -> str:
+        return lic.build_code(
+            {"v": 1, "fp": lic._fingerprint(lic.machine_code()), "exp": exp, "memo": memo}, self.seed
+        )
+
+    def _envelope(self, payload: dict) -> dict:
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        signature = lic.ed25519_sign(self.server_seed, body)
+        return {
+            "body": base64.b64encode(body).decode("ascii"),
+            "sig": base64.b64encode(signature).decode("ascii"),
+        }
+
+    def _lease(self, *, device: str | None = None, not_after: int | None = None) -> dict:
+        return self._envelope({
+            "v": 1,
+            "status": "active",
+            "device_id": device or self.device,
+            "machine_code": lic.machine_code(),
+            "exp": 0,
+            "not_after": int(time.time()) + 14 * 86400 if not_after is None else not_after,
+            "lease_days": 14,
+            "server_time": int(time.time()),
+            "nonce": "",
+        })
+
+    def _post(self, path, payload, timeout=None):
+        if self.mode == "offline":
+            raise lic.LicenseServerUnreachable("offline")
+        if self.mode == "reject":
+            raise lic.LicenseError(self.reject_message)
+        now = int(time.time())
+        if path == "/v1/activate":
+            return self._envelope({
+                "v": 1,
+                "status": self.status,
+                "code_hash": "x" * 64,
+                "device_id": payload["device_id"],
+                "machine_code": payload.get("machine_code", ""),
+                "exp": payload.get("exp", 0),
+                "not_after": now + 14 * 86400 if self.status == "active" else 0,
+                "lease_days": 14,
+                "server_time": now,
+                "nonce": "",
+            })
+        if path == "/v1/heartbeat":
+            return self._envelope({
+                "v": 1,
+                "status": self.status,
+                "code_hash": "x" * 64,
+                "device_id": payload["device_id"],
+                "machine_code": lic.machine_code(),
+                "exp": 0,
+                "not_after": now + 14 * 86400 if self.status == "active" else 0,
+                "lease_days": 14,
+                "server_time": now,
+                "nonce": payload.get("nonce", ""),
+            })
+        raise AssertionError("unexpected path " + path)
+
+    def _write_license(self, data: dict) -> None:
+        path = lic.license_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _read_license(self) -> dict:
+        return json.loads(lic.license_path().read_text(encoding="utf-8"))
+
+    def test_activation_requires_network(self):
+        self.mode = "offline"
+        with self.assertRaises(lic.LicenseError) as caught:
+            lic.activate(self._code())
+        self.assertIn("联网", str(caught.exception))
+        self.assertFalse(lic.license_path().exists())
+
+    def test_activation_saves_signed_lease_and_survives_restart(self):
+        state = lic.activate(self._code())
+        self.assertTrue(state["activated"])
+        self.assertGreater(state["offline_until"], time.time())
+        data = self._read_license()
+        self.assertIn("lease", data)
+        self.assertEqual(data["device"], self.device)
+        # 模拟重新打开软件：断网也能在宽限期内继续使用
+        self.mode = "offline"
+        lic._reset_cache()
+        self.assertTrue(lic.is_activated())
+
+    def test_tampered_lease_is_not_trusted(self):
+        lic.activate(self._code())
+        data = self._read_license()
+        data["lease"]["sig"] = base64.b64encode(os.urandom(64)).decode()
+        self._write_license(data)
+        self.mode = "offline"
+        lic._reset_cache()
+        self.assertFalse(lic.is_activated())
+        self.assertIn("联网", lic.state()["issue"])
+
+    def test_expired_lease_blocks_offline_but_renews_online(self):
+        code = self._code()
+        self._write_license({
+            "code": lic.normalize_code(code),
+            "last_seen": time.time(),
+            "device": self.device,
+            "lease": self._lease(not_after=int(time.time()) - 60),
+        })
+        self.mode = "offline"
+        lic._reset_cache()
+        self.assertFalse(lic.is_activated())
+        self.assertIn("宽限期", lic.state()["issue"])
+
+        self.mode = "online"
+        lic._reset_cache()
+        self.assertTrue(lic.is_activated())
+        self.assertGreater(self._read_license()["lease"]["body"].__len__(), 0)
+
+    def test_legacy_license_is_confirmed_online_once(self):
+        code = self._code(memo="老客户")
+        self._write_license({"code": lic.normalize_code(code), "last_seen": time.time()})
+        lic._reset_cache()
+        self.assertTrue(lic.is_activated())
+        self.assertIn("lease", self._read_license())
+        self.assertEqual(lic.state()["memo"], "老客户")
+
+    def test_revoked_code_is_rejected_on_activation(self):
+        self.mode = "reject"
+        self.reject_message = lic._status_message("revoked")
+        with self.assertRaises(lic.LicenseError) as caught:
+            lic.activate(self._code())
+        self.assertIn("停用", str(caught.exception))
+
+    def test_heartbeat_detects_revocation_immediately(self):
+        lic.activate(self._code())
+        self.assertTrue(lic.is_activated())
+        self.status = "revoked"
+        outcome = lic._heartbeat_once(lic.normalize_code(self._code()), self.device)
+        self.assertEqual(outcome, "revoked")
+        self.assertFalse(lic.is_activated())
+        self.assertIn("停用", lic.state()["issue"])
+
+    def test_heartbeat_detects_device_mismatch(self):
+        lic.activate(self._code())
+        self.status = "device_mismatch"
+        outcome = lic._heartbeat_once(lic.normalize_code(self._code()), self.device)
+        self.assertEqual(outcome, "device_mismatch")
+        self.assertFalse(lic.is_activated())
+        self.assertIn("换绑", lic.state()["issue"])
+
+    def test_lease_expiry_while_running_blocks_requests(self):
+        lic.activate(self._code())
+        lic._cached_confirmation["not_after"] = int(time.time()) - 1
+        self.assertFalse(lic.is_activated())
+        self.assertFalse(lic.state()["activated"])
+        self.assertIn("宽限期", lic.state()["issue"])
+
+    def test_lease_bound_to_other_device_is_rejected(self):
+        code = self._code()
+        self._write_license({
+            "code": lic.normalize_code(code),
+            "last_seen": time.time(),
+            "device": "other-device-0001",
+            "lease": self._lease(device="other-device-0001"),
+        })
+        self.mode = "offline"
+        lic._reset_cache()
+        self.assertFalse(lic.is_activated())
+        self.assertIn("设备", lic.state()["issue"])
+
+
 if __name__ == "__main__":
     unittest.main()

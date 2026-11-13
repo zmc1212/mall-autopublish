@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const {chromium} = require('../../.work/node_modules/playwright-core');
-const helpers = fs.readFileSync(path.join(__dirname, '_helpers.inc.js'), 'utf8');
+const helpers = fs.readFileSync(path.join(__dirname, '_helpers.inc.js'), 'utf8').replace(/^await ensureFront\(\);\s*$/m, '');
 
 test('cooldown survives a real Chromium restart and is shared across tabs', async () => {
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'qianniu-pacing-test-'));
@@ -55,7 +55,7 @@ test('visible stream-upload punish frame pauses even without middleware widget c
     await page.locator('#challenge').evaluate(el => {el.style.display = 'block';});
     assert.equal(await reason(page), '滑块验证');
     const check = new Function('page', helpers + 'return assertNoSecurityChallenge();');
-    await assert.rejects(() => check(page), /PAUSE:.*手动完成验证/);
+    await assert.rejects(() => check(page), /PAUSE:.*(手动完成验证|人工处理)/);
   } finally {
     await browser.close();
   }

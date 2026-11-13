@@ -8,12 +8,29 @@ const second = {...row, name:'白杆', sku_id:'6141276652864', image:'https://im
 function script(payload) {
   return eval('(' + fs.readFileSync(path.join(__dirname, 'material_import.js'), 'utf8').replace('/*PAYLOAD*/', JSON.stringify(payload)) + ')');
 }
-function pageWithRows(rows) {
+function pageWithRows(rows, options = {}) {
   let clicks = 0, reloads = 0;
-  const locator = {count:async () => 0, waitFor:async () => {}, getByRole:() => locator, click:async () => {clicks++;}};
+  const drawerOpen = !!options.drawerOpen;
+  const adopt = {
+    count: async () => drawerOpen ? 1 : 0,
+    waitFor: async () => {
+      if (options.waitError) throw new Error('drawer did not close');
+    },
+    getByRole: () => adopt,
+    click: async () => {
+      clicks++;
+      if (options.clickError) throw new Error('adopt click timeout');
+    },
+  };
+  const locator = {
+    count: async () => 0,
+    waitFor: async () => {},
+    getByRole: () => locator,
+    click: async () => { clicks++; },
+  };
   return {
     url:() => 'https://myseller.taobao.com/home.htm/SellManage/all_skucenter?from=qn_entry',
-    locator:() => locator, getByRole:() => locator,
+    locator:() => drawerOpen ? adopt : locator, getByRole:() => locator,
     evaluate:async (fn, args) => typeof args === 'string' ? fn(args) : args ? {ready:true, rows} : false,
     reload:async () => {reloads++;}, waitForTimeout:async () => {},
     clicks:() => clicks, reloads:() => reloads,
@@ -25,6 +42,14 @@ test('verification reloads and requires per-SKU persisted image identity', async
   const result = JSON.parse(await script({phase:'verify', item_id:'1085270103015', baseline:[row, second], preview:[row, second]})(page));
   assert.equal(result.rows.length, 2);
   assert.equal(page.reloads(), 1);
+  assert.equal(page.clicks(), 0);
+});
+
+test('guard phase checks the current page without opening or writing anything', async () => {
+  const page = pageWithRows([row]);
+  const result = JSON.parse(await script({phase:'guard', item_id:'1085270103015'})(page));
+  assert.deepEqual(result, {guarded:true});
+  assert.equal(page.reloads(), 0);
   assert.equal(page.clicks(), 0);
 });
 
@@ -115,14 +140,45 @@ test('adoption rejects additional SKUs before clicking', async () => {
   assert.equal(page.clicks(), 0);
 });
 
-test('adoption preserves attributes and merchant code, including missing fields', async () => {
+test('adoption allows the known preview attribute placeholder and preserves evidence', async () => {
   const original = {...row, attributes_text:'书写粗细: 0.5mm', merchant_code:'SKU-1'};
-  for (const changed of [{...original, attributes_text:'-'}, {...original, merchant_code:'SKU-2'}, row]) {
+  const changed = {...original, attributes_text:'-'};
+  const page = pageWithRows([changed], {drawerOpen:true});
+  const result = JSON.parse(await script({phase:'adopt', item_id:'1085270103015',
+    baseline:[original], preview:[changed]})(page));
+  assert.equal(result.adopted, true);
+  assert.equal(result.uncertain, undefined);
+  assert.equal(page.clicks(), 1);
+});
+
+test('adoption still rejects arbitrary attributes or merchant-code changes', async () => {
+  const original = {...row, attributes_text:'书写粗细: 0.5mm', merchant_code:'SKU-1'};
+  for (const changed of [{...original, attributes_text:'书写粗细: 0.7mm'}, {...original, merchant_code:'SKU-2'}, row]) {
     const page = pageWithRows([changed]);
     await assert.rejects(script({phase:'adopt', item_id:'1085270103015',
       baseline:[original], preview:[changed]})(page), /属性或商家编码/);
     assert.equal(page.clicks(), 0);
   }
+});
+
+test('uncertain adoption returns without making a second click', async () => {
+  const original = {...row, attributes_text:'书写粗细: 0.05mm'};
+  const changed = {...original, attributes_text:'-'};
+  const page = pageWithRows([changed], {drawerOpen:true, clickError:true});
+  const result = JSON.parse(await script({phase:'adopt', item_id:'1085270103015',
+    baseline:[original], preview:[changed]})(page));
+  assert.equal(result.uncertain, true);
+  assert.equal(page.clicks(), 1);
+});
+
+test('post-adoption verification keeps attributes_text strict against the server baseline', async () => {
+  const original = {...row, attributes_text:'书写粗细: 0.05mm'};
+  const server = {...original, attributes_text:'-'};
+  const page = pageWithRows([server]);
+  await assert.rejects(script({phase:'verify', item_id:'1085270103015',
+    baseline:[original], preview:[{...original, attributes_text:'-'}]})(page), /属性或商家编码/);
+  assert.equal(page.reloads(), 1);
+  assert.equal(page.clicks(), 0);
 });
 
 test('verification pauses on captcha instead of clicking or reloading', async () => {

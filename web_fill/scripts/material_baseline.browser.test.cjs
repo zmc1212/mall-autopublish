@@ -8,7 +8,7 @@ const url = 'https://myseller.taobao.com/home.htm/SellManage/all_skucenter';
 
 test('existing-item repair authorization is scoped to one exact item and host', () => {
   const vm = require('node:vm');
-  const helper = fs.readFileSync(__dirname + '/_helpers.inc.js', 'utf8');
+  const helper = fs.readFileSync(__dirname + '/_helpers.inc.js', 'utf8').replace(/^await ensureFront\(\);\s*$/m, '');
   const context = vm.createContext({PAYLOAD: {repairItemId: '1085482487262'}});
   vm.runInContext(helper, context);
   for (const [candidate, expected] of [
@@ -141,7 +141,8 @@ test('search-main thumbnails never count as specification images', async () => {
       .replace('/*PAYLOAD*/', '{}').replace('/*HELPERS*/', '');
     const probe = async () => JSON.parse(await new Function('return (' + script + ')')()(page));
     assert.equal((await probe()).specImgs, 0);
-    const status = fs.readFileSync(__dirname + '/spec_row_status.js', 'utf8');
+    const status = fs.readFileSync(__dirname + '/spec_row_status.js', 'utf8')
+      .replace('/*HELPERS*/', fs.readFileSync(__dirname + '/_helpers.inc.js', 'utf8'));
     assert.deepEqual(JSON.parse(await new Function('return (' + status + ')')()(page)).missing, [1]);
     await page.locator('td[id="0-custom_-1"]').evaluate(el => {
       el.insertAdjacentHTML('beforeend', '<img class="image-item" width=40 height=40 src="spec.jpg">');

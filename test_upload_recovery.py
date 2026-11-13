@@ -263,7 +263,9 @@ class UploadRecoveryTests(unittest.TestCase):
     def test_spec_images_use_throttled_upload_batches(self):
         session = FakeSession()
         payload = {'skus': [{'image': f'{i}.jpg'} for i in range(8)]}
-        with patch.object(pipeline, '_image_step', return_value={'bind': {'saved': True}}) as image_step:
+        with patch.object(pipeline, '_image_step', return_value={'bind': {'saved': True}}) as image_step, \
+             patch.object(pipeline, 'run_script', return_value={"v2Cells": 0, "legacyCells": 8,
+                                                                "drawer": True, "editSpecBtn": True}):
             pipeline.spec_images_gate(session, payload, [])
         sent = image_step.call_args.args[2]
         self.assertEqual(sent['uploadBatchSize'], 1)
@@ -354,7 +356,9 @@ class UploadRecoveryTests(unittest.TestCase):
     def test_spec_images_uploads_shared_file_once(self):
         session = FakeSession()
         payload = {'skus': [{'image': 'shared.jpg'}, {'image': 'shared.jpg'}, {'image': 'other.jpg'}]}
-        with patch.object(pipeline, '_image_step', return_value={'bind': {'saved': True}}) as image_step:
+        with patch.object(pipeline, '_image_step', return_value={'bind': {'saved': True}}) as image_step, \
+             patch.object(pipeline, 'run_script', return_value={"v2Cells": 0, "legacyCells": 3,
+                                                                "drawer": True, "editSpecBtn": True}):
             pipeline.spec_images_gate(session, payload, [])
         self.assertEqual(image_step.call_args.args[3], ['shared.jpg', 'other.jpg'])
 

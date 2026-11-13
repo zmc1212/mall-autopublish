@@ -1,3 +1,7 @@
+export type ExecutionLimitMode = "default" | "all" | "custom";
+
+export interface JobRowSelection { row: number; product_id: string; pack_fingerprint?: string }
+
 export interface ChromeStatus {
   chrome_path: string;
   chrome_found: boolean;
@@ -24,6 +28,10 @@ export interface LogEntry {
   time: string;
   level: string;
   message: string;
+  /** 调度器附加的执行槽标识；旧日志没有此字段。 */
+  worker_id?: string;
+  product_id?: string;
+  row?: number;
 }
 
 export interface WorkbookRow {
@@ -44,7 +52,12 @@ export interface WorkbookRow {
   video_name?: string;
   /** 主视频容器校验是否通过（false 时明细表标红“格式错误”）。 */
   video_ok?: boolean;
+  video_warning?: string;
+  video_status?: "uploading" | "bound" | "uploaded" | "failed" | "uncertain" | "paused" | "invalid";
   pack: string;
+  pack_fingerprint?: string;
+  /** 图片包主图的本地预览地址；不可用时为空。 */
+  preview_url?: string;
   pack_found?: boolean;
   taobao_item_id?: string;
   view_url?: string;
@@ -77,6 +90,13 @@ export interface JobState {
   elapsed_seconds?: number | null;
   /** 本段任务实际处理条目的平均耗时（秒）；无记录为 null。 */
   avg_item_seconds?: number | null;
+  /** 本批开始时固定的并发数；运行中修改设置不会改变它。 */
+  concurrency?: number;
+  sku_image_strategy?: string;
+  /** 当前各执行槽的状态；空闲槽也可以由调度器返回。 */
+  active_workers?: ActiveWorker[];
+  /** 需要人工关注的商品数量。 */
+  attention_count?: number;
   workbook_path: string;
   workspace_path?: string;
   result_xlsx: string;
@@ -91,6 +111,17 @@ export interface JobState {
   count: number;
   rows: WorkbookRow[];
   logs: LogEntry[];
+}
+
+export interface ActiveWorker {
+  worker_id: string;
+  row: number | null;
+  product_id: string;
+  status: string;
+  phase: string;
+  started_at?: number | null;
+  activity_at?: number | null;
+  stalled?: boolean;
 }
 
 export interface JobHistoryEntry {
@@ -115,11 +146,14 @@ export interface AppSettings {
   sku_image_strategy: string;
   settings_version?: number;
   limit: number;
+  /** 同时处理的商品数量，范围 1-8。 */
+  concurrency: number;
   /** 入库后进编辑页每批补传的规格图行数；0 表示全部一次上传。 */
   spec_upload_batch_size: number;
   /** 条目失败后的自动重试次数；0 表示失败不重试直接跳下一条。 */
   item_retry_limit: number;
   results_dir: string;
+  update_feed_url?: string;
 }
 
 export interface WorkspaceDefaults {
@@ -188,6 +222,21 @@ export interface AppStatus {
   job: JobState;
   workspace?: WorkspaceInfo;
   settings: AppSettings;
+  /** 磁盘任务代码比进程内存新：开任务会被拦截，需重启应用。 */
+  stale_code?: { files: string[] };
+  update?: UpdateState;
+}
+
+export interface UpdateState {
+  status: string;
+  current_version: string;
+  version: string;
+  notes: string;
+  message: string;
+  error: string;
+  progress: number;
+  feed_url: string;
+  can_restart: boolean;
 }
 
 export interface LicenseState {

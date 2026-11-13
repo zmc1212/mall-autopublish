@@ -1,4 +1,4 @@
-import type { AppSettings, AppStatus, JobHistoryEntry, JobState, LicenseState, SyncSummary, WorkspaceDefaults, WorkspaceInfo } from "./types";
+import type { AppSettings, AppStatus, JobHistoryEntry, JobRowSelection, JobState, LicenseState, SyncSummary, UpdateState, WorkspaceDefaults, WorkspaceInfo } from "./types";
 
 const base = () => window.__QIANNIU_API_BASE__ || "";
 
@@ -46,8 +46,22 @@ async function request<T>(path: string, init?: RequestInit, timeoutMs = DEFAULT_
 }
 
 export const api = {
-  status: () => request<AppStatus>("/api/status", undefined, 5000),
+  previewUrl: (path: string) => `${base()}${path}`,
+  updateState: () => request<UpdateState>("/api/update"),
+  checkUpdate: () => request<UpdateState>("/api/update/check", { method: "POST" }),
+  downloadUpdate: () => request<UpdateState>("/api/update/download", { method: "POST" }),
+  importUpdate: (path: string) => request<UpdateState>("/api/update/import", {
+    method: "POST", body: JSON.stringify({ path }),
+  }),
+  scheduleUpdate: () => request<UpdateState>("/api/update/schedule", { method: "POST" }),
+  restartUpdateNow: () => request<UpdateState>("/api/update/restart", { method: "POST" }),
+  cancelUpdate: () => request<UpdateState>("/api/update/cancel", { method: "POST" }),
+  confirmUpdateBoot: () => request<{ ok: boolean }>("/api/update/boot-ready", { method: "POST" }),
+  // 状态轮询：后端在 Chrome 繁忙时单次探测可能接近数秒，超时给足余量，
+  // 避免任务运行期间反复弹「与本地服务失去连接」。
+  status: () => request<AppStatus>("/api/status", undefined, 10000),
   openChrome: () => request<ChromeLike>("/api/chrome/open", { method: "POST" }),
+  revealChrome: () => request<ChromeLike>("/api/chrome/reveal", { method: "POST" }),
   checkLogin: () => request<{ started: boolean }>("/api/chrome/check-login", { method: "POST" }, 5000),
   importWorkbook: (path: string) =>
     request<JobState>("/api/workbook/import", {
@@ -76,13 +90,15 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ path }),
     }),
-  startJob: (limit: number, forceNew = false, retryFailed = false) =>
+  startJob: (limit: number | null, forceNew = false, retryFailed = false, selectedRows?: JobRowSelection[], workbookPath?: string) =>
     request<JobState>("/api/job/start", {
       method: "POST",
       body: JSON.stringify({
         limit,
         force_new: forceNew,
         retry_failed: retryFailed,
+        selected_rows: selectedRows,
+        workbook_path: workbookPath,
       }),
     }),
   stopJob: () => request<JobState>("/api/job/stop", { method: "POST" }),
@@ -93,11 +109,16 @@ export const api = {
     request<{ ok: boolean; url: string }>("/api/item/open", {
       method: "POST",
       body: JSON.stringify({ row, product_id: productId, action }),
-    }),
+    }, 30000),
   clearItem: (row: number, productId: string) =>
     request<{ ok: boolean; row: number; product_id: string }>("/api/item/clear", {
       method: "POST",
       body: JSON.stringify({ row, product_id: productId }),
+    }),
+  clearItems: (rows: number[]) =>
+    request<{ ok: boolean; cleared: number }>("/api/item/clear-batch", {
+      method: "POST",
+      body: JSON.stringify({ rows }),
     }),
   saveSettings: (body: Partial<AppSettings>) =>
     request<SavedSettings>("/api/settings", {
@@ -126,7 +147,7 @@ export interface LogExportResult {
 export type SavedSettings = AppSettings & { debug_browser_applied?: boolean | null };
 
 export async function nativePick(
-  method: "pick_excel" | "pick_chrome" | "pick_folder" | "save_template",
+  method: "pick_excel" | "pick_chrome" | "pick_update" | "pick_folder" | "save_template",
 ): Promise<string> {
   const bridge = window.pywebview?.api;
   if (!bridge) return "";
