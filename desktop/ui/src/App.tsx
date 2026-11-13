@@ -294,7 +294,7 @@ export default function App() {
     <div className="flex h-full overflow-hidden bg-background">
       <Sidebar current={nav} onChange={setNav} />
       <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
-        <StatusBar chrome={chrome} loading={!status} workspacePath={job?.workspace_path || job?.workbook_path || ""} onConnect={() => setNav("connect")} />
+        <StatusBar chrome={chrome} license={license} loading={!status} workspacePath={job?.workspace_path || job?.workbook_path || ""} onConnect={() => setNav("connect")} />
         {status?.update && ["available", "ready", "waiting", "restarting", "rolled_back", "rollback_failed"].includes(status.update.status) ? (
           <div className="flex shrink-0 items-center justify-between gap-3 border-b border-amber-200 bg-amber-50 px-6 py-2 text-xs text-amber-800" role="status">
             <span>{status.update.status === "available" ? `发现新版本 ${status.update.version}，可在设置中下载更新` : status.update.message}{status.update.error ? `：${status.update.error}` : ""}</span>

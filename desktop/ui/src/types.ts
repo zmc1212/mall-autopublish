@@ -242,9 +242,12 @@ export interface UpdateState {
 export interface LicenseState {
   activated: boolean;
   machine_code: string;
+  /** 授权签名里的真实到期时间（Unix 秒）；0 表示永久授权。 */
   expires_at: number;
   memo: string;
   days_left: number | null;
+  /** 本次离线可用的截止时间（服务端签发的租约，Unix 秒）；0 表示未启用联网确认。 */
+  offline_until?: number;
   /** 未激活且本机存在失效授权时的原因说明（如机器码变化、文件损坏）；正常为空串。 */
   issue?: string;
 }

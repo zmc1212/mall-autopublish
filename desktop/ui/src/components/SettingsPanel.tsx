@@ -580,13 +580,26 @@ export default function SettingsPanel({
             </div>
             <div className="rounded-lg border border-border bg-muted p-3 text-xs leading-5">
               <p className="text-slate-500">有效期</p>
-              <p className="mt-1 font-medium text-foreground">
-                {license.activated
-                  ? license.expires_at
-                    ? new Date(license.expires_at * 1000).toLocaleDateString("zh-CN") + " 到期（剩余 " + (license.days_left ?? 0) + " 天）"
-                    : "永久有效"
-                  : "未激活"}
-              </p>
+              {license.activated ? (
+                <>
+                  <p className="mt-1 font-medium text-foreground">
+                    {license.expires_at
+                      ? new Date(license.expires_at * 1000).toLocaleDateString("zh-CN") + " 到期（剩余 " + (license.days_left ?? 0) + " 天）"
+                      : "永久"}
+                  </p>
+                  {license.offline_until ? (
+                    <p className={cn("mt-1", (license.offline_until - Date.now() / 1000) <= 3 * 86400 ? "text-amber-700" : "text-slate-500")}>
+                      {(license.offline_until - Date.now() / 1000) <= 3 * 86400
+                        ? "离线确认仅剩 " + Math.max(0, Math.floor((license.offline_until - Date.now() / 1000) / 86400) + 1) + " 天，请联网打开软件确认授权"
+                        : "离线确认至 " + new Date(license.offline_until * 1000).toLocaleDateString("zh-CN") + "，联网自动续期"}
+                    </p>
+                  ) : null}
+                </>
+              ) : (
+                <p className={cn("mt-1 font-medium", license.issue ? "text-red-600" : "text-foreground")}>
+                  {license.issue ? "已停用" : "未激活"}
+                </p>
+              )}
             </div>
           </div>
         ) : (
